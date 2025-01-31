@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -14,6 +14,7 @@
 #include "query/frontend/ast/ast.hpp"
 #include "query/parameters.hpp"
 #include "query/plan/operator.hpp"
+#include "query/plan/rewrite/index_lookup.hpp"
 #include "query/typed_value.hpp"
 #include "utils/algorithm.hpp"
 #include "utils/math.hpp"
@@ -44,6 +45,11 @@ struct CostEstimation {
 
   // expected number of rows
   double cardinality;
+};
+
+struct PlanCost {
+  double cost;
+  bool use_index_hints;
 };
 
 /**
@@ -84,6 +90,12 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
     static constexpr double MakeScanAllByLabelPropertyValue{1.1};
     static constexpr double MakeScanAllByLabelPropertyRange{1.1};
     static constexpr double MakeScanAllByLabelProperty{1.1};
+    static constexpr double MakeScanAllByPointDistance{1.1};
+    static constexpr double MakeScanAllByPointWithinbbox{1.1};
+    static constexpr double kScanAllByEdgeType{1.1};
+    static constexpr double MakeScanAllByEdgeTypePropertyValue{1.1};
+    static constexpr double MakeScanAllByEdgeTypePropertyRange{1.1};
+    static constexpr double MakeScanAllByEdgeTypeProperty{1.1};
     static constexpr double kExpand{2.0};
     static constexpr double kExpandVariable{3.0};
     static constexpr double kFilter{1.5};
@@ -109,11 +121,13 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
   using HierarchicalLogicalOperatorVisitor::PostVisit;
   using HierarchicalLogicalOperatorVisitor::PreVisit;
 
-  CostEstimator(TDbAccessor *db_accessor, const SymbolTable &table, const Parameters &parameters)
-      : db_accessor_(db_accessor), table_(table), parameters(parameters), scopes_{Scope()} {}
+  CostEstimator(TDbAccessor *db_accessor, const SymbolTable &table, const Parameters &parameters,
+                const IndexHints &index_hints)
+      : db_accessor_(db_accessor), table_(table), parameters(parameters), scopes_{Scope()}, index_hints_(index_hints) {}
 
-  CostEstimator(TDbAccessor *db_accessor, const SymbolTable &table, const Parameters &parameters, Scope scope)
-      : db_accessor_(db_accessor), table_(table), parameters(parameters), scopes_{scope} {}
+  CostEstimator(TDbAccessor *db_accessor, const SymbolTable &table, const Parameters &parameters, Scope scope,
+                const IndexHints &index_hints)
+      : db_accessor_(db_accessor), table_(table), parameters(parameters), scopes_{scope}, index_hints_(index_hints) {}
 
   bool PostVisit(ScanAll &) override {
     cardinality_ *= db_accessor_->VerticesCount();
@@ -129,7 +143,10 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
     }
 
     cardinality_ *= db_accessor_->VerticesCount(scan_all_by_label.label_);
-    // ScanAll performs some work for every element that is produced
+    if (index_hints_.HasLabelIndex(db_accessor_, scan_all_by_label.label_)) {
+      use_index_hints_ = true;
+    }
+
     IncrementCost(CostParam::kScanAllByLabel);
     return true;
   }
@@ -153,6 +170,10 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
       factor = db_accessor_->VerticesCount(logical_op.label_, logical_op.property_) * CardParam::kFilter;
 
     cardinality_ *= factor;
+
+    if (index_hints_.HasLabelPropertyIndex(db_accessor_, logical_op.label_, logical_op.property_)) {
+      use_index_hints_ = true;
+    }
 
     // ScanAll performs some work for every element that is produced
     IncrementCost(CostParam::MakeScanAllByLabelPropertyValue);
@@ -184,6 +205,10 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
 
     cardinality_ *= factor;
 
+    if (index_hints_.HasLabelPropertyIndex(db_accessor_, logical_op.label_, logical_op.property_)) {
+      use_index_hints_ = true;
+    }
+
     // ScanAll performs some work for every element that is produced
     IncrementCost(CostParam::MakeScanAllByLabelPropertyRange);
     return true;
@@ -197,7 +222,98 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
 
     const auto factor = db_accessor_->VerticesCount(logical_op.label_, logical_op.property_);
     cardinality_ *= factor;
+    if (index_hints_.HasLabelPropertyIndex(db_accessor_, logical_op.label_, logical_op.property_)) {
+      use_index_hints_ = true;
+    }
+
     IncrementCost(CostParam::MakeScanAllByLabelProperty);
+    return true;
+  }
+
+  bool PostVisit(ScanAllByPointDistance &logical_op) override {
+    // FYI, no stats for point types
+
+    const auto factor = db_accessor_->VerticesPointCount(logical_op.label_, logical_op.property_);
+    cardinality_ *= factor.value_or(1);
+    if (index_hints_.HasPointIndex(db_accessor_, logical_op.label_, logical_op.property_)) {
+      use_index_hints_ = true;
+    }
+
+    IncrementCost(CostParam::MakeScanAllByPointDistance);
+    return true;
+  }
+
+  bool PostVisit(ScanAllByPointWithinbbox &logical_op) override {
+    // FYI, no stats for point types
+
+    const auto factor = db_accessor_->VerticesPointCount(logical_op.label_, logical_op.property_);
+    cardinality_ *= factor.value_or(1);
+    if (index_hints_.HasPointIndex(db_accessor_, logical_op.label_, logical_op.property_)) {
+      use_index_hints_ = true;
+    }
+
+    IncrementCost(CostParam::MakeScanAllByPointWithinbbox);
+    return true;
+  }
+
+  bool PostVisit(ScanAllByEdgeType &op) override {
+    auto edge_type = op.GetEdgeType();
+    cardinality_ *= db_accessor_->EdgesCount(edge_type);
+    IncrementCost(CostParam::kScanAllByEdgeType);
+    return true;
+  }
+
+  bool PostVisit(ScanAllByEdgeTypePropertyValue &op) override {
+    auto edge_type = op.GetEdgeType();
+    auto property_value = ConstPropertyValue(op.expression_);
+    double factor = 1.0;
+    if (property_value)
+      // get the exact influence based on ScanAllByEdge(label, property, value)
+      factor = db_accessor_->EdgesCount(edge_type, op.property_, property_value.value());
+    else
+      // estimate the influence as ScanAllByEdge(label, property) * filtering
+      factor = db_accessor_->EdgesCount(edge_type, op.property_) * CardParam::kFilter;
+
+    cardinality_ *= factor;
+
+    // ScanAll performs some work for every element that is produced
+    IncrementCost(CostParam::MakeScanAllByEdgeTypePropertyValue);
+    return true;
+  }
+
+  bool PostVisit(ScanAllByEdgeTypePropertyRange &op) override {
+    auto edge_type = op.GetEdgeType();
+
+    // this cardinality estimation depends on Bound expressions.
+    // if they are literals we can evaluate cardinality properly
+    auto lower = BoundToPropertyValue(op.lower_bound_);
+    auto upper = BoundToPropertyValue(op.upper_bound_);
+
+    int64_t factor = 1;
+    if (upper || lower)
+      // if we have either Bound<PropertyValue>, use the value index
+      factor = db_accessor_->EdgesCount(edge_type, op.property_, lower, upper);
+    else
+      // no values, but we still have the label
+      factor = db_accessor_->EdgesCount(edge_type, op.property_);
+
+    // if we failed to take either bound from the op into account, then apply
+    // the filtering constant to the factor
+    if ((op.upper_bound_ && !upper) || (op.lower_bound_ && !lower)) factor *= CardParam::kFilter;
+
+    cardinality_ *= factor;
+
+    // ScanAll performs some work for every element that is produced
+    IncrementCost(CostParam::MakeScanAllByEdgeTypePropertyRange);
+    return true;
+  }
+
+  bool PostVisit(ScanAllByEdgeTypeProperty &op) override {
+    auto edge_type = op.GetEdgeType();
+    const auto factor = db_accessor_->EdgesCount(edge_type, op.property_);
+    cardinality_ *= factor;
+
+    IncrementCost(CostParam::MakeScanAllByEdgeTypeProperty);
     return true;
   }
 
@@ -375,6 +491,7 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
 
   auto cost() const { return cost_; }
   auto cardinality() const { return cardinality_; }
+  auto use_index_hints() const { return use_index_hints_; }
 
  private:
   // cost estimation that gets accumulated as the visitor
@@ -390,17 +507,19 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
   const SymbolTable &table_;
   const Parameters &parameters;
   std::vector<Scope> scopes_;
+  IndexHints index_hints_;
+  bool use_index_hints_{false};
 
   void IncrementCost(double param) { cost_ += param * cardinality_; }
 
   CostEstimation EstimateCostOnBranch(std::shared_ptr<LogicalOperator> *branch) {
-    CostEstimator<TDbAccessor> cost_estimator(db_accessor_, table_, parameters);
+    CostEstimator<TDbAccessor> cost_estimator(db_accessor_, table_, parameters, index_hints_);
     (*branch)->Accept(cost_estimator);
     return CostEstimation{.cost = cost_estimator.cost(), .cardinality = cost_estimator.cardinality()};
   }
 
   CostEstimation EstimateCostOnBranch(std::shared_ptr<LogicalOperator> *branch, Scope scope) {
-    CostEstimator<TDbAccessor> cost_estimator(db_accessor_, table_, parameters, scope);
+    CostEstimator<TDbAccessor> cost_estimator(db_accessor_, table_, parameters, scope, index_hints_);
     (*branch)->Accept(cost_estimator);
     return CostEstimation{.cost = cost_estimator.cost(), .cardinality = cost_estimator.cardinality()};
   }
@@ -450,11 +569,11 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
 
 /** Returns the estimated cost of the given plan. */
 template <class TDbAccessor>
-double EstimatePlanCost(TDbAccessor *db, const SymbolTable &table, const Parameters &parameters,
-                        LogicalOperator &plan) {
-  CostEstimator<TDbAccessor> estimator(db, table, parameters);
+PlanCost EstimatePlanCost(TDbAccessor *db, const SymbolTable &table, const Parameters &parameters,
+                          LogicalOperator &plan, const IndexHints &index_hints) {
+  CostEstimator<TDbAccessor> estimator(db, table, parameters, index_hints);
   plan.Accept(estimator);
-  return estimator.cost();
+  return PlanCost{.cost = estimator.cost(), .use_index_hints = estimator.use_index_hints()};
 }
 
 }  // namespace memgraph::query::plan

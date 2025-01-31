@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -22,6 +22,7 @@
 
 #include "integrations/kafka/consumer.hpp"
 #include "kvstore/kvstore.hpp"
+#include "query/query_user.hpp"
 #include "query/stream/common.hpp"
 #include "query/stream/sources.hpp"
 #include "query/typed_value.hpp"
@@ -52,8 +53,8 @@ struct StreamInfo<void> {
   using Type = CommonStreamInfo;
 };
 
-template <Stream TStream>
-struct StreamInfo<TStream> {
+template <typename TStream>
+struct StreamInfo {
   using Type = typename TStream::StreamInfo;
 };
 
@@ -67,6 +68,7 @@ struct StreamStatus {
   bool is_running;
   StreamInfoType<T> info;
   std::optional<std::string> owner;
+  std::optional<std::string> owner_role;
 };
 
 using TransformationResult = std::vector<std::vector<TypedValue>>;
@@ -99,8 +101,8 @@ class Streams final {
   /// @param stream_info the necessary informations needed to create the Kafka consumer and transform the messages
   ///
   /// @throws StreamsException if the stream with the same name exists or if the creation of Kafka consumer fails
-  template <Stream TStream, typename TDbAccess>
-  void Create(const std::string &stream_name, typename TStream::StreamInfo info, std::optional<std::string> owner,
+  template <typename TStream, typename TDbAccess>
+  void Create(const std::string &stream_name, typename TStream::StreamInfo info, std::shared_ptr<QueryUserOrRole> owner,
               TDbAccess db, InterpreterContext *interpreter_context);
 
   /// Deletes an existing stream and all the data that was persisted.
@@ -109,6 +111,11 @@ class Streams final {
   ///
   /// @throws StreamsException if the stream doesn't exist or if the persisted metadata can't be deleted.
   void Drop(const std::string &stream_name);
+
+  /// Deletes all existing streams and all the data that was persisted.
+  ///
+  /// @throws StreamsException if the persisted metadata can't be deleted.
+  void DropAll();
 
   /// Start consuming from a stream.
   ///
@@ -147,6 +154,9 @@ class Streams final {
   /// @throws StreamsException if the metadata cannot be persisted
   void StopAll();
 
+  /// Stops streams without affecting the durable data. Use for destruction only.
+  void Shutdown();
+
   /// Return current status for all streams.
   /// It might happend that the is_running field is out of date if the one of the streams stops during the invocation of
   /// this function because of an error.
@@ -170,13 +180,14 @@ class Streams final {
                              std::optional<uint64_t> batch_limit = std::nullopt) const;
 
  private:
-  template <Stream TStream>
+  template <typename TStream>
   using SynchronizedStreamSource = utils::Synchronized<TStream, utils::WritePrioritizedRWLock>;
 
-  template <Stream TStream>
+  template <typename TStream>
   struct StreamData {
     std::string transformation_name;
     std::optional<std::string> owner;
+    std::optional<std::string> owner_role;
     std::unique_ptr<SynchronizedStreamSource<TStream>> stream_source;
   };
 
@@ -184,12 +195,12 @@ class Streams final {
   using StreamsMap = std::unordered_map<std::string, StreamDataVariant>;
   using SynchronizedStreamsMap = utils::Synchronized<StreamsMap, utils::WritePrioritizedRWLock>;
 
-  template <Stream TStream, typename TDbAccess>
+  template <typename TStream, typename TDbAccess>
   StreamsMap::iterator CreateConsumer(StreamsMap &map, const std::string &stream_name,
-                                      typename TStream::StreamInfo stream_info, std::optional<std::string> owner,
+                                      typename TStream::StreamInfo stream_info, std::shared_ptr<QueryUserOrRole> owner,
                                       TDbAccess db, InterpreterContext *interpreter_context);
 
-  template <Stream TStream>
+  template <typename TStream>
   void Persist(StreamStatus<TStream> &&status) {
     const std::string stream_name = status.name;
     if (!storage_.Put(stream_name, nlohmann::json(std::move(status)).dump())) {

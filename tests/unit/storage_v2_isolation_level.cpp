@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -15,6 +15,8 @@
 #include "storage/v2/disk/storage.hpp"
 #include "storage/v2/inmemory/storage.hpp"
 #include "storage/v2/isolation_level.hpp"
+#include "utils/on_scope_exit.hpp"
+using memgraph::replication_coordination_glue::ReplicationRole;
 
 namespace {
 int64_t VerticesCount(memgraph::storage::Storage::Accessor *accessor) {
@@ -113,6 +115,7 @@ TEST_P(StorageIsolationLevelTest, VisibilityOnDiskStorage) {
 
   for (const auto override_isolation_level : isolation_levels) {
     std::unique_ptr<memgraph::storage::Storage> storage(new memgraph::storage::DiskStorage(config));
+    auto on_exit = memgraph::utils::OnScopeExit{[&]() { disk_test_utils::RemoveRocksDbDirs(testSuite); }};
     try {
       this->TestVisibility(storage, default_isolation_level, override_isolation_level);
     } catch (memgraph::utils::NotYetImplemented &) {
@@ -120,12 +123,10 @@ TEST_P(StorageIsolationLevelTest, VisibilityOnDiskStorage) {
           override_isolation_level != memgraph::storage::IsolationLevel::SNAPSHOT_ISOLATION) {
         continue;
       }
-      disk_test_utils::RemoveRocksDbDirs(testSuite);
       throw;
     }
-    disk_test_utils::RemoveRocksDbDirs(testSuite);
   }
 }
 
-INSTANTIATE_TEST_CASE_P(ParameterizedStorageIsolationLevelTests, StorageIsolationLevelTest,
-                        ::testing::ValuesIn(isolation_levels), StorageIsolationLevelTest::PrintToStringParamName());
+INSTANTIATE_TEST_SUITE_P(ParameterizedStorageIsolationLevelTests, StorageIsolationLevelTest,
+                         ::testing::ValuesIn(isolation_levels), StorageIsolationLevelTest::PrintToStringParamName());

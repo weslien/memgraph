@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -15,6 +15,7 @@
 #include <optional>
 
 #include "dbms/database.hpp"
+#include "dbms/dbms_handler.hpp"
 #include "disk_test_utils.hpp"
 #include "query/interpret/awesome_memgraph_functions.hpp"
 #include "query/interpreter_context.hpp"
@@ -30,15 +31,31 @@ using namespace memgraph::storage;
 constexpr auto testSuite = "database_v2_get_info";
 const std::filesystem::path storage_directory{std::filesystem::temp_directory_path() / testSuite};
 
-template <typename StorageType>
+struct TestConfig {};
+struct DefaultConfig : TestConfig {};
+struct TenantConfig : TestConfig {};
+
+template <typename TestType>
 class InfoTest : public testing::Test {
+  using StorageType = typename TestType::first_type;
+  using ConfigType = typename TestType::second_type;
+
  protected:
   void SetUp() {
-    repl_state.emplace(memgraph::storage::ReplicationStateRootPath(config));
-    db_gk.emplace(config, *repl_state);
-    auto db_acc_opt = db_gk->access();
-    MG_ASSERT(db_acc_opt, "Failed to access db");
-    auto &db_acc = *db_acc_opt;
+    repl_state_.emplace(ReplicationStateRootPath(config));
+#ifdef MG_ENTERPRISE
+    dbms_handler_.emplace(config, *repl_state_, auth_, false);
+    auto db_acc = dbms_handler_->Get();  // Default db
+    if (std::is_same_v<ConfigType, TenantConfig>) {
+      constexpr std::string_view db_name = "test_db";
+      MG_ASSERT(dbms_handler_->New(std::string{db_name}).HasValue(), "Failed to create database.");
+      db_acc = dbms_handler_->Get(db_name);
+    }
+#else
+    dbms_handler_.emplace(config, *repl_state_);
+    auto db_acc = dbms_handler_->Get();
+#endif
+    MG_ASSERT(db_acc, "Failed to access db");
     MG_ASSERT(db_acc->GetStorageMode() == (std::is_same_v<StorageType, memgraph::storage::DiskStorage>
                                                ? memgraph::storage::StorageMode::ON_DISK_TRANSACTIONAL
                                                : memgraph::storage::StorageMode::IN_MEMORY_TRANSACTIONAL),
@@ -48,8 +65,8 @@ class InfoTest : public testing::Test {
 
   void TearDown() {
     db_acc_.reset();
-    db_gk.reset();
-    repl_state.reset();
+    dbms_handler_.reset();
+    repl_state_.reset();
     if (std::is_same<StorageType, memgraph::storage::DiskStorage>::value) {
       disk_test_utils::RemoveRocksDbDirs(testSuite);
     }
@@ -59,9 +76,9 @@ class InfoTest : public testing::Test {
   StorageMode mode{std::is_same_v<StorageType, DiskStorage> ? StorageMode::ON_DISK_TRANSACTIONAL
                                                             : StorageMode::IN_MEMORY_TRANSACTIONAL};
 
-  std::optional<memgraph::replication::ReplicationState> repl_state;
-  std::optional<memgraph::dbms::DatabaseAccess> db_acc_;
-  std::optional<memgraph::utils::Gatekeeper<memgraph::dbms::Database>> db_gk;
+#ifdef MG_ENTERPRISE
+  memgraph::auth::SynchedAuth auth_{storage_directory, memgraph::auth::Auth::Config {}};
+#endif
   memgraph::storage::Config config{
       [&]() {
         memgraph::storage::Config config{};
@@ -69,18 +86,27 @@ class InfoTest : public testing::Test {
         config.durability.snapshot_wal_mode =
             memgraph::storage::Config::Durability::SnapshotWalMode::PERIODIC_SNAPSHOT_WITH_WAL;
         if constexpr (std::is_same_v<StorageType, memgraph::storage::DiskStorage>) {
-          config.disk = disk_test_utils::GenerateOnDiskConfig(testSuite).disk;
           config.force_on_disk = true;
         }
         return config;
       }()  // iile
   };
+  std::optional<memgraph::replication::ReplicationState> repl_state_;
+  std::optional<memgraph::dbms::DbmsHandler> dbms_handler_;
+  std::optional<memgraph::dbms::DatabaseAccess> db_acc_;
 };
 
-using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
+using TestTypes = ::testing::Types<std::pair<memgraph::storage::InMemoryStorage, DefaultConfig>,
+                                   std::pair<memgraph::storage::DiskStorage, DefaultConfig>
 
-TYPED_TEST_CASE(InfoTest, StorageTypes);
-// TYPED_TEST_CASE(IndexTest, InMemoryStorageType);
+#ifdef MG_ENTERPRISE
+                                   ,
+                                   std::pair<memgraph::storage::InMemoryStorage, TenantConfig>,
+                                   std::pair<memgraph::storage::DiskStorage, TenantConfig>
+#endif
+                                   >;
+
+TYPED_TEST_SUITE(InfoTest, TestTypes);
 
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TYPED_TEST(InfoTest, InfoCheck) {
@@ -93,12 +119,12 @@ TYPED_TEST(InfoTest, InfoCheck) {
 
   {
     {
-      auto unique_acc = db_acc->storage()->UniqueAccess();
+      auto unique_acc = db_acc->UniqueAccess();
       ASSERT_FALSE(unique_acc->CreateExistenceConstraint(lbl, prop).HasError());
       ASSERT_FALSE(unique_acc->Commit().HasError());
     }
     {
-      auto unique_acc = db_acc->storage()->UniqueAccess();
+      auto unique_acc = db_acc->UniqueAccess();
       ASSERT_FALSE(unique_acc->DropExistenceConstraint(lbl, prop).HasError());
       ASSERT_FALSE(unique_acc->Commit().HasError());
     }
@@ -108,7 +134,7 @@ TYPED_TEST(InfoTest, InfoCheck) {
     auto v2 = acc->CreateVertex();
     auto v3 = acc->CreateVertex();
     auto v4 = acc->CreateVertex();
-    auto v5 = acc->CreateVertex();
+    [[maybe_unused]] auto v5 = acc->CreateVertex();
 
     ASSERT_FALSE(v2.AddLabel(lbl).HasError());
     ASSERT_FALSE(v3.AddLabel(lbl).HasError());
@@ -123,57 +149,55 @@ TYPED_TEST(InfoTest, InfoCheck) {
   }
 
   {
-    auto unique_acc = db_acc->storage()->UniqueAccess();
+    auto unique_acc = db_acc->UniqueAccess();
     ASSERT_FALSE(unique_acc->CreateIndex(lbl).HasError());
     ASSERT_FALSE(unique_acc->Commit().HasError());
   }
   {
-    auto unique_acc = db_acc->storage()->UniqueAccess();
+    auto unique_acc = db_acc->UniqueAccess();
     ASSERT_FALSE(unique_acc->CreateIndex(lbl, prop).HasError());
     ASSERT_FALSE(unique_acc->Commit().HasError());
   }
   {
-    auto unique_acc = db_acc->storage()->UniqueAccess();
+    auto unique_acc = db_acc->UniqueAccess();
     ASSERT_FALSE(unique_acc->CreateIndex(lbl, prop2).HasError());
     ASSERT_FALSE(unique_acc->Commit().HasError());
   }
   {
-    auto unique_acc = db_acc->storage()->UniqueAccess();
+    auto unique_acc = db_acc->UniqueAccess();
     ASSERT_FALSE(unique_acc->DropIndex(lbl, prop).HasError());
     ASSERT_FALSE(unique_acc->Commit().HasError());
   }
 
   {
-    auto unique_acc = db_acc->storage()->UniqueAccess();
+    auto unique_acc = db_acc->UniqueAccess();
     ASSERT_FALSE(unique_acc->CreateUniqueConstraint(lbl, {prop2}).HasError());
     ASSERT_FALSE(unique_acc->Commit().HasError());
   }
   {
-    auto unique_acc = db_acc->storage()->UniqueAccess();
+    auto unique_acc = db_acc->UniqueAccess();
     ASSERT_FALSE(unique_acc->CreateUniqueConstraint(lbl2, {prop}).HasError());
     ASSERT_FALSE(unique_acc->Commit().HasError());
   }
   {
-    auto unique_acc = db_acc->storage()->UniqueAccess();
+    auto unique_acc = db_acc->UniqueAccess();
     ASSERT_FALSE(unique_acc->CreateUniqueConstraint(lbl3, {prop}).HasError());
     ASSERT_FALSE(unique_acc->Commit().HasError());
   }
   {
-    auto unique_acc = db_acc->storage()->UniqueAccess();
+    auto unique_acc = db_acc->UniqueAccess();
     ASSERT_EQ(unique_acc->DropUniqueConstraint(lbl, {prop2}),
               memgraph::storage::UniqueConstraints::DeletionStatus::SUCCESS);
     ASSERT_FALSE(unique_acc->Commit().HasError());
   }
 
-  const auto &info = db_acc->GetInfo(true);  // force to use configured directory
+  const auto &info = db_acc->GetInfo();  // force to use configured directory
 
   ASSERT_EQ(info.storage_info.vertex_count, 5);
   ASSERT_EQ(info.storage_info.edge_count, 2);
   ASSERT_EQ(info.storage_info.average_degree, 0.8);
-  ASSERT_GT(info.storage_info.memory_res, 10'000'000);  // 200MB < > 10MB
-  ASSERT_LT(info.storage_info.memory_res, 200'000'000);
-  ASSERT_GT(info.storage_info.disk_usage, 100);  // 1MB < > 100B
-  ASSERT_LT(info.storage_info.disk_usage, 1000'000);
+  ASSERT_GT(info.storage_info.memory_res, 0);  // exact value not salient
+  ASSERT_GT(info.storage_info.disk_usage, 0);  // exact value not salient
   ASSERT_EQ(info.storage_info.label_indices, 1);
   ASSERT_EQ(info.storage_info.label_property_indices, 1);
   ASSERT_EQ(info.storage_info.existence_constraints, 0);

@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -27,7 +27,7 @@ namespace memgraph::communication::bolt {
 /**
  * Bolt BaseEncoder. Has public interfaces for writing Bolt encoded data.
  * Supported types are: Null, Bool, Int, Double, String, List, Map, Vertex,
- * Edge, Date, LocalDate, LocalDateTime, Duration.
+ * Edge, Date, LocalDate, LocalDateTime, Duration, and ZonedDateTime.
  *
  * The purpose of this class is to stream bolt data into the given Buffer.
  *
@@ -111,12 +111,12 @@ class BaseEncoder {
 
   void WriteList(const std::vector<Value> &value) {
     WriteTypeSize(value.size(), MarkerList);
-    for (auto &x : value) WriteValue(x);
+    for (const auto &x : value) WriteValue(x);
   }
 
-  void WriteMap(const std::map<std::string, Value> &value) {
+  void WriteMap(const map_t &value) {
     WriteTypeSize(value.size(), MarkerMap);
-    for (auto &x : value) {
+    for (const auto &x : value) {
       WriteString(x.first);
       WriteValue(x.second);
     }
@@ -205,11 +205,11 @@ class BaseEncoder {
     WriteRAW(utils::UnderlyingCast(Marker::TinyStruct) + 3);
     WriteRAW(utils::UnderlyingCast(Signature::Path));
     WriteTypeSize(path.vertices.size(), MarkerList);
-    for (auto &v : path.vertices) WriteVertex(v);
+    for (const auto &v : path.vertices) WriteVertex(v);
     WriteTypeSize(path.edges.size(), MarkerList);
-    for (auto &e : path.edges) WriteEdge(e);
+    for (const auto &e : path.edges) WriteEdge(e);
     WriteTypeSize(path.indices.size(), MarkerList);
-    for (auto &i : path.indices) WriteInt(i);
+    for (const auto &i : path.indices) WriteInt(i);
   }
 
   void WriteDate(const utils::Date &date) {
@@ -225,6 +225,7 @@ class BaseEncoder {
   }
 
   void WriteLocalDateTime(const utils::LocalDateTime &local_date_time) {
+    // Bolt defines local date time without timezone (as if UTC)
     WriteRAW(utils::UnderlyingCast(Marker::TinyStruct2));
     WriteRAW(utils::UnderlyingCast(Signature::LocalDateTime));
     WriteInt(local_date_time.SecondsSinceEpoch());
@@ -241,6 +242,61 @@ class BaseEncoder {
     WriteInt(duration.Days());
     WriteInt(duration.SubDaysAsSeconds());
     WriteInt(duration.SubSecondsAsNanoseconds());
+  }
+
+  void WritePoint2d(const Point2d &point_2d) {
+    WriteRAW(utils::UnderlyingCast(Marker::TinyStruct3));
+    WriteRAW(utils::UnderlyingCast(Signature::Point2d));
+    WriteInt(storage::CrsToSrid(point_2d.crs()).value_of());
+    WriteDouble(point_2d.x());
+    WriteDouble(point_2d.y());
+  }
+
+  void WritePoint3d(const Point3d &point_3d) {
+    WriteRAW(utils::UnderlyingCast(Marker::TinyStruct4));
+    WriteRAW(utils::UnderlyingCast(Signature::Point3d));
+    WriteInt(storage::CrsToSrid(point_3d.crs()).value_of());
+    WriteDouble(point_3d.x());
+    WriteDouble(point_3d.y());
+    WriteDouble(point_3d.z());
+  }
+
+  void WriteLegacyZonedDateTime(const utils::ZonedDateTime &zoned_date_time) {
+    WriteRAW(utils::UnderlyingCast(Marker::TinyStruct3));
+    if (zoned_date_time.GetTimezone().InTzDatabase()) {
+      WriteRAW(utils::UnderlyingCast(Signature::LegacyDateTimeZoneId));
+      WriteInt((zoned_date_time.SysSecondsSinceEpoch() + zoned_date_time.OffsetDuration()).count());
+      WriteInt(zoned_date_time.SysSubSecondsAsNanoseconds().count());
+      WriteString(std::string{zoned_date_time.GetTimezone().TimezoneName()});
+    } else {
+      WriteRAW(utils::UnderlyingCast(Signature::LegacyDateTime));
+      WriteInt((zoned_date_time.SysSecondsSinceEpoch() + zoned_date_time.OffsetDuration()).count());
+      WriteInt(zoned_date_time.SysSubSecondsAsNanoseconds().count());
+      WriteInt(zoned_date_time.GetTimezone().DefiningOffsetSeconds());
+    }
+  }
+
+  void WriteV5ZonedDateTime(const utils::ZonedDateTime &zoned_date_time) {
+    WriteRAW(utils::UnderlyingCast(Marker::TinyStruct3));
+    if (zoned_date_time.GetTimezone().InTzDatabase()) {
+      WriteRAW(utils::UnderlyingCast(Signature::DateTimeZoneId));
+      WriteInt(zoned_date_time.SysSecondsSinceEpoch().count());
+      WriteInt(zoned_date_time.SysSubSecondsAsNanoseconds().count());
+      WriteString(std::string{zoned_date_time.GetTimezone().TimezoneName()});
+    } else {
+      WriteRAW(utils::UnderlyingCast(Signature::DateTime));
+      WriteInt(zoned_date_time.SysSecondsSinceEpoch().count());
+      WriteInt(zoned_date_time.SysSubSecondsAsNanoseconds().count());
+      WriteInt(zoned_date_time.GetTimezone().DefiningOffsetSeconds());
+    }
+  }
+
+  void WriteZonedDateTime(const utils::ZonedDateTime &zoned_date_time) {
+    if (major_v_ > 4) {
+      WriteV5ZonedDateTime(zoned_date_time);
+    } else {
+      WriteLegacyZonedDateTime(zoned_date_time);
+    }
   }
 
   void WriteValue(const Value &value) {
@@ -287,8 +343,17 @@ class BaseEncoder {
       case Value::Type::LocalDateTime:
         WriteLocalDateTime(value.ValueLocalDateTime());
         break;
+      case Value::Type::ZonedDateTime:
+        WriteZonedDateTime(value.ValueZonedDateTime());
+        break;
       case Value::Type::Duration:
         WriteDuration(value.ValueDuration());
+        break;
+      case Value::Type::Point2d:
+        WritePoint2d(value.ValuePoint2d());
+        break;
+      case Value::Type::Point3d:
+        WritePoint3d(value.ValuePoint3d());
         break;
     }
   }

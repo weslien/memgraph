@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -17,18 +17,19 @@
 
 namespace memgraph::utils {
 
-void QueryMemoryTracker::TrackAlloc(size_t size) {
+bool QueryMemoryTracker::TrackAlloc(size_t size) {
   if (query_tracker_.has_value()) [[likely]] {
-    query_tracker_->Alloc(static_cast<int64_t>(size));
+    bool ok = query_tracker_->Alloc(static_cast<int64_t>(size));
+    if (!ok) return false;
   }
 
   auto *proc_tracker = GetActiveProc();
 
   if (proc_tracker == nullptr) {
-    return;
+    return true;
   }
 
-  proc_tracker->Alloc(static_cast<int64_t>(size));
+  return proc_tracker->Alloc(static_cast<int64_t>(size));
 }
 void QueryMemoryTracker::TrackFree(size_t size) {
   if (query_tracker_.has_value()) [[likely]] {
@@ -68,11 +69,12 @@ void QueryMemoryTracker::TryCreateProcTracker(int64_t procedure_id, size_t limit
   if (proc_memory_trackers_.contains(procedure_id)) {
     return;
   }
-  auto [it, inserted] = proc_memory_trackers_.emplace(procedure_id, utils::MemoryTracker{});
+  auto [it, inserted] = proc_memory_trackers_.emplace(std::piecewise_construct, std::forward_as_tuple(procedure_id),
+                                                      std::forward_as_tuple());
   it->second.SetMaximumHardLimit(static_cast<int64_t>(limit));
   it->second.SetHardLimit(static_cast<int64_t>(limit));
 }
 
-void QueryMemoryTracker::InitializeQueryTracker() { query_tracker_.emplace(MemoryTracker{}); }
+void QueryMemoryTracker::InitializeQueryTracker() { query_tracker_.emplace(); }
 
 }  // namespace memgraph::utils

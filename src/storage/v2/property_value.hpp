@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,14 +11,19 @@
 
 #pragma once
 
-#include <iostream>
+#include <iosfwd>
 #include <map>
 #include <string>
 #include <vector>
 
+#include "storage/v2/enum.hpp"
+#include "storage/v2/point.hpp"
 #include "storage/v2/temporal.hpp"
 #include "utils/algorithm.hpp"
 #include "utils/exceptions.hpp"
+
+#include <boost/container/flat_map.hpp>
+#include "range/v3/all.hpp"
 
 namespace memgraph::storage {
 
@@ -30,83 +35,198 @@ class PropertyValueException : public utils::BasicException {
   SPECIALIZE_GET_EXCEPTION_NAME(PropertyValueException)
 };
 
+// These are durable, do not chage there values
+enum class PropertyValueType : uint8_t {
+  Null = 0,
+  Bool = 1,
+  Int = 2,
+  Double = 3,
+  String = 4,
+  List = 5,
+  Map = 6,
+  TemporalData = 7,
+  ZonedTemporalData = 8,
+  Enum = 9,
+  Point2d = 10,
+  Point3d = 11,
+};
+
+inline bool AreComparableTypes(PropertyValueType a, PropertyValueType b) {
+  return (a == b) || (a == PropertyValueType::Int && b == PropertyValueType::Double) ||
+         (a == PropertyValueType::Double && b == PropertyValueType::Int);
+}
+
 /// Encapsulation of a value and its type in a class that has no compile-time
 /// info about the type.
 ///
 /// Values can be of a number of predefined types that are enumerated in
 /// PropertyValue::Type. Each such type corresponds to exactly one C++ type.
-class PropertyValue {
+template <typename Alloc>
+class PropertyValueImpl {
  public:
-  /// A value type, each type corresponds to exactly one C++ type.
-  enum class Type : uint8_t {
-    Null = 0,
-    Bool = 1,
-    Int = 2,
-    Double = 3,
-    String = 4,
-    List = 5,
-    Map = 6,
-    TemporalData = 7
-  };
+  using allocator_type = Alloc;
+  using alloc_trait = std::allocator_traits<allocator_type>;
 
-  static bool AreComparableTypes(Type a, Type b) {
-    return (a == b) || (a == Type::Int && b == Type::Double) || (a == Type::Double && b == Type::Int);
-  }
+  /// A value type, each type corresponds to exactly one C++ type.
+  using Type = PropertyValueType;
+
+  using string_t = std::basic_string<char, std::char_traits<char>, typename alloc_trait::template rebind_alloc<char>>;
+
+  using map_t =
+      boost::container::flat_map<string_t, PropertyValueImpl, std::less<>,
+                                 typename alloc_trait::template rebind_alloc<std::pair<string_t, PropertyValueImpl>>>;
+
+  using list_t = std::vector<PropertyValueImpl, typename alloc_trait::template rebind_alloc<PropertyValueImpl>>;
 
   /// Make a Null value
-  PropertyValue() : type_(Type::Null) {}
+  PropertyValueImpl(allocator_type const &alloc = allocator_type{}) : alloc_{alloc}, type_(Type::Null) {}
 
   // constructors for primitive types
-  explicit PropertyValue(const bool value) : type_(Type::Bool) { bool_v = value; }
-  explicit PropertyValue(const int value) : type_(Type::Int) { int_v = value; }
-  explicit PropertyValue(const int64_t value) : type_(Type::Int) { int_v = value; }
-  explicit PropertyValue(const double value) : type_(Type::Double) { double_v = value; }
-  explicit PropertyValue(const TemporalData value) : type_{Type::TemporalData} { temporal_data_v = value; }
+  explicit PropertyValueImpl(const bool value, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, bool_v{.val_ = value} {}
+  explicit PropertyValueImpl(const int value, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, int_v{.val_ = value} {}
+  explicit PropertyValueImpl(const int64_t value, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, int_v{.val_ = value} {}
+  explicit PropertyValueImpl(const double value, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, double_v{.val_ = value} {}
+  explicit PropertyValueImpl(const TemporalData value, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, temporal_data_v{.val_ = value} {}
+  explicit PropertyValueImpl(const ZonedTemporalData value, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, zoned_temporal_data_v{.val_ = value} {}
+  explicit PropertyValueImpl(const Enum value, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, enum_data_v{.val_ = value} {}
+  explicit PropertyValueImpl(const Point2d value, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, point2d_data_v{.val_ = value} {}
+  explicit PropertyValueImpl(const Point3d value, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, point3d_data_v{.val_ = value} {}
 
   // copy constructors for non-primitive types
   /// @throw std::bad_alloc
-  explicit PropertyValue(const std::string &value) : type_(Type::String) { new (&string_v) std::string(value); }
+  explicit PropertyValueImpl(string_t const &value) : alloc_{value.get_allocator()}, string_v{.val_ = value} {}
+  explicit PropertyValueImpl(string_t &&value) : alloc_{value.get_allocator()}, string_v{.val_ = std::move(value)} {}
+  explicit PropertyValueImpl(string_t const &value, allocator_type const &alloc)
+      : alloc_{alloc}, string_v{.val_ = string_t{value, alloc}} {}
+  explicit PropertyValueImpl(string_t &&value, allocator_type const &alloc)
+      : alloc_{alloc}, string_v{.val_ = string_t{std::move(value), alloc}} {}
+
   /// @throw std::bad_alloc
   /// @throw std::length_error if length of value exceeds
   ///        std::string::max_length().
-  explicit PropertyValue(const char *value) : type_(Type::String) { new (&string_v) std::string(value); }
-  /// @throw std::bad_alloc
-  explicit PropertyValue(const std::vector<PropertyValue> &value) : type_(Type::List) {
-    new (&list_v) std::vector<PropertyValue>(value);
-  }
-  /// @throw std::bad_alloc
-  explicit PropertyValue(const std::map<std::string, PropertyValue> &value) : type_(Type::Map) {
-    new (&map_v) std::map<std::string, PropertyValue>(value);
-  }
+  explicit PropertyValueImpl(std::string_view value, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, string_v{.val_ = string_t{value, alloc}} {}
+  explicit PropertyValueImpl(char const *value, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, string_v{.val_ = string_t{value, alloc}} {}
 
-  // move constructors for non-primitive types
-  explicit PropertyValue(std::string &&value) noexcept : type_(Type::String) {
-    new (&string_v) std::string(std::move(value));
-  }
-  explicit PropertyValue(std::vector<PropertyValue> &&value) noexcept : type_(Type::List) {
-    new (&list_v) std::vector<PropertyValue>(std::move(value));
-  }
-  explicit PropertyValue(std::map<std::string, PropertyValue> &&value) noexcept : type_(Type::Map) {
-    new (&map_v) std::map<std::string, PropertyValue>(std::move(value));
-  }
+  /// @throw std::bad_alloc
+  explicit PropertyValueImpl(list_t const &value) : alloc_{value.get_allocator()}, list_v{.val_ = value} {}
+  explicit PropertyValueImpl(list_t &&value) : alloc_{value.get_allocator()}, list_v{.val_ = std::move(value)} {}
+  explicit PropertyValueImpl(list_t const &value, allocator_type const &alloc)
+      : alloc_{alloc}, list_v{.val_ = list_t{value, alloc}} {}
+  explicit PropertyValueImpl(list_t &&value, allocator_type const &alloc)
+      : alloc_{alloc}, list_v{.val_ = list_t{std::move(value), alloc}} {}
+
+  /// @throw std::bad_alloc
+  explicit PropertyValueImpl(map_t const &value) : alloc_{value.get_allocator()}, map_v{.val_ = value} {}
+  explicit PropertyValueImpl(map_t &&value) : alloc_{value.get_allocator()}, map_v{.val_ = std::move(value)} {}
+  explicit PropertyValueImpl(map_t const &value, allocator_type const &alloc)
+      : alloc_{alloc}, map_v{.val_ = map_t{value, alloc}} {}
+  explicit PropertyValueImpl(map_t &&value, allocator_type const &alloc)
+      : alloc_{alloc}, map_v{.val_ = map_t{std::move(value), alloc}} {}
 
   // copy constructor
   /// @throw std::bad_alloc
-  PropertyValue(const PropertyValue &other);
+  PropertyValueImpl(const PropertyValueImpl &other);
+  PropertyValueImpl(const PropertyValueImpl &other, allocator_type const &alloc);
 
   // move constructor
-  PropertyValue(PropertyValue &&other) noexcept;
+  PropertyValueImpl(PropertyValueImpl &&other) noexcept;
+  PropertyValueImpl(PropertyValueImpl &&other, allocator_type const &alloc) noexcept;
 
   // copy assignment
   /// @throw std::bad_alloc
-  PropertyValue &operator=(const PropertyValue &other);
+  PropertyValueImpl &operator=(const PropertyValueImpl &other);
 
   // move assignment
-  PropertyValue &operator=(PropertyValue &&other) noexcept;
+  PropertyValueImpl &operator=(PropertyValueImpl &&other) noexcept(
+      alloc_trait::is_always_equal::value || alloc_trait::propagate_on_container_move_assignment::value);
+
   // TODO: Implement copy assignment operators for primitive types.
   // TODO: Implement copy and move assignment operators for non-primitive types.
 
-  ~PropertyValue() { DestroyValue(); }
+  template <typename AllocOther>
+  friend class PropertyValueImpl;
+
+  /// Copy accross allocators
+  template <typename AllocOther>
+  requires(!std::same_as<allocator_type, AllocOther>)
+      PropertyValueImpl(PropertyValueImpl<AllocOther> const &other, allocator_type const &alloc = allocator_type{})
+      : alloc_{alloc}, type_{other.type_} {
+    switch (other.type_) {
+      case Type::Null:
+        return;
+      case Type::Bool:
+        bool_v.val_ = other.bool_v.val_;
+        return;
+      case Type::Int:
+        int_v.val_ = other.int_v.val_;
+        return;
+      case Type::Double:
+        double_v.val_ = other.double_v.val_;
+        return;
+      case Type::String:
+        alloc_trait::construct(alloc_, &string_v.val_, other.string_v.val_);
+        return;
+      case Type::List:
+        alloc_trait::construct(alloc_, &list_v.val_, other.list_v.val_.begin(), other.list_v.val_.end());
+        return;
+      case Type::Map:
+        alloc_trait::construct(alloc_, &map_v.val_, other.map_v.val_.begin(), other.map_v.val_.end());
+        return;
+      case Type::TemporalData:
+        temporal_data_v.val_ = other.temporal_data_v.val_;
+        return;
+      case Type::ZonedTemporalData:
+        zoned_temporal_data_v.val_ = other.zoned_temporal_data_v.val_;
+        return;
+      case Type::Enum:
+        enum_data_v.val_ = other.enum_data_v.val_;
+        return;
+      case Type::Point2d:
+        point2d_data_v.val_ = other.point2d_data_v.val_;
+        return;
+      case Type::Point3d:
+        point3d_data_v.val_ = other.point3d_data_v.val_;
+        return;
+    }
+  }
+
+  ~PropertyValueImpl() {
+    switch (type_) {
+      // destructor for primitive types does nothing
+      case Type::Null:
+      case Type::Bool:
+      case Type::Int:
+      case Type::Double:
+      case Type::TemporalData:
+      case Type::ZonedTemporalData:
+        // Do nothing: std::chrono::time_zone* pointers reference immutable values from the external tz DB
+      case Type::Enum:
+      case Type::Point2d:
+      case Type::Point3d:
+        return;
+      // destructor for non primitive types since we used placement new
+      case Type::String:
+        alloc_trait::destroy(alloc_, &string_v.val_);
+        return;
+      case Type::List:
+        alloc_trait::destroy(alloc_, &list_v.val_);
+        return;
+      case Type::Map:
+        alloc_trait::destroy(alloc_, &map_v.val_);
+        return;
+    }
+  }
 
   Type type() const { return type_; }
 
@@ -118,378 +238,662 @@ class PropertyValue {
   bool IsString() const { return type_ == Type::String; }
   bool IsList() const { return type_ == Type::List; }
   bool IsMap() const { return type_ == Type::Map; }
+  bool IsEnum() const { return type_ == Type::Enum; }
   bool IsTemporalData() const { return type_ == Type::TemporalData; }
+  bool IsZonedTemporalData() const { return type_ == Type::ZonedTemporalData; }
+  bool IsPoint2d() const { return type_ == Type::Point2d; }
+  bool IsPoint3d() const { return type_ == Type::Point3d; }
 
   // value getters for primitive types
   /// @throw PropertyValueException if value isn't of correct type.
   bool ValueBool() const {
-    if (type_ != Type::Bool) {
+    if (type_ != Type::Bool) [[unlikely]] {
       throw PropertyValueException("The value isn't a bool!");
     }
-    return bool_v;
+    return bool_v.val_;
   }
   /// @throw PropertyValueException if value isn't of correct type.
-  int64_t ValueInt() const {
-    if (type_ != Type::Int) {
+  auto ValueInt() const -> int64_t {
+    if (type_ != Type::Int) [[unlikely]] {
       throw PropertyValueException("The value isn't an int!");
     }
-    return int_v;
+    return int_v.val_;
   }
   /// @throw PropertyValueException if value isn't of correct type.
-  double ValueDouble() const {
-    if (type_ != Type::Double) {
+  auto ValueDouble() const -> double {
+    if (type_ != Type::Double) [[unlikely]] {
       throw PropertyValueException("The value isn't a double!");
     }
-    return double_v;
+    return double_v.val_;
   }
 
   /// @throw PropertyValueException if value isn't of correct type.
-  TemporalData ValueTemporalData() const {
-    if (type_ != Type::TemporalData) {
+  auto ValueTemporalData() const -> TemporalData {
+    if (type_ != Type::TemporalData) [[unlikely]] {
       throw PropertyValueException("The value isn't a temporal data!");
     }
 
-    return temporal_data_v;
+    return temporal_data_v.val_;
+  }
+
+  auto ValueZonedTemporalData() const -> ZonedTemporalData {
+    if (type_ != Type::ZonedTemporalData) [[unlikely]] {
+      throw PropertyValueException("The value isn't a zoned temporal datum!");
+    }
+
+    return zoned_temporal_data_v.val_;
+  }
+
+  auto ValueEnum() const -> Enum {
+    if (type_ != Type::Enum) [[unlikely]] {
+      throw PropertyValueException("The value isn't an enum!");
+    }
+
+    return enum_data_v.val_;
+  }
+
+  auto ValuePoint2d() const -> Point2d {
+    if (type_ != Type::Point2d) [[unlikely]] {
+      throw PropertyValueException("The value isn't a 2d point!");
+    }
+
+    return point2d_data_v.val_;
+  }
+
+  auto ValuePoint3d() const -> Point3d {
+    if (type_ != Type::Point3d) [[unlikely]] {
+      throw PropertyValueException("The value isn't a 3d point!");
+    }
+
+    return point3d_data_v.val_;
   }
 
   // const value getters for non-primitive types
   /// @throw PropertyValueException if value isn't of correct type.
-  const std::string &ValueString() const {
-    if (type_ != Type::String) {
+  auto ValueString() const -> string_t const & {
+    if (type_ != Type::String) [[unlikely]] {
       throw PropertyValueException("The value isn't a string!");
     }
-    return string_v;
+    return string_v.val_;
   }
 
   /// @throw PropertyValueException if value isn't of correct type.
-  const std::vector<PropertyValue> &ValueList() const {
-    if (type_ != Type::List) {
+  auto ValueList() const -> list_t const & {
+    if (type_ != Type::List) [[unlikely]] {
       throw PropertyValueException("The value isn't a list!");
     }
-    return list_v;
+    return list_v.val_;
   }
 
   /// @throw PropertyValueException if value isn't of correct type.
-  const std::map<std::string, PropertyValue> &ValueMap() const {
-    if (type_ != Type::Map) {
+  auto ValueMap() const -> map_t const & {
+    if (type_ != Type::Map) [[unlikely]] {
       throw PropertyValueException("The value isn't a map!");
     }
-    return map_v;
+    return map_v.val_;
   }
 
   // reference value getters for non-primitive types
   /// @throw PropertyValueException if value isn't of correct type.
-  std::string &ValueString() {
-    if (type_ != Type::String) {
+  auto ValueString() -> string_t & {
+    if (type_ != Type::String) [[unlikely]] {
       throw PropertyValueException("The value isn't a string!");
     }
-    return string_v;
+    return string_v.val_;
   }
 
   /// @throw PropertyValueException if value isn't of correct type.
-  std::vector<PropertyValue> &ValueList() {
-    if (type_ != Type::List) {
+  auto ValueList() -> list_t & {
+    if (type_ != Type::List) [[unlikely]] {
       throw PropertyValueException("The value isn't a list!");
     }
-    return list_v;
+    return list_v.val_;
   }
 
   /// @throw PropertyValueException if value isn't of correct type.
-  std::map<std::string, PropertyValue> &ValueMap() {
-    if (type_ != Type::Map) {
+  auto ValueMap() -> map_t & {
+    if (type_ != Type::Map) [[unlikely]] {
       throw PropertyValueException("The value isn't a map!");
     }
-    return map_v;
+    return map_v.val_;
   }
 
  private:
-  void DestroyValue() noexcept;
+  [[no_unique_address]] allocator_type alloc_;
 
+  // NOTE: this may look strange but it is for better data layout
+  //       https://eel.is/c++draft/class.union#general-note-1
   union {
-    bool bool_v;
-    int64_t int_v;
-    double double_v;
-    std::string string_v;
-    std::vector<PropertyValue> list_v;
-    std::map<std::string, PropertyValue> map_v;
-    TemporalData temporal_data_v;
+    Type type_;
+    struct {
+      Type type_ = Type::Bool;
+      bool val_;
+    } bool_v;
+    struct {
+      Type type_ = Type::Int;
+      int64_t val_;
+    } int_v;
+    struct {
+      Type type_ = Type::Double;
+      double val_;
+    } double_v;
+    struct {
+      Type type_ = Type::String;
+      string_t val_;
+    } string_v;
+    struct {
+      Type type_ = Type::List;
+      list_t val_;
+    } list_v;
+    struct {
+      Type type_ = Type::Map;
+      map_t val_;
+    } map_v;
+    struct {
+      Type type_ = Type::TemporalData;
+      TemporalData val_;
+    } temporal_data_v;
+    struct {
+      Type type_ = Type::ZonedTemporalData;
+      ZonedTemporalData val_;
+    } zoned_temporal_data_v;  // FYI: current largest member at 40B
+    struct {
+      Type type_ = Type::Enum;
+      Enum val_;
+    } enum_data_v;
+    struct {
+      Type type_ = Type::Point2d;
+      Point2d val_;
+    } point2d_data_v;
+    struct {
+      Type type_ = Type::Point3d;
+      Point3d val_;
+    } point3d_data_v;
   };
-
-  Type type_;
 };
+
+using PropertyValue = PropertyValueImpl<std::allocator<void>>;
+namespace pmr {
+using PropertyValue = PropertyValueImpl<std::pmr::polymorphic_allocator<std::byte>>;
+}
+
+struct ExtendedPropertyType {
+  PropertyValueType type{PropertyValueType::Null};
+  TemporalType temporal_type{};
+  EnumTypeId enum_type{};
+
+  ExtendedPropertyType() {}
+  explicit ExtendedPropertyType(PropertyValueType type) : type{type} {}
+  explicit ExtendedPropertyType(TemporalType temporal_type)
+      : type{PropertyValueType::TemporalData}, temporal_type{temporal_type} {}
+  explicit ExtendedPropertyType(EnumTypeId enum_type) : type{PropertyValueType::Enum}, enum_type{enum_type} {}
+  explicit ExtendedPropertyType(const PropertyValue &val) : type{val.type()} {
+    if (type == PropertyValueType::TemporalData) {
+      temporal_type = val.ValueTemporalData().type;
+    }
+    if (type == PropertyValueType::Enum) {
+      enum_type = val.ValueEnum().type_id();
+    }
+  }
+
+  bool operator==(const ExtendedPropertyType &other) const {
+    return type == other.type && temporal_type == other.temporal_type && enum_type == other.enum_type;
+  }
+};
+
+static_assert(sizeof(PropertyValue) == 40);
+static_assert(sizeof(pmr::PropertyValue) == 56);
 
 // stream output
 /// @throw anything std::ostream::operator<< may throw.
-inline std::ostream &operator<<(std::ostream &os, const PropertyValue::Type type) {
+inline std::ostream &operator<<(std::ostream &os, const PropertyValueType type) {
   switch (type) {
-    case PropertyValue::Type::Null:
+    case PropertyValueType::Null:
       return os << "null";
-    case PropertyValue::Type::Bool:
+    case PropertyValueType::Bool:
       return os << "bool";
-    case PropertyValue::Type::Int:
+    case PropertyValueType::Int:
       return os << "int";
-    case PropertyValue::Type::Double:
+    case PropertyValueType::Double:
       return os << "double";
-    case PropertyValue::Type::String:
+    case PropertyValueType::String:
       return os << "string";
-    case PropertyValue::Type::List:
+    case PropertyValueType::List:
       return os << "list";
-    case PropertyValue::Type::Map:
+    case PropertyValueType::Map:
       return os << "map";
-    case PropertyValue::Type::TemporalData:
+    case PropertyValueType::TemporalData:
       return os << "temporal data";
+    case PropertyValueType::ZonedTemporalData:
+      return os << "zoned temporal data";
+    case PropertyValueType::Enum:
+      return os << "enum";
+    case PropertyValueType::Point2d:
+      return os << "point";
+    case PropertyValueType::Point3d:
+      return os << "point";
   }
 }
+
 /// @throw anything std::ostream::operator<< may throw.
-inline std::ostream &operator<<(std::ostream &os, const PropertyValue &value) {
+template <typename Alloc>
+inline std::ostream &operator<<(std::ostream &os, const PropertyValueImpl<Alloc> &value) {
+  // These can appear in log messages
   switch (value.type()) {
-    case PropertyValue::Type::Null:
+    case PropertyValueType::Null:
       return os << "null";
-    case PropertyValue::Type::Bool:
+    case PropertyValueType::Bool:
       return os << (value.ValueBool() ? "true" : "false");
-    case PropertyValue::Type::Int:
+    case PropertyValueType::Int:
       return os << value.ValueInt();
-    case PropertyValue::Type::Double:
+    case PropertyValueType::Double:
       return os << value.ValueDouble();
-    case PropertyValue::Type::String:
-      return os << value.ValueString();
-    case PropertyValue::Type::List:
+    case PropertyValueType::String:
+      return os << "\"" << value.ValueString() << "\"";
+    case PropertyValueType::List:
       os << "[";
       utils::PrintIterable(os, value.ValueList());
       return os << "]";
-    case PropertyValue::Type::Map:
+    case PropertyValueType::Map:
       os << "{";
       utils::PrintIterable(os, value.ValueMap(), ", ",
                            [](auto &stream, const auto &pair) { stream << pair.first << ": " << pair.second; });
       return os << "}";
-    case PropertyValue::Type::TemporalData:
-      return os << fmt::format("type: {}, microseconds: {}", TemporalTypeTostring(value.ValueTemporalData().type),
+    case PropertyValueType::TemporalData:
+      return os << fmt::format("type: {}, microseconds: {}", TemporalTypeToString(value.ValueTemporalData().type),
                                value.ValueTemporalData().microseconds);
+    case PropertyValueType::ZonedTemporalData: {
+      auto const &temp_value = value.ValueZonedTemporalData();
+      return os << fmt::format("type: {}, microseconds: {}, timezone: {}", ZonedTemporalTypeToString(temp_value.type),
+                               temp_value.IntMicroseconds(), temp_value.TimezoneToString());
+    }
+    case PropertyValueType::Enum: {
+      auto const &[e_type, e_value] = value.ValueEnum();
+
+      return os << fmt::format("{{ type: {}, value: {} }}", e_type.value_of(), e_value.value_of());
+    }
+    case PropertyValueType::Point2d: {
+      const auto point = value.ValuePoint2d();
+      return os << fmt::format("point({{ x:{}, y:{}, srid:{} }})", point.x(), point.y(),
+                               CrsToSrid(point.crs()).value_of());
+    }
+    case PropertyValueType::Point3d: {
+      const auto point = value.ValuePoint3d();
+      return os << fmt::format("point({{ x:{}, y:{}, z:{}, srid:{} }})", point.x(), point.y(), point.z(),
+                               CrsToSrid(point.crs()).value_of());
+    }
   }
 }
 
 // NOTE: The logic in this function *MUST* be equal to the logic in
 // `PropertyStore::ComparePropertyValue`. If you change this operator make sure
 // to change the function so that they have identical functionality.
-inline bool operator==(const PropertyValue &first, const PropertyValue &second) noexcept {
-  if (!PropertyValue::AreComparableTypes(first.type(), second.type())) return false;
+template <typename Alloc, typename Alloc2>
+inline bool operator==(const PropertyValueImpl<Alloc> &first, const PropertyValueImpl<Alloc2> &second) noexcept {
+  if (!AreComparableTypes(first.type(), second.type())) return false;
   switch (first.type()) {
-    case PropertyValue::Type::Null:
+    case PropertyValueType::Null:
       return true;
-    case PropertyValue::Type::Bool:
+    case PropertyValueType::Bool:
       return first.ValueBool() == second.ValueBool();
-    case PropertyValue::Type::Int:
-      if (second.type() == PropertyValue::Type::Double) {
+    case PropertyValueType::Int:
+      if (second.type() == PropertyValueType::Double) [[unlikely]] {
         return first.ValueInt() == second.ValueDouble();
       } else {
         return first.ValueInt() == second.ValueInt();
       }
-    case PropertyValue::Type::Double:
-      if (second.type() == PropertyValue::Type::Double) {
+    case PropertyValueType::Double:
+      if (second.type() == PropertyValueType::Double) {
         return first.ValueDouble() == second.ValueDouble();
       } else {
         return first.ValueDouble() == second.ValueInt();
       }
-    case PropertyValue::Type::String:
-      return first.ValueString() == second.ValueString();
-    case PropertyValue::Type::List:
-      return first.ValueList() == second.ValueList();
-    case PropertyValue::Type::Map:
-      return first.ValueMap() == second.ValueMap();
-    case PropertyValue::Type::TemporalData:
+    case PropertyValueType::String:
+      // using string_view for allocator agnostic compare
+      return std::string_view{first.ValueString()} == second.ValueString();
+    case PropertyValueType::List:
+      return std::ranges::equal(first.ValueList(), second.ValueList(), std::equal_to<>{});
+    case PropertyValueType::Map: {
+      auto const &m1 = first.ValueMap();
+      auto const &m2 = second.ValueMap();
+      if (m1.size() != m2.size()) return false;
+      for (auto &&[v1, v2] : ranges::views::zip(m1, m2)) {
+        if (std::string_view{v1.first} != v2.first) return false;
+        if (v1.second != v2.second) return false;
+      }
+      return true;
+    }
+    case PropertyValueType::TemporalData:
       return first.ValueTemporalData() == second.ValueTemporalData();
+    case PropertyValueType::ZonedTemporalData:
+      return first.ValueZonedTemporalData() == second.ValueZonedTemporalData();
+    case PropertyValueType::Enum:
+      return first.ValueEnum() == second.ValueEnum();
+    case PropertyValueType::Point2d:
+      return first.ValuePoint2d() == second.ValuePoint2d();
+    case PropertyValueType::Point3d:
+      return first.ValuePoint3d() == second.ValuePoint3d();
   }
 }
 
+template <typename Alloc, typename Alloc2>
+inline bool operator!=(const PropertyValueImpl<Alloc> &first, const PropertyValueImpl<Alloc2> &second) noexcept {
+  return !(first == second);
+}
+
 /// NOLINTNEXTLINE(bugprone-exception-escape)
-inline bool operator<(const PropertyValue &first, const PropertyValue &second) noexcept {
-  if (!PropertyValue::AreComparableTypes(first.type(), second.type())) return first.type() < second.type();
+template <typename Alloc>
+inline bool operator<(const PropertyValueImpl<Alloc> &first, const PropertyValueImpl<Alloc> &second) noexcept {
+  if (!AreComparableTypes(first.type(), second.type())) return first.type() < second.type();
   switch (first.type()) {
-    case PropertyValue::Type::Null:
+    case PropertyValueType::Null:
       return false;
-    case PropertyValue::Type::Bool:
+    case PropertyValueType::Bool:
       return first.ValueBool() < second.ValueBool();
-    case PropertyValue::Type::Int:
-      if (second.type() == PropertyValue::Type::Double) {
+    case PropertyValueType::Int:
+      if (second.type() == PropertyValueType::Double) [[unlikely]] {
         return first.ValueInt() < second.ValueDouble();
       } else {
         return first.ValueInt() < second.ValueInt();
       }
-    case PropertyValue::Type::Double:
-      if (second.type() == PropertyValue::Type::Double) {
+    case PropertyValueType::Double:
+      if (second.type() == PropertyValueType::Double) {
         return first.ValueDouble() < second.ValueDouble();
       } else {
         return first.ValueDouble() < second.ValueInt();
       }
-    case PropertyValue::Type::String:
+    case PropertyValueType::String:
       return first.ValueString() < second.ValueString();
-    case PropertyValue::Type::List:
+    case PropertyValueType::List:
       return first.ValueList() < second.ValueList();
-    case PropertyValue::Type::Map:
+    case PropertyValueType::Map:
       return first.ValueMap() < second.ValueMap();
-    case PropertyValue::Type::TemporalData:
+    case PropertyValueType::TemporalData:
       return first.ValueTemporalData() < second.ValueTemporalData();
+    case PropertyValueType::ZonedTemporalData:
+      return first.ValueZonedTemporalData() < second.ValueZonedTemporalData();
+    case PropertyValueType::Enum:
+      return first.ValueEnum() < second.ValueEnum();
+    case PropertyValueType::Point2d:
+      return first.ValuePoint2d() < second.ValuePoint2d();
+    case PropertyValueType::Point3d:
+      return first.ValuePoint3d() < second.ValuePoint3d();
   }
 }
 
 /// NOLINTNEXTLINE(bugprone-exception-escape)
-inline bool operator>(const PropertyValue &first, const PropertyValue &second) noexcept { return second < first; }
+template <typename Alloc>
+inline bool operator>(const PropertyValueImpl<Alloc> &lhs, const PropertyValueImpl<Alloc> &rhs) noexcept {
+  return rhs < lhs;
+}
+template <typename Alloc>
+inline bool operator>=(const PropertyValueImpl<Alloc> &lhs, const PropertyValueImpl<Alloc> &rhs) noexcept {
+  return !(lhs < rhs);
+}
+template <typename Alloc>
+inline bool operator<=(const PropertyValueImpl<Alloc> &lhs, const PropertyValueImpl<Alloc> &rhs) noexcept {
+  return !(rhs < lhs);
+}
 
-inline PropertyValue::PropertyValue(const PropertyValue &other) : type_(other.type_) {
+template <typename Alloc>
+inline PropertyValueImpl<Alloc>::PropertyValueImpl(const PropertyValueImpl &other)
+    : PropertyValueImpl{other, other.alloc_} {}
+
+template <typename Alloc>
+inline PropertyValueImpl<Alloc>::PropertyValueImpl(const PropertyValueImpl &other, allocator_type const &alloc)
+    : alloc_{alloc}, type_(other.type_) {
   switch (other.type_) {
     case Type::Null:
       return;
     case Type::Bool:
-      this->bool_v = other.bool_v;
+      bool_v.val_ = other.bool_v.val_;
       return;
     case Type::Int:
-      this->int_v = other.int_v;
+      int_v.val_ = other.int_v.val_;
       return;
     case Type::Double:
-      this->double_v = other.double_v;
+      double_v.val_ = other.double_v.val_;
       return;
     case Type::String:
-      new (&string_v) std::string(other.string_v);
+      alloc_trait::construct(alloc_, &string_v.val_, other.string_v.val_);
       return;
     case Type::List:
-      new (&list_v) std::vector<PropertyValue>(other.list_v);
+      alloc_trait::construct(alloc_, &list_v.val_, other.list_v.val_);
       return;
     case Type::Map:
-      new (&map_v) std::map<std::string, PropertyValue>(other.map_v);
+      alloc_trait::construct(alloc_, &map_v.val_, other.map_v.val_);
       return;
     case Type::TemporalData:
-      this->temporal_data_v = other.temporal_data_v;
+      temporal_data_v.val_ = other.temporal_data_v.val_;
+      return;
+    case Type::ZonedTemporalData:
+      zoned_temporal_data_v.val_ = other.zoned_temporal_data_v.val_;
+      return;
+    case Type::Enum:
+      enum_data_v.val_ = other.enum_data_v.val_;
+      return;
+    case Type::Point2d:
+      point2d_data_v.val_ = other.point2d_data_v.val_;
+      return;
+    case Type::Point3d:
+      point3d_data_v.val_ = other.point3d_data_v.val_;
       return;
   }
 }
 
-inline PropertyValue::PropertyValue(PropertyValue &&other) noexcept : type_(other.type_) {
-  switch (other.type_) {
-    case Type::Null:
-      break;
-    case Type::Bool:
-      this->bool_v = other.bool_v;
-      break;
-    case Type::Int:
-      this->int_v = other.int_v;
-      break;
-    case Type::Double:
-      this->double_v = other.double_v;
-      break;
-    case Type::String:
-      new (&string_v) std::string(std::move(other.string_v));
-      break;
-    case Type::List:
-      new (&list_v) std::vector<PropertyValue>(std::move(other.list_v));
-      break;
-    case Type::Map:
-      new (&map_v) std::map<std::string, PropertyValue>(std::move(other.map_v));
-      break;
-    case Type::TemporalData:
-      this->temporal_data_v = other.temporal_data_v;
-      break;
-  }
+template <typename Alloc>
+inline PropertyValueImpl<Alloc>::PropertyValueImpl(PropertyValueImpl &&other) noexcept
+    : PropertyValueImpl{std::move(other), other.alloc_} {}
 
-  // reset the type of other
-  other.DestroyValue();
-  other.type_ = Type::Null;
-}
-
-inline PropertyValue &PropertyValue::operator=(const PropertyValue &other) {
-  if (this == &other) return *this;
-
-  DestroyValue();
-  type_ = other.type_;
-
-  switch (other.type_) {
-    case Type::Null:
-      break;
-    case Type::Bool:
-      this->bool_v = other.bool_v;
-      break;
-    case Type::Int:
-      this->int_v = other.int_v;
-      break;
-    case Type::Double:
-      this->double_v = other.double_v;
-      break;
-    case Type::String:
-      new (&string_v) std::string(other.string_v);
-      break;
-    case Type::List:
-      new (&list_v) std::vector<PropertyValue>(other.list_v);
-      break;
-    case Type::Map:
-      new (&map_v) std::map<std::string, PropertyValue>(other.map_v);
-      break;
-    case Type::TemporalData:
-      this->temporal_data_v = other.temporal_data_v;
-      break;
-  }
-
-  return *this;
-}
-
-inline PropertyValue &PropertyValue::operator=(PropertyValue &&other) noexcept {
-  if (this == &other) return *this;
-
-  DestroyValue();
-  type_ = other.type_;
-
-  switch (other.type_) {
-    case Type::Null:
-      break;
-    case Type::Bool:
-      this->bool_v = other.bool_v;
-      break;
-    case Type::Int:
-      this->int_v = other.int_v;
-      break;
-    case Type::Double:
-      this->double_v = other.double_v;
-      break;
-    case Type::String:
-      new (&string_v) std::string(std::move(other.string_v));
-      break;
-    case Type::List:
-      new (&list_v) std::vector<PropertyValue>(std::move(other.list_v));
-      break;
-    case Type::Map:
-      new (&map_v) std::map<std::string, PropertyValue>(std::move(other.map_v));
-      break;
-    case Type::TemporalData:
-      this->temporal_data_v = other.temporal_data_v;
-      break;
-  }
-
-  // reset the type of other
-  other.DestroyValue();
-  other.type_ = Type::Null;
-
-  return *this;
-}
-
-inline void PropertyValue::DestroyValue() noexcept {
+template <typename Alloc>
+inline PropertyValueImpl<Alloc>::PropertyValueImpl(PropertyValueImpl &&other, allocator_type const &alloc) noexcept
+    : alloc_{alloc}, type_(other.type_) {
   switch (type_) {
-    // destructor for primitive types does nothing
     case Type::Null:
+      break;
     case Type::Bool:
+      bool_v.val_ = other.bool_v.val_;
+      break;
     case Type::Int:
+      int_v.val_ = other.int_v.val_;
+      break;
     case Type::Double:
-    case Type::TemporalData:
-      return;
-
-    // destructor for non primitive types since we used placement new
+      double_v.val_ = other.double_v.val_;
+      break;
     case Type::String:
-      std::destroy_at(&string_v);
-      return;
+      alloc_trait::construct(alloc_, &string_v.val_, std::move(other.string_v.val_));
+      break;
     case Type::List:
-      std::destroy_at(&list_v);
-      return;
+      alloc_trait::construct(alloc_, &list_v.val_, std::move(other.list_v.val_));
+      break;
     case Type::Map:
-      std::destroy_at(&map_v);
-      return;
+      alloc_trait::construct(alloc_, &map_v.val_, std::move(other.map_v.val_));
+      break;
+    case Type::TemporalData:
+      temporal_data_v.val_ = other.temporal_data_v.val_;
+      break;
+    case Type::ZonedTemporalData:
+      zoned_temporal_data_v.val_ = other.zoned_temporal_data_v.val_;
+      break;
+    case Type::Enum:
+      enum_data_v.val_ = other.enum_data_v.val_;
+      break;
+    case Type::Point2d:
+      point2d_data_v.val_ = other.point2d_data_v.val_;
+      break;
+    case Type::Point3d:
+      point3d_data_v.val_ = other.point3d_data_v.val_;
+      break;
+  }
+}
+
+template <typename Alloc>
+inline auto PropertyValueImpl<Alloc>::operator=(PropertyValueImpl const &other) -> PropertyValueImpl & {
+  auto do_copy = [&]() -> PropertyValueImpl<allocator_type> & {
+    // if same type try assignment
+    if (type_ == other.type_) {
+      if (this == &other) return *this;
+      switch (other.type_) {
+        case Type::Null:
+          break;
+        case Type::Bool:
+          bool_v.val_ = other.bool_v.val_;
+          break;
+        case Type::Int:
+          int_v.val_ = other.int_v.val_;
+          break;
+        case Type::Double:
+          double_v.val_ = other.double_v.val_;
+          break;
+        case Type::String:
+          string_v.val_ = string_t{other.string_v.val_, alloc_};
+          break;
+        case Type::List:
+          list_v.val_ = list_t(other.list_v.val_, alloc_);
+          break;
+        case Type::Map:
+          map_v.val_ = map_t(other.map_v.val_, alloc_);
+          break;
+        case Type::TemporalData:
+          temporal_data_v.val_ = other.temporal_data_v.val_;
+          break;
+        case Type::ZonedTemporalData:
+          zoned_temporal_data_v.val_ = other.zoned_temporal_data_v.val_;
+          break;
+        case Type::Enum:
+          enum_data_v.val_ = other.enum_data_v.val_;
+          break;
+        case Type::Point2d:
+          point2d_data_v.val_ = other.point2d_data_v.val_;
+          break;
+        case Type::Point3d:
+          point3d_data_v.val_ = other.point3d_data_v.val_;
+          break;
+      }
+      return *this;
+    } else {
+      alloc_trait::destroy(alloc_, this);
+      try {
+        auto *new_this = std::launder(this);
+        alloc_trait::construct(alloc_, new_this, other);
+        return *new_this;
+      } catch (...) {
+        type_ = Type::Null;
+        throw;
+      }
+    }
+  };
+
+  if constexpr (alloc_trait::is_always_equal::value) {
+    return do_copy();
+  } else {
+    if (other.alloc_ == alloc_) {
+      return do_copy();
+    } else {
+      if constexpr (alloc_trait::propagate_on_container_copy_assignment::value) {
+        auto oldalloc = alloc_;
+        try {
+          alloc_ = other.alloc_;
+          return do_copy();
+        } catch (...) {
+          alloc_ = oldalloc;
+          throw;
+        }
+      }
+      return do_copy();
+    }
+  }
+}
+
+template <typename Alloc>
+inline auto PropertyValueImpl<Alloc>::operator=(PropertyValueImpl &&other) noexcept(
+    alloc_trait::is_always_equal::value || alloc_trait::propagate_on_container_move_assignment::value)
+    -> PropertyValueImpl<allocator_type> & {
+  auto do_move = [&]() -> PropertyValueImpl<allocator_type> & {
+    if (type_ == other.type_) {
+      // maybe the same object, check if no work is required
+      if (this == &other) return *this;
+
+      switch (type_) {
+        case Type::Null:
+          break;
+        case Type::Bool:
+          bool_v.val_ = other.bool_v.val_;
+          break;
+        case Type::Int:
+          int_v.val_ = other.int_v.val_;
+          break;
+        case Type::Double:
+          double_v.val_ = other.double_v.val_;
+          break;
+        case Type::String:
+          string_v.val_ = std::move(other.string_v.val_);
+          break;
+        case Type::List:
+          list_v.val_ = std::move(other.list_v.val_);
+          break;
+        case Type::Map:
+          map_v.val_ = std::move(other.map_v.val_);
+          break;
+        case Type::TemporalData:
+          temporal_data_v.val_ = other.temporal_data_v.val_;
+          break;
+        case Type::ZonedTemporalData:
+          zoned_temporal_data_v.val_ = other.zoned_temporal_data_v.val_;
+          break;
+        case Type::Enum:
+          enum_data_v.val_ = other.enum_data_v.val_;
+          break;
+        case Type::Point2d:
+          point2d_data_v.val_ = other.point2d_data_v.val_;
+          break;
+        case Type::Point3d:
+          point3d_data_v.val_ = other.point3d_data_v.val_;
+          break;
+      }
+      return *this;
+    } else {
+      alloc_trait::destroy(alloc_, this);
+      try {
+        auto *new_this = std::launder(this);
+        alloc_trait::construct(alloc_, new_this, std::move(other));
+        return *new_this;
+      } catch (...) {
+        type_ = Type::Null;
+        throw;
+      }
+    }
+  };
+
+  if constexpr (alloc_trait::is_always_equal::value) {
+    return do_move();
+  } else {
+    if (other.alloc_ == alloc_) {
+      return do_move();
+    } else {
+      if constexpr (alloc_trait::propagate_on_container_move_assignment::value) {
+        std::swap(alloc_, other.alloc_);
+        return do_move();  //???
+      } else {
+        // fall back to copy
+        return operator=(other);
+      }
+    }
   }
 }
 
 }  // namespace memgraph::storage
+namespace std {
+
+template <>
+struct hash<memgraph::storage::ExtendedPropertyType> {
+  size_t operator()(const memgraph::storage::ExtendedPropertyType &type) const {
+    size_t seed = 0;
+    boost::hash_combine(seed, type.type);
+    boost::hash_combine(seed, type.temporal_type);
+    boost::hash_combine(seed, type.enum_type.value_of());
+    return seed;
+  }
+};
+
+}  // namespace std

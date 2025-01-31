@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -49,16 +49,16 @@ class CartesianProduct {
   using TElement = typename decltype(begin_->begin())::value_type;
 
  public:
-  CartesianProduct(std::vector<TSet> sets)
+  explicit CartesianProduct(std::vector<TSet> sets)
       : original_sets_(std::move(sets)), begin_(original_sets_.begin()), end_(original_sets_.end()) {}
 
   class iterator {
    public:
-    typedef std::input_iterator_tag iterator_category;
-    typedef std::vector<TElement> value_type;
-    typedef long difference_type;
-    typedef const std::vector<TElement> &reference;
-    typedef const std::vector<TElement> *pointer;
+    using iterator_category = std::input_iterator_tag;
+    using value_type = std::vector<TElement>;
+    using difference_type = long;
+    using reference = const std::vector<TElement> &;
+    using pointer = const std::vector<TElement> *;
 
     explicit iterator(CartesianProduct *self, bool is_done) : self_(self), is_done_(is_done) {
       if (is_done || self->begin_ == self->end_) {
@@ -154,24 +154,24 @@ auto MakeCartesianProduct(std::vector<TSet> sets) {
 
 namespace impl {
 
-class NodeSymbolHash {
+class PatternAtomSymbolHash {
  public:
-  explicit NodeSymbolHash(const SymbolTable &symbol_table) : symbol_table_(symbol_table) {}
+  explicit PatternAtomSymbolHash(const SymbolTable &symbol_table) : symbol_table_(symbol_table) {}
 
-  size_t operator()(const NodeAtom *node_atom) const {
-    return std::hash<Symbol>{}(symbol_table_.at(*node_atom->identifier_));
+  size_t operator()(const PatternAtom *pattern_atom) const {
+    return std::hash<Symbol>{}(symbol_table_.at(*pattern_atom->identifier_));
   }
 
  private:
   const SymbolTable &symbol_table_;
 };
 
-class NodeSymbolEqual {
+class PatternAtomSymbolEqual {
  public:
-  explicit NodeSymbolEqual(const SymbolTable &symbol_table) : symbol_table_(symbol_table) {}
+  explicit PatternAtomSymbolEqual(const SymbolTable &symbol_table) : symbol_table_(symbol_table) {}
 
-  bool operator()(const NodeAtom *node_atom1, const NodeAtom *node_atom2) const {
-    return symbol_table_.at(*node_atom1->identifier_) == symbol_table_.at(*node_atom2->identifier_);
+  bool operator()(const PatternAtom *pattern_atom1, const PatternAtom *pattern_atom2) const {
+    return symbol_table_.at(*pattern_atom1->identifier_) == symbol_table_.at(*pattern_atom2->identifier_);
   }
 
  private:
@@ -186,11 +186,11 @@ class VaryMatchingStart {
 
   class iterator {
    public:
-    typedef std::input_iterator_tag iterator_category;
-    typedef Matching value_type;
-    typedef long difference_type;
-    typedef const Matching &reference;
-    typedef const Matching *pointer;
+    using iterator_category = std::input_iterator_tag;
+    using value_type = Matching;
+    using difference_type = long;
+    using reference = const Matching &;
+    using pointer = const Matching *;
 
     iterator(VaryMatchingStart *, bool);
 
@@ -198,7 +198,7 @@ class VaryMatchingStart {
     reference operator*() const { return current_matching_; }
     pointer operator->() const { return &current_matching_; }
     bool operator==(const iterator &other) const {
-      return self_ == other.self_ && start_nodes_it_ == other.start_nodes_it_;
+      return self_ == other.self_ && start_atoms_it_ == other.start_atoms_it_;
     }
     bool operator!=(const iterator &other) const { return !(*this == other); }
 
@@ -207,12 +207,12 @@ class VaryMatchingStart {
     // assignment.
     VaryMatchingStart *self_;
     Matching current_matching_;
-    // Iterator over start nodes. Optional is used for differentiating the case
-    // when there are no start nodes vs. VaryMatchingStart::iterator itself
-    // being at the end. When there are no nodes, this iterator needs to produce
+    // Iterator over start nodes and edges. Optional is used for differentiating the case
+    // when there are no start nodes and edges vs. VaryMatchingStart::iterator itself
+    // being at the end. When there are no nodes or edges, this iterator needs to produce
     // a single result, which is the original matching passed in. Setting
-    // start_nodes_it_ to end signifies the end of our iteration.
-    std::optional<std::unordered_set<NodeAtom *, NodeSymbolHash, NodeSymbolEqual>::iterator> start_nodes_it_;
+    // start_atoms_it_ to end signifies the end of our iteration.
+    std::optional<std::vector<PatternAtom *>::iterator> start_atoms_it_;
   };
 
   auto begin() { return iterator(this, false); }
@@ -222,7 +222,7 @@ class VaryMatchingStart {
   friend class iterator;
   Matching matching_;
   const SymbolTable &symbol_table_;
-  std::unordered_set<NodeAtom *, NodeSymbolHash, NodeSymbolEqual> nodes_;
+  std::vector<PatternAtom *> graph_atoms_;
 };
 
 // Similar to VaryMatchingStart, but varies the starting nodes for all given
@@ -240,13 +240,13 @@ class VaryQueryPartMatching {
 
   class iterator {
    public:
-    typedef std::input_iterator_tag iterator_category;
-    typedef SingleQueryPart value_type;
-    typedef long difference_type;
-    typedef const SingleQueryPart &reference;
-    typedef const SingleQueryPart *pointer;
+    using iterator_category = std::input_iterator_tag;
+    using value_type = SingleQueryPart;
+    using difference_type = long;
+    using reference = const SingleQueryPart &;
+    using pointer = const SingleQueryPart *;
 
-    iterator(const SingleQueryPart &, VaryMatchingStart::iterator, VaryMatchingStart::iterator,
+    iterator(SingleQueryPart, VaryMatchingStart::iterator, VaryMatchingStart::iterator,
              CartesianProduct<VaryMatchingStart>::iterator, CartesianProduct<VaryMatchingStart>::iterator,
              CartesianProduct<VaryMatchingStart>::iterator, CartesianProduct<VaryMatchingStart>::iterator,
              CartesianProduct<VaryMatchingStart>::iterator, CartesianProduct<VaryMatchingStart>::iterator);
@@ -370,21 +370,26 @@ class VariableStartPlanner {
   /// @brief Generate multiple plans by varying the order of graph traversal.
   auto Plan(const QueryParts &query_parts) {
     return iter::imap(
-        [context = context_, old_query_parts = query_parts, this](const auto &alternative_query_parts) {
+        [context = context_, old_query_parts = query_parts,
+         this](const auto &alternative_query_parts) -> RuleBasedPlanner<TPlanningContext>::PlanResult {
           uint64_t index = 0;
           auto reconstructed_query_parts = ReconstructQueryParts(old_query_parts, alternative_query_parts, index);
 
           RuleBasedPlanner<TPlanningContext> rule_planner(context);
           context->bound_symbols.clear();
-          return rule_planner.Plan(reconstructed_query_parts);
+          try {
+            return rule_planner.Plan(reconstructed_query_parts);
+          } catch (QueryException const &e) {
+            return nullptr;
+          }
         },
         VaryQueryMatching(query_parts, *context_->symbol_table));
   }
 
   /// @brief The result of plan generation is an iterable of roots to multiple
   /// generated operator trees.
-  using PlanResult = typename std::result_of<decltype (&VariableStartPlanner<TPlanningContext>::Plan)(
-      VariableStartPlanner<TPlanningContext>, QueryParts &)>::type;
+  using PlanResult = std::result_of_t<decltype (&VariableStartPlanner<TPlanningContext>::Plan)(
+      VariableStartPlanner<TPlanningContext>, QueryParts &)>;
 };
 
 }  // namespace memgraph::query::plan

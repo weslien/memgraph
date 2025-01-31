@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -15,10 +15,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -47,6 +47,7 @@
 #include "communication/buffer.hpp"
 #include "communication/context.hpp"
 #include "communication/exceptions.hpp"
+#include "communication/fmt.hpp"
 #include "dbms/global.hpp"
 #include "utils/event_counter.hpp"
 #include "utils/logging.hpp"
@@ -76,7 +77,7 @@ using tcp = boost::asio::ip::tcp;
 class OutputStream final {
  public:
   explicit OutputStream(std::function<bool(const uint8_t *, size_t, bool)> write_function)
-      : write_function_(write_function) {}
+      : write_function_(std::move(write_function)) {}
 
   OutputStream(const OutputStream &) = delete;
   OutputStream(OutputStream &&) = delete;
@@ -174,7 +175,14 @@ class WebsocketSession : public std::enable_shared_from_this<WebsocketSession<TS
         },
         session_context_{session_context},
         endpoint_{endpoint},
-        remote_endpoint_{ws_.next_layer().socket().remote_endpoint()},
+        remote_endpoint_{std::invoke([&]() -> std::optional<tcp::endpoint> {
+          try {
+            return ws_.next_layer().socket().remote_endpoint();
+          } catch (const boost::system::system_error &e) {
+            spdlog::error("Failed to get remote endpoint for {}.", service_name);
+            return std::nullopt;
+          }
+        })},
         service_name_{service_name} {
   }
 
@@ -212,14 +220,11 @@ class WebsocketSession : public std::enable_shared_from_this<WebsocketSession<TS
       session_.Execute();
       DoRead();
     } catch (const SessionClosedException &e) {
-      spdlog::info("{} client {}:{} closed the connection.", service_name_, remote_endpoint_.address(),
-                   remote_endpoint_.port());
+      spdlog::info("{} client {} closed the connection.", service_name_, remote_endpoint_);
       DoClose();
     } catch (const std::exception &e) {
-      spdlog::error(
-          "Exception was thrown while processing event in {} session "
-          "associated with {}:{}",
-          service_name_, remote_endpoint_.address(), remote_endpoint_.port());
+      spdlog::error("Exception was thrown while processing event in {} session associated with {}", service_name_,
+                    remote_endpoint_);
       spdlog::debug("Exception message: {}", e.what());
       DoClose();
     }
@@ -261,7 +266,7 @@ class WebsocketSession : public std::enable_shared_from_this<WebsocketSession<TS
   TSession session_;
   TSessionContext *session_context_;
   tcp::endpoint endpoint_;
-  tcp::endpoint remote_endpoint_;
+  std::optional<tcp::endpoint> remote_endpoint_{};
   std::string_view service_name_;
   bool execution_active_{false};
 };
@@ -376,8 +381,7 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
       socket.lowest_layer().non_blocking(false);
     });
     timeout_timer_.expires_at(boost::asio::steady_timer::time_point::max());
-    spdlog::info("Accepted a connection from {}: {}:{}", service_name_, remote_endpoint_.address(),
-                 remote_endpoint_.port());
+    spdlog::info("Accepted a connection from {}: {}", service_name_, remote_endpoint_);
   }
 
   void DoRead() {
@@ -437,14 +441,11 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
       session_.Execute();
       DoRead();
     } catch (const SessionClosedException &e) {
-      spdlog::info("{} client {}:{} closed the connection.", service_name_, remote_endpoint_.address(),
-                   remote_endpoint_.port());
+      spdlog::info("{} client {} closed the connection.", service_name_, remote_endpoint_);
       DoShutdown();
     } catch (const std::exception &e) {
-      spdlog::error(
-          "Exception was thrown while processing event in {} session "
-          "associated with {}:{}",
-          service_name_, remote_endpoint_.address(), remote_endpoint_.port());
+      spdlog::error("Exception was thrown while processing event in {} session associated with {}", service_name_,
+                    remote_endpoint_);
       spdlog::debug("Exception message: {}", e.what());
       DoShutdown();
     }
@@ -456,7 +457,7 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
     }
 
     if (ec == boost::asio::error::eof) {
-      spdlog::info("Session closed by peer");
+      spdlog::info("Session closed by peer {}", remote_endpoint_);
     } else {
       spdlog::error("Session error: {}", ec.message());
     }
@@ -477,7 +478,10 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
       if (ec) {
         spdlog::error("Session shutdown failed: {}", ec.what());
       }
-      lowest_layer.close();
+      lowest_layer.close(ec);
+      if (ec) {
+        spdlog::error("Session close failed: {}", ec.what());
+      }
     });
   }
 
@@ -546,7 +550,13 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
   }
 
   auto GetRemoteEndpoint() const {
-    return std::visit(utils::Overloaded{[](const auto &socket) { return socket.lowest_layer().remote_endpoint(); }},
+    return std::visit(utils::Overloaded{[](const auto &socket) -> std::optional<tcp::endpoint> {
+                        try {
+                          return socket.lowest_layer().remote_endpoint();
+                        } catch (const boost::system::system_error &e) {
+                          return std::nullopt;
+                        }
+                      }},
                       socket_);
   }
 
@@ -564,11 +574,11 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
   TSession session_;
   TSessionContext *session_context_;
   tcp::endpoint endpoint_;
-  tcp::endpoint remote_endpoint_;
+  std::optional<tcp::endpoint> remote_endpoint_;
   std::string_view service_name_;
   std::chrono::seconds timeout_seconds_;
   boost::asio::steady_timer timeout_timer_;
-  bool execution_active_{false};
-  bool has_received_msg_{false};
+  std::atomic_bool execution_active_{false};
+  std::atomic_bool has_received_msg_{false};
 };
 }  // namespace memgraph::communication::v2

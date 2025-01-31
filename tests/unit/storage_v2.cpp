@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -22,6 +22,8 @@
 #include "storage/v2/storage.hpp"
 #include "storage/v2/vertex_accessor.hpp"
 #include "storage_test_utils.hpp"
+
+using memgraph::replication_coordination_glue::ReplicationRole;
 
 using testing::Types;
 using testing::UnorderedElementsAre;
@@ -47,7 +49,7 @@ class StorageV2Test : public testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(StorageV2Test, StorageTypes);
+TYPED_TEST_SUITE(StorageV2Test, StorageTypes);
 
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TYPED_TEST(StorageV2Test, Commit) {

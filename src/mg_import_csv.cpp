@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -13,7 +13,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <regex>
@@ -24,7 +23,6 @@
 #include "replication/state.hpp"
 #include "storage/v2/config.hpp"
 #include "storage/v2/edge_accessor.hpp"
-#include "storage/v2/inmemory/storage.hpp"
 #include "utils/exceptions.hpp"
 #include "utils/logging.hpp"
 #include "utils/message.hpp"
@@ -136,6 +134,11 @@ struct NodeId {
   // Group/space of IDs. ID must be unique in a single group.
   std::string id_space;
 };
+
+#if FMT_VERSION > 90000
+template <>
+class fmt::formatter<NodeId> : public fmt::ostream_formatter {};
+#endif
 
 bool operator==(const NodeId &a, const NodeId &b) { return a.id == b.id && a.id_space == b.id_space; }
 
@@ -409,7 +412,7 @@ memgraph::storage::PropertyValue StringToValue(const std::string &str, const std
 std::string GetIdSpace(const std::string &type) {
   // The format of this field is as follows:
   // [START_|END_]ID[(<id_space>)]
-  std::regex format(R"(^(START_|END_)?ID(\(([^\(\)]+)\))?$)", std::regex::extended);
+  static std::regex format(R"(^(START_|END_)?ID(\(([^\(\)]+)\))?$)", std::regex::extended);
   std::smatch res;
   if (!std::regex_match(type, res, format))
     throw LoadException(
@@ -519,7 +522,7 @@ void ProcessRelationshipsRow(memgraph::storage::Storage *store, const std::vecto
                              const std::unordered_map<NodeId, memgraph::storage::Gid> &node_id_map) {
   std::optional<memgraph::storage::Gid> start_id;
   std::optional<memgraph::storage::Gid> end_id;
-  std::map<std::string, memgraph::storage::PropertyValue> properties;
+  auto properties = memgraph::storage::PropertyValue::map_t{};
   for (size_t i = 0; i < row.size(); ++i) {
     const auto &field = fields[i];
     const auto &value = row[i];
@@ -705,13 +708,11 @@ int main(int argc, char *argv[]) {
 
   std::unordered_map<NodeId, memgraph::storage::Gid> node_id_map;
   memgraph::storage::Config config{
-
-      .items = {.properties_on_edges = FLAGS_storage_properties_on_edges},
       .durability = {.storage_directory = FLAGS_data_directory,
                      .recover_on_startup = false,
                      .snapshot_wal_mode = memgraph::storage::Config::Durability::SnapshotWalMode::DISABLED,
                      .snapshot_on_exit = true},
-  };
+      .salient = {.items = {.properties_on_edges = FLAGS_storage_properties_on_edges}}};
   memgraph::replication::ReplicationState repl_state{memgraph::storage::ReplicationStateRootPath(config)};
   auto store = memgraph::dbms::CreateInMemoryStorage(config, repl_state);
 

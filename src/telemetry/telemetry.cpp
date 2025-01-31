@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -12,10 +12,12 @@
 #include "telemetry/telemetry.hpp"
 
 #include <filesystem>
+#include <utility>
 
 #include <fmt/format.h>
 
 #include "communication/bolt/metrics.hpp"
+#include "query/plan/operator.hpp"
 #include "requests/requests.hpp"
 #include "telemetry/collectors.hpp"
 #include "utils/event_counter.hpp"
@@ -28,6 +30,8 @@
 #include "utils/uuid.hpp"
 #include "version.hpp"
 
+#include <mutex>
+
 namespace memgraph::telemetry {
 
 constexpr auto kMaxBatchSize{100};
@@ -36,8 +40,8 @@ Telemetry::Telemetry(std::string url, std::filesystem::path storage_directory, s
                      bool ssl, std::filesystem::path root_directory, std::chrono::duration<int64_t> refresh_interval,
                      const uint64_t send_every_n)
     : url_(std::move(url)),
-      uuid_(uuid),
-      machine_id_(machine_id),
+      uuid_(std::move(uuid)),
+      machine_id_(std::move(machine_id)),
       ssl_(ssl),
       send_every_n_(send_every_n),
       storage_(std::move(storage_directory)) {
@@ -52,11 +56,12 @@ Telemetry::Telemetry(std::string url, std::filesystem::path storage_directory, s
          metrics::global_one_shot_events[metrics::OneShotEvents::kFirstSuccessfulQueryTs].load()},
         {"first_failed_query", metrics::global_one_shot_events[metrics::OneShotEvents::kFirstFailedQueryTs].load()}};
   });
-  scheduler_.Run("Telemetry", refresh_interval, [&] { CollectData(); });
+  scheduler_.SetInterval(refresh_interval);
+  scheduler_.Run("Telemetry", [&] { CollectData(); });
 }
 
 void Telemetry::AddCollector(const std::string &name, const std::function<const nlohmann::json(void)> &func) {
-  std::lock_guard<std::mutex> guard(lock_);
+  auto guard = std::lock_guard{lock_};
   collectors_.emplace_back(name, func);
 }
 
@@ -107,9 +112,15 @@ void Telemetry::SendData() {
 void Telemetry::CollectData(const std::string &event) {
   nlohmann::json data = nlohmann::json::object();
   {
-    std::lock_guard<std::mutex> guard(lock_);
+    auto guard = std::lock_guard{lock_};
     for (auto &collector : collectors_) {
-      data[collector.first] = collector.second();
+      try {
+        data[collector.first] = collector.second();
+      } catch (std::exception &e) {
+        spdlog::warn(fmt::format(
+            "Unknwon exception occured on in telemetry server {}, please contact support on https://memgr.ph/unknown ",
+            e.what()));
+      }
     }
   }
   if (event == "") {
@@ -155,9 +166,7 @@ void Telemetry::AddDatabaseCollector(dbms::DbmsHandler &dbms_handler) {
 #else
 #endif
 
-void Telemetry::AddStorageCollector(
-    dbms::DbmsHandler &dbms_handler,
-    memgraph::utils::Synchronized<memgraph::auth::Auth, memgraph::utils::WritePrioritizedRWLock> &auth) {
+void Telemetry::AddStorageCollector(dbms::DbmsHandler &dbms_handler, memgraph::auth::SynchedAuth &auth) {
   AddCollector("storage", [&dbms_handler, &auth]() -> nlohmann::json {
     auto stats = dbms_handler.Stats();
     stats.users = auth->AllUsers().size();

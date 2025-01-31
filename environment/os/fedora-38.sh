@@ -1,9 +1,9 @@
 #!/bin/bash
-
 set -Eeuo pipefail
-
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 source "$DIR/../util.sh"
+
+# IMPORTANT: Deprecated since memgraph v3.0.0.
 
 check_operating_system "fedora-38"
 check_architecture "x86_64"
@@ -27,6 +27,7 @@ TOOLCHAIN_BUILD_DEPS=(
     libipt libipt-devel # intel
     patch
     perl # for openssl
+    git
 )
 
 TOOLCHAIN_RUN_DEPS=(
@@ -46,7 +47,7 @@ MEMGRAPH_BUILD_DEPS=(
     libuuid-devel java-11-openjdk # required by antlr
     readline-devel # for memgraph console
     python3-devel # for query modules
-    openssl-devel
+    openssl-devel openssl
     libseccomp-devel
     python3 python3-pip python3-virtualenv python3-virtualenvwrapper python3-pyyaml nmap-ncat # for tests
     libcurl-devel # mg-requests
@@ -56,6 +57,17 @@ MEMGRAPH_BUILD_DEPS=(
     sbcl # for custom Lisp C++ preprocessing
     autoconf # for jemalloc code generation
     libtool  # for protobuf code generation
+    cyrus-sasl-devel
+)
+
+MEMGRAPH_TEST_DEPS="${MEMGRAPH_BUILD_DEPS[*]}"
+
+MEMGRAPH_RUN_DEPS=(
+    logrotate openssl python3 libseccomp
+)
+
+NEW_DEPS=(
+    wget curl tar gzip
 )
 
 list() {

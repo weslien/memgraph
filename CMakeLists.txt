@@ -42,12 +42,9 @@ endif()
 
 project(memgraph LANGUAGES C CXX)
 
-#TODO: upgrade to cmake 3.24 + CheckIPOSupported
-#cmake_policy(SET CMP0138 NEW)
-#include(CheckIPOSupported)
-#check_ipo_supported()
-#set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_Release TRUE)
-#set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RelWithDebInfo TRUE)
+# this reduces issues in build folders from inside containers
+# which are different locations than the host
+set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
 
 # Install licenses.
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/licenses/
@@ -191,13 +188,24 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_compile_definitions(BOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT)
+
 # c99-designator is disabled because of required mixture of designated and
 # non-designated initializers in Python Query Module code (`py_module.cpp`).
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall \
-    -Werror=switch -Werror=switch-bool -Werror=return-type \
-    -Werror=return-stack-address \
-    -Wno-c99-designator -Wmissing-field-initializers \
-    -DBOOST_ASIO_USE_TS_EXECUTOR_AS_DEFAULT")
+add_compile_options(
+        -Wall
+        -Werror=non-virtual-dtor
+        -Werror=unused-private-field
+        -Werror=switch
+        -Werror=switch-bool
+        -Werror=return-type
+        -Werror=return-stack-address
+        -Wno-c99-designator
+        -Wmissing-field-initializers
+        -Werror=implicit-fallthrough
+        $<$<CXX_COMPILER_ID:Clang>:-Werror=reorder-init-list>
+)
 
 # Don't omit frame pointer in RelWithDebInfo, for additional callchain debug.
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO
@@ -211,8 +219,25 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO
 # ** Static linking is allowed only for executables! **
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
 
-# Use lld linker to speedup build
-add_link_options(-fuse-ld=lld) # TODO: use mold linker
+# Use lld linker to speedup build and use less memory.
+add_link_options(-fuse-ld=lld)
+if (DEFINED ENV{LD_LIBRARY_PATH})
+    string(REPLACE ":" " " LD_LIBS $ENV{LD_LIBRARY_PATH})
+    separate_arguments(LD_LIBS)
+    link_directories(${LD_LIBS})
+endif ()
+add_link_options(LINKER:--build-id)
+
+# After linker is set, check we can use link-time optimization
+cmake_policy(SET CMP0138 NEW)
+include(CheckIPOSupported)
+check_ipo_supported() # fatal error if IPO is not supported
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_Release TRUE)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RelWithDebInfo TRUE)
+
+# This is used to so that 3rd party libs can find the
+# correct libraries from our toolchain
+set(MG_TOOLCHAIN_ROOT "$ENV{MG_TOOLCHAIN_ROOT}")
 
 # release flags
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
@@ -242,7 +267,12 @@ endif()
 message(STATUS "CMake build type: ${CMAKE_BUILD_TYPE}")
 # -----------------------------------------------------------------------------
 
-add_definitions( -DCMAKE_BUILD_TYPE_NAME="${CMAKE_BUILD_TYPE}")
+add_compile_definitions(
+    CMAKE_BUILD_TYPE_NAME="${CMAKE_BUILD_TYPE}"
+    # In Debug also check we have correct usage of libstdc++
+    $<$<CONFIG:Debug>:_GLIBCXX_ASSERTIONS>
+)
+
 
 if (NOT MG_ARCH)
     set(MG_ARCH_DESCR "Host architecture to build Memgraph on. Supported values are x86_64, ARM64.")
@@ -268,16 +298,15 @@ if (USE_READLINE)
   endif()
 endif()
 
-set(libs_dir ${CMAKE_SOURCE_DIR}/libs)
-add_subdirectory(libs EXCLUDE_FROM_ALL)
 
-# Optional subproject configuration -------------------------------------------
 option(TEST_COVERAGE "Generate coverage reports from running memgraph" OFF)
 option(TOOLS "Build tools binaries" ON)
 option(QUERY_MODULES "Build query modules containing custom procedures" ON)
 option(ASAN "Build with Address Sanitizer. To get a reasonable performance option should be used only in Release or RelWithDebInfo build " OFF)
 option(TSAN "Build with Thread Sanitizer. To get a reasonable performance option should be used only in Release or RelWithDebInfo build " OFF)
 option(UBSAN "Build with Undefined Behaviour Sanitizer" OFF)
+
+# Build feature flags
 
 if (TEST_COVERAGE)
   string(TOLOWER ${CMAKE_BUILD_TYPE} lower_build_type)
@@ -292,7 +321,20 @@ if (MG_ENTERPRISE)
   add_definitions(-DMG_ENTERPRISE)
 endif()
 
-set(ENABLE_JEMALLOC ON)
+option(ENABLE_JEMALLOC "Use jemalloc" ON)
+
+option(MG_MEMORY_PROFILE "If build should be setup for memory profiling" OFF)
+if (MG_MEMORY_PROFILE AND ENABLE_JEMALLOC)
+    message(STATUS "Jemalloc has been disabled because MG_MEMORY_PROFILE is enabled")
+    set(ENABLE_JEMALLOC OFF)
+endif ()
+if (MG_MEMORY_PROFILE AND ASAN)
+    message(STATUS "ASAN has been disabled because MG_MEMORY_PROFILE is enabled")
+    set(ASAN OFF)
+endif ()
+if (MG_MEMORY_PROFILE)
+    add_compile_definitions(MG_MEMORY_PROFILE)
+endif ()
 
 if (ASAN)
   message(WARNING "Disabling jemalloc as it doesn't work well with ASAN")
@@ -303,8 +345,8 @@ if (ASAN)
   # llvm-symbolizer version must match the version of ASan runtime library).
   # Just make sure llvm-symbolizer is in PATH before running the binary or
   # provide it in separate ASAN_SYMBOLIZER_PATH environment variable.
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+  add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address)
   # To detect Stack-use-after-return bugs set run-time flag:
   #   ASAN_OPTIONS=detect_stack_use_after_return=1
   # To check initialization order bugs set run-time flag:
@@ -318,6 +360,8 @@ if (ASAN)
 endif()
 
 if (TSAN)
+  message(WARNING "Disabling jemalloc as it doesn't work well with ASAN")
+  set(ENABLE_JEMALLOC OFF)
   # ThreadSanitizer generally requires all code to be compiled with -fsanitize=thread.
   # If some code (e.g. dynamic libraries) is not compiled with the flag, it can
   # lead to false positive race reports, false negative race reports and/or
@@ -333,7 +377,7 @@ if (TSAN)
   # By default ThreadSanitizer uses addr2line utility to symbolize reports.
   # llvm-symbolizer is faster, consumes less memory and produces much better
   # reports. To use it set runtime flag:
-  #   TSAN_OPTIONS="extern-symbolizer-path=~/llvm-symbolizer"
+  # TSAN_OPTIONS="extern-symbolizer-path=~/llvm-symbolizer"
   # For more runtime flags see: https://github.com/google/sanitizers/wiki/ThreadSanitizerFlags
 endif()
 
@@ -341,12 +385,16 @@ if (UBSAN)
   # Compile with UBSAN but disable vptr check. This is disabled because it
   # requires linking with clang++ to make sure C++ specific parts of the
   # runtime library and c++ standard libraries are present.
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize=vptr")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=undefined -fno-sanitize=vptr")
+  add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize=vptr)
+  add_link_options(-fsanitize=undefined -fno-sanitize=vptr)
   # Run program with environment variable UBSAN_OPTIONS=print_stacktrace=1.
   # Make sure llvm-symbolizer binary is in path.
   # To make the program abort on undefined behavior, use UBSAN_OPTIONS=halt_on_error=1.
 endif()
+
+# absl library is sensitive to sanitisers, 3rd party libs need building with sanitizer options
+set(libs_dir ${CMAKE_SOURCE_DIR}/libs)
+add_subdirectory(libs EXCLUDE_FROM_ALL)
 
 set(MG_PYTHON_VERSION "" CACHE STRING "Specify the exact Python version used by the query modules")
 set(MG_PYTHON_PATH "" CACHE STRING "Specify the exact Python path used by the query modules")
@@ -374,6 +422,28 @@ if(QUERY_MODULES)
   add_subdirectory(query_modules)
 endif()
 
-install(FILES ${CMAKE_BINARY_DIR}/bin/mgconsole
-  PERMISSIONS OWNER_EXECUTE OWNER_READ OWNER_WRITE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
-  TYPE BIN)
+# All targets which generate code, useful as a single target to build for clang-tidy analysis to work
+add_custom_target(generated_code DEPENDS
+    generate_opencypher_parser
+    mgcxx-proj
+    librdkafka-proj
+    antlr4-proj
+    librdtsc-proj
+    pulsar-proj
+)
+
+if(DEFINED ENV{MG_TOOLCHAIN_VERSION})
+  if($ENV{MG_TOOLCHAIN_VERSION} GREATER_EQUAL 6)
+    install(FILES ${MG_TOOLCHAIN_ROOT}/bin/mgconsole
+      PERMISSIONS OWNER_EXECUTE OWNER_READ OWNER_WRITE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+      TYPE BIN)
+  else()
+    install(FILES ${CMAKE_BINARY_DIR}/bin/mgconsole
+      PERMISSIONS OWNER_EXECUTE OWNER_READ OWNER_WRITE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+      TYPE BIN)
+  endif()
+else()
+  install(FILES ${CMAKE_BINARY_DIR}/bin/mgconsole
+    PERMISSIONS OWNER_EXECUTE OWNER_READ OWNER_WRITE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+    TYPE BIN)
+endif()

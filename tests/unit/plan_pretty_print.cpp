@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "disk_test_utils.hpp"
+#include "query/frontend/ast/ast.hpp"
 #include "query/frontend/semantic/symbol_table.hpp"
 #include "query/plan/operator.hpp"
 #include "query/plan/pretty_print.hpp"
@@ -46,7 +47,7 @@ class PrintToJsonTest : public ::testing::Test {
         dba_storage(db->Access()),
         dba(dba_storage.get()) {}
 
-  ~PrintToJsonTest() {
+  void TearDown() override {
     if (std::is_same<StorageType, memgraph::storage::DiskStorage>::value) {
       disk_test_utils::RemoveRocksDbDirs(testSuite);
     }
@@ -66,7 +67,7 @@ class PrintToJsonTest : public ::testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(PrintToJsonTest, StorageTypes);
+TYPED_TEST_SUITE(PrintToJsonTest, StorageTypes);
 
 TYPED_TEST(PrintToJsonTest, Once) {
   std::shared_ptr<LogicalOperator> last_op;
@@ -107,7 +108,7 @@ TYPED_TEST(PrintToJsonTest, ScanAllByLabelPropertyRange) {
   {
     std::shared_ptr<LogicalOperator> last_op;
     last_op = std::make_shared<ScanAllByLabelPropertyRange>(
-        nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"), "prop",
+        nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"),
         memgraph::utils::MakeBoundInclusive<Expression *>(LITERAL(1)),
         memgraph::utils::MakeBoundExclusive<Expression *>(LITERAL(20)));
 
@@ -131,7 +132,7 @@ TYPED_TEST(PrintToJsonTest, ScanAllByLabelPropertyRange) {
   {
     std::shared_ptr<LogicalOperator> last_op;
     last_op = std::make_shared<ScanAllByLabelPropertyRange>(
-        nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"), "prop",
+        nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"),
         std::nullopt, memgraph::utils::MakeBoundExclusive<Expression *>(LITERAL(20)));
 
     this->Check(last_op.get(), R"(
@@ -151,7 +152,7 @@ TYPED_TEST(PrintToJsonTest, ScanAllByLabelPropertyRange) {
   {
     std::shared_ptr<LogicalOperator> last_op;
     last_op = std::make_shared<ScanAllByLabelPropertyRange>(
-        nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"), "prop",
+        nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"),
         memgraph::utils::MakeBoundInclusive<Expression *>(LITERAL(1)), std::nullopt);
 
     this->Check(last_op.get(), R"(
@@ -172,9 +173,9 @@ TYPED_TEST(PrintToJsonTest, ScanAllByLabelPropertyRange) {
 
 TYPED_TEST(PrintToJsonTest, ScanAllByLabelPropertyValue) {
   std::shared_ptr<LogicalOperator> last_op;
-  last_op = std::make_shared<ScanAllByLabelPropertyValue>(
-      nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"), "prop",
-      ADD(LITERAL(21), LITERAL(21)));
+  last_op =
+      std::make_shared<ScanAllByLabelPropertyValue>(nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"),
+                                                    this->dba.NameToProperty("prop"), ADD(LITERAL(21), LITERAL(21)));
 
   this->Check(last_op.get(), R"sep(
         {
@@ -416,6 +417,24 @@ TYPED_TEST(PrintToJsonTest, Filter) {
           })sep");
 }
 
+TYPED_TEST(PrintToJsonTest, FilterByEnum) {
+  std::shared_ptr<LogicalOperator> last_op = std::make_shared<ScanAll>(nullptr, this->GetSymbol("node1"));
+  last_op = std::make_shared<Filter>(
+      last_op, std::vector<std::shared_ptr<LogicalOperator>>{},
+      EQ(PROPERTY_LOOKUP(this->dba, "node1", this->dba.NameToProperty("prop")), ENUM_VALUE("Status", "Good")));
+
+  this->Check(last_op.get(), R"sep(
+          {
+            "name" : "Filter",
+            "expression" : "(== (PropertyLookup (Identifier \"node1\") \"prop\") Status::Good)",
+            "input" : {
+              "name" : "ScanAll",
+              "output_symbol" : "node1",
+              "input" : { "name" : "Once" }
+            }
+          })sep");
+}
+
 TYPED_TEST(PrintToJsonTest, Produce) {
   std::shared_ptr<LogicalOperator> last_op = std::make_shared<Produce>(
       nullptr, std::vector<NamedExpression *>{NEXPR("pet", LITERAL(5)), NEXPR("string", LITERAL("string"))});
@@ -510,12 +529,34 @@ TYPED_TEST(PrintToJsonTest, SetProperties) {
           })sep");
 }
 
+TYPED_TEST(PrintToJsonTest, SetEnumProperty) {
+  memgraph::storage::PropertyId prop = this->dba.NameToProperty("prop");
+
+  std::shared_ptr<LogicalOperator> last_op = std::make_shared<ScanAll>(nullptr, this->GetSymbol("node"));
+  last_op =
+      std::make_shared<plan::SetProperty>(last_op, prop, PROPERTY_LOOKUP(this->dba, "node", prop),
+                                          ADD(PROPERTY_LOOKUP(this->dba, "node", prop), ENUM_VALUE("Status", "Good")));
+
+  this->Check(last_op.get(), R"sep(
+          {
+            "name" : "SetProperty",
+            "property" : "prop",
+            "lhs" : "(PropertyLookup (Identifier \"node\") \"prop\")",
+            "rhs" : "(+ (PropertyLookup (Identifier \"node\") \"prop\") Status::Good)",
+            "input" : {
+              "name" : "ScanAll",
+              "output_symbol" : "node",
+              "input" : { "name" : "Once" }
+            }
+          })sep");
+}
+
 TYPED_TEST(PrintToJsonTest, SetLabels) {
   auto node_sym = this->GetSymbol("node");
   std::shared_ptr<LogicalOperator> last_op = std::make_shared<ScanAll>(nullptr, node_sym);
   last_op = std::make_shared<plan::SetLabels>(
       last_op, node_sym,
-      std::vector<memgraph::storage::LabelId>{this->dba.NameToLabel("label1"), this->dba.NameToLabel("label2")});
+      std::vector<StorageLabelType>{this->dba.NameToLabel("label1"), this->dba.NameToLabel("label2")});
 
   this->Check(last_op.get(), R"(
           {
@@ -554,7 +595,7 @@ TYPED_TEST(PrintToJsonTest, RemoveLabels) {
   std::shared_ptr<LogicalOperator> last_op = std::make_shared<ScanAll>(nullptr, node_sym);
   last_op = std::make_shared<plan::RemoveLabels>(
       last_op, node_sym,
-      std::vector<memgraph::storage::LabelId>{this->dba.NameToLabel("label1"), this->dba.NameToLabel("label2")});
+      std::vector<StorageLabelType>{this->dba.NameToLabel("label1"), this->dba.NameToLabel("label2")});
 
   this->Check(last_op.get(), R"(
           {
@@ -1074,5 +1115,59 @@ TYPED_TEST(PrintToJsonTest, Exists) {
               "name": "EvaluatePatternFilter",
               "output_symbol": "output_symbol"
             }
+          })sep");
+}
+
+// Test for rollup apply operator
+TYPED_TEST(PrintToJsonTest, RollUpApply) {
+  auto x = this->GetSymbol("x");
+  auto e = this->GetSymbol("edge");
+  auto n = this->GetSymbol("node");
+  auto output = this->GetSymbol("output_symbol");
+  auto list_collection_expand =
+      std::make_shared<Expand>(nullptr, x, n, e, memgraph::query::EdgeAtom::Direction::BOTH,
+                               std::vector<memgraph::storage::EdgeTypeId>{this->dba.NameToEdgeType("EdgeType1")}, false,
+                               memgraph::storage::View::OLD);
+  auto list_collection_produce =
+      std::make_shared<Produce>(list_collection_expand, std::vector<NamedExpression *>{NEXPR("alias", IDENT("node"))});
+
+  auto input_op = std::make_shared<ScanAll>(nullptr, x);
+  auto rollup_op = std::make_shared<RollUpApply>(std::move(input_op), std::move(list_collection_produce),
+                                                 std::vector<Symbol>{n}, this->GetSymbol("node"));
+
+  this->Check(rollup_op.get(), R"sep(
+          {
+            "input": {
+                "input": {
+                    "name": "Once"
+                },
+                "name": "ScanAll",
+                "output_symbol": "x"
+            },
+            "list_collection_branch": {
+                "input": {
+                    "direction": "both",
+                    "edge_symbol": "edge",
+                    "edge_types": [
+                        "EdgeType1"
+                    ],
+                    "existing_node": false,
+                    "input": {
+                        "name": "Once"
+                    },
+                    "input_symbol": "x",
+                    "name": "Expand",
+                    "node_symbol": "node"
+                },
+                "name": "Produce",
+                "named_expressions": [
+                    {
+                        "expression": "(Identifier \"node\")",
+                        "name": "alias"
+                    }
+                ]
+            },
+            "name": "RollUpApply",
+            "output_symbol": "node"
           })sep");
 }

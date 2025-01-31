@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -8,8 +8,6 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
-
-#include <cstdint>
 
 #include "query/plan/operator.hpp"
 
@@ -50,7 +48,29 @@ constexpr utils::TypeInfo query::plan::ScanAllByLabelProperty::kType{
 constexpr utils::TypeInfo query::plan::ScanAllById::kType{utils::TypeId::SCAN_ALL_BY_ID, "ScanAllById",
                                                           &query::plan::ScanAll::kType};
 
+constexpr utils::TypeInfo query::plan::ScanAllByEdge::kType{utils::TypeId::SCAN_ALL_BY_EDGE, "ScanAllByEdge",
+                                                            &query::plan::ScanAll::kType};
+
+constexpr utils::TypeInfo query::plan::ScanAllByEdgeType::kType{utils::TypeId::SCAN_ALL_BY_EDGE_TYPE,
+                                                                "ScanAllByEdgeType", &query::plan::ScanAll::kType};
+
+constexpr utils::TypeInfo query::plan::ScanAllByEdgeTypeProperty::kType{
+    utils::TypeId::SCAN_ALL_BY_EDGE_TYPE_PROPERTY, "ScanAllByEdgeTypeProperty", &query::plan::ScanAll::kType};
+
+constexpr utils::TypeInfo query::plan::ScanAllByEdgeTypePropertyValue::kType{
+    utils::TypeId::SCAN_ALL_BY_EDGE_TYPE_PROPERTY_VALUE, "ScanAllByEdgeTypePropertyValue",
+    &query::plan::ScanAll::kType};
+
+constexpr utils::TypeInfo query::plan::ScanAllByEdgeTypePropertyRange::kType{
+    utils::TypeId::SCAN_ALL_BY_EDGE_TYPE_PROPERTY_RANGE, "ScanAllByEdgeTypePropertyRange",
+    &query::plan::ScanAll::kType};
+
+constexpr utils::TypeInfo query::plan::ScanAllByEdgeId::kType{utils::TypeId::SCAN_ALL_BY_ID, "ScanAllByEdgeId",
+                                                              &query::plan::ScanAll::kType};
+
 constexpr utils::TypeInfo query::plan::ExpandCommon::kType{utils::TypeId::EXPAND_COMMON, "ExpandCommon", nullptr};
+constexpr utils::TypeInfo query::plan::ScanByEdgeCommon::kType{utils::TypeId::SCAN_BY_EDGE_COMMON, "ScanByEdgeCommon",
+                                                               nullptr};
 
 constexpr utils::TypeInfo query::plan::Expand::kType{utils::TypeId::EXPAND, "Expand",
                                                      &query::plan::LogicalOperator::kType};
@@ -154,4 +174,19 @@ constexpr utils::TypeInfo query::plan::IndexedJoin::kType{utils::TypeId::INDEXED
 
 constexpr utils::TypeInfo query::plan::HashJoin::kType{utils::TypeId::HASH_JOIN, "HashJoin",
                                                        &query::plan::LogicalOperator::kType};
+
+constexpr utils::TypeInfo query::plan::RollUpApply::kType{utils::TypeId::ROLLUP_APPLY, "RollUpApply",
+                                                          &query::plan::LogicalOperator::kType};
+
+constexpr utils::TypeInfo query::plan::PeriodicCommit::kType{utils::TypeId::PERIODIC_COMMIT, "PeriodicCommit",
+                                                             &query::plan::LogicalOperator::kType};
+constexpr utils::TypeInfo query::plan::PeriodicSubquery::kType{utils::TypeId::PERIODIC_SUBQUERY, "PeriodicSubquery",
+                                                               &query::plan::LogicalOperator::kType};
+
+constexpr utils::TypeInfo query::plan::ScanAllByPointDistance::kType{
+    utils::TypeId::SCAN_ALL_BY_POINT_DISTANCE, "ScanAllByPointDistance", &query::plan::ScanAllByPointDistance::kType};
+
+constexpr utils::TypeInfo query::plan::ScanAllByPointWithinbbox::kType{utils::TypeId::SCAN_ALL_BY_POINT_WITHINBBOX,
+                                                                       "ScanAllByPointWithinbbox",
+                                                                       &query::plan::ScanAllByPointWithinbbox::kType};
 }  // namespace memgraph

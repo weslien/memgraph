@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -17,30 +17,6 @@
 
 namespace memgraph::replication {
 
-struct FrequentHeartbeatReq {
-  static const utils::TypeInfo kType;                            // TODO: make constexpr?
-  static const utils::TypeInfo &GetTypeInfo() { return kType; }  // WHAT?
-
-  static void Load(FrequentHeartbeatReq *self, memgraph::slk::Reader *reader);
-  static void Save(const FrequentHeartbeatReq &self, memgraph::slk::Builder *builder);
-  FrequentHeartbeatReq() {}
-};
-
-struct FrequentHeartbeatRes {
-  static const utils::TypeInfo kType;
-  static const utils::TypeInfo &GetTypeInfo() { return kType; }
-
-  static void Load(FrequentHeartbeatRes *self, memgraph::slk::Reader *reader);
-  static void Save(const FrequentHeartbeatRes &self, memgraph::slk::Builder *builder);
-  FrequentHeartbeatRes() {}
-  explicit FrequentHeartbeatRes(bool success) : success(success) {}
-
-  bool success;
-};
-
-// TODO: move to own header
-using FrequentHeartbeatRpc = rpc::RequestResponse<FrequentHeartbeatReq, FrequentHeartbeatRes>;
-
 class ReplicationServer {
  public:
   explicit ReplicationServer(const memgraph::replication::ReplicationServerConfig &config);
@@ -49,9 +25,10 @@ class ReplicationServer {
   ReplicationServer &operator=(const ReplicationServer &) = delete;
   ReplicationServer &operator=(ReplicationServer &&) = delete;
 
-  virtual ~ReplicationServer();
+  ~ReplicationServer();
 
   bool Start();
+  void Shutdown();
 
  protected:
   communication::ServerContext rpc_server_context_;

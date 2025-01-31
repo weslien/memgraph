@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -35,20 +35,25 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <gmock/gmock.h>
+
+#include "query/db_accessor.hpp"
 #include "query/frontend/ast/ast.hpp"
 #include "query/frontend/ast/pretty_print.hpp"
-#include "storage/v2/id_types.hpp"
 #include "utils/string.hpp"
 
-namespace memgraph::query {
+#include "storage/v2/inmemory/storage.hpp"
 
-namespace test_common {
+namespace memgraph::query::test_common {
+
+using ::testing::_;
 
 auto ToIntList(const TypedValue &t) {
   std::vector<int64_t> list;
@@ -65,14 +70,24 @@ auto ToIntMap(const TypedValue &t) {
 };
 
 std::string ToString(Expression *expr) {
+  std::unique_ptr<memgraph::storage::Storage> store(
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = true}}}));
+  auto storage_acc = store->Access();
+  memgraph::query::DbAccessor dba(storage_acc.get());
+
   std::ostringstream ss;
-  PrintExpression(expr, &ss);
+  PrintExpression(expr, &ss, dba);
   return ss.str();
 }
 
 std::string ToString(NamedExpression *expr) {
+  std::unique_ptr<memgraph::storage::Storage> store(
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = true}}}));
+  auto storage_acc = store->Access();
+  memgraph::query::DbAccessor dba(storage_acc.get());
+
   std::ostringstream ss;
-  PrintExpression(expr, &ss);
+  PrintExpression(expr, &ss, dba);
   return ss.str();
 }
 
@@ -92,6 +107,10 @@ struct OnMatch {
 };
 struct OnCreate {
   std::vector<Clause *> set;
+};
+
+struct CommitFrequency {
+  Expression *expression = nullptr;
 };
 
 // Helper functions for filling the OrderBy with expressions.
@@ -189,7 +208,7 @@ auto GetEdgeVariable(AstStorage &storage, const std::string &name, EdgeAtom::Typ
   for (const auto &type : edge_types) {
     types.push_back(storage.GetEdgeTypeIx(type));
   }
-  auto r_val = storage.Create<EdgeAtom>(storage.Create<Identifier>(name), type, dir, types);
+  auto *r_val = storage.Create<EdgeAtom>(storage.Create<Identifier>(name), type, dir, types);
 
   r_val->filter_lambda_.inner_edge =
       flambda_inner_edge ? flambda_inner_edge : storage.Create<Identifier>(memgraph::utils::RandomString(20));
@@ -215,14 +234,14 @@ auto GetEdgeVariable(AstStorage &storage, const std::string &name, EdgeAtom::Typ
 /// Name is used to create the Identifier which is assigned to the node.
 auto GetNode(AstStorage &storage, const std::string &name, std::optional<std::string> label = std::nullopt,
              const bool user_declared = true) {
-  auto node = storage.Create<NodeAtom>(storage.Create<Identifier>(name, user_declared));
+  auto *node = storage.Create<NodeAtom>(storage.Create<Identifier>(name, user_declared));
   if (label) node->labels_.emplace_back(storage.GetLabelIx(*label));
   return node;
 }
 
 /// Create a Pattern with given atoms.
 auto GetPattern(AstStorage &storage, std::vector<PatternAtom *> atoms) {
-  auto pattern = storage.Create<Pattern>();
+  auto *pattern = storage.Create<Pattern>();
   pattern->identifier_ = storage.Create<Identifier>(memgraph::utils::RandomString(20), false);
   pattern->atoms_.insert(pattern->atoms_.begin(), atoms.begin(), atoms.end());
   return pattern;
@@ -230,7 +249,7 @@ auto GetPattern(AstStorage &storage, std::vector<PatternAtom *> atoms) {
 
 /// Create a Pattern with given name and atoms.
 auto GetPattern(AstStorage &storage, const std::string &name, std::vector<PatternAtom *> atoms) {
-  auto pattern = storage.Create<Pattern>();
+  auto *pattern = storage.Create<Pattern>();
   pattern->identifier_ = storage.Create<Identifier>(name, true);
   pattern->atoms_.insert(pattern->atoms_.begin(), atoms.begin(), atoms.end());
   return pattern;
@@ -297,6 +316,29 @@ auto GetQuery(AstStorage &storage, SingleQuery *single_query, T *...cypher_union
   query->single_query_ = single_query;
   query->cypher_unions_ = std::vector<CypherUnion *>{cypher_unions...};
   return query;
+}
+
+auto GetPeriodicQuery(AstStorage &storage, SingleQuery *single_query, CommitFrequency commit_frequency) {
+  auto *query = storage.Create<CypherQuery>();
+  PreQueryDirectives pre_query_directives;
+
+  query->single_query_ = single_query;
+  query->pre_query_directives_ = pre_query_directives;
+  query->pre_query_directives_.commit_frequency_ = commit_frequency.expression;
+
+  return query;
+}
+
+auto GetLoadCSV(AstStorage &storage, Expression *file_name, const std::string &row_var) {
+  auto *ident = storage.Create<memgraph::query::Identifier>(row_var);
+  auto *load_csv = storage.Create<memgraph::query::LoadCsv>(file_name, true, true, nullptr, nullptr, nullptr, ident);
+
+  return load_csv;
+}
+
+auto GetLoadCSV(AstStorage &storage, Expression *file_name, Identifier *row_var) {
+  auto *load_csv = storage.Create<memgraph::query::LoadCsv>(file_name, true, true, nullptr, nullptr, nullptr, row_var);
+  return load_csv;
 }
 
 // Helper functions for constructing RETURN and WITH clauses.
@@ -377,7 +419,7 @@ void FillReturnBody(AstStorage &storage, ReturnBody &body, const std::string &na
 /// @sa GetWith
 template <class... T>
 auto GetReturn(AstStorage &storage, bool distinct, T... exprs) {
-  auto ret = storage.Create<Return>();
+  auto *ret = storage.Create<Return>();
   ret->body_.distinct = distinct;
   FillReturnBody(storage, ret->body_, exprs...);
   return ret;
@@ -390,7 +432,7 @@ auto GetReturn(AstStorage &storage, bool distinct, T... exprs) {
 /// @sa GetReturn
 template <class... T>
 auto GetWith(AstStorage &storage, bool distinct, T... exprs) {
-  auto with = storage.Create<With>();
+  auto *with = storage.Create<With>();
   with->body_.distinct = distinct;
   FillReturnBody(storage, with->body_, exprs...);
   return with;
@@ -407,7 +449,7 @@ auto GetUnwind(AstStorage &storage, Expression *expr, NamedExpression *as) {
 
 /// Create the delete clause with given named expressions.
 auto GetDelete(AstStorage &storage, std::vector<Expression *> exprs, bool detach = false) {
-  auto del = storage.Create<Delete>();
+  auto *del = storage.Create<Delete>();
   del->expressions_.insert(del->expressions_.begin(), exprs.begin(), exprs.end());
   del->detach_ = detach;
   return del;
@@ -427,7 +469,7 @@ auto GetSet(AstStorage &storage, const std::string &name, Expression *expr, bool
 
 /// Create a set labels clause for given identifier name and labels.
 auto GetSet(AstStorage &storage, const std::string &name, std::vector<std::string> label_names) {
-  std::vector<LabelIx> labels;
+  std::vector<QueryLabelType> labels;
   labels.reserve(label_names.size());
   for (const auto &label : label_names) {
     labels.push_back(storage.GetLabelIx(label));
@@ -440,7 +482,7 @@ auto GetRemove(AstStorage &storage, PropertyLookup *prop_lookup) { return storag
 
 /// Create a remove labels clause for given identifier name and labels.
 auto GetRemove(AstStorage &storage, const std::string &name, std::vector<std::string> label_names) {
-  std::vector<LabelIx> labels;
+  std::vector<QueryLabelType> labels;
   labels.reserve(label_names.size());
   for (const auto &label : label_names) {
     labels.push_back(storage.GetLabelIx(label));
@@ -490,14 +532,32 @@ auto GetCallSubquery(AstStorage &storage, CypherQuery *subquery) {
   return call_subquery;
 }
 
+auto GetCallPeriodicSubquery(AstStorage &storage, SingleQuery *subquery, CommitFrequency commit_frequency) {
+  auto *periodic_subquery = storage.Create<memgraph::query::CallSubquery>();
+
+  auto *query = storage.Create<CypherQuery>();
+  query->single_query_ = std::move(subquery);
+
+  periodic_subquery->cypher_query_ = std::move(query);
+  periodic_subquery->cypher_query_->pre_query_directives_.commit_frequency_ = commit_frequency.expression;
+
+  return periodic_subquery;
+}
+
+auto GetCallPeriodicSubquery(AstStorage &storage, CypherQuery *subquery, CommitFrequency commit_frequency) {
+  auto *periodic_subquery = storage.Create<memgraph::query::CallSubquery>();
+  periodic_subquery->cypher_query_ = std::move(subquery);
+  periodic_subquery->cypher_query_->pre_query_directives_.commit_frequency_ = commit_frequency.expression;
+
+  return periodic_subquery;
+}
+
 /// Create the FOREACH clause with given named expression.
 auto GetForeach(AstStorage &storage, NamedExpression *named_expr, const std::vector<query::Clause *> &clauses) {
   return storage.Create<query::Foreach>(named_expr, clauses);
 }
 
-}  // namespace test_common
-
-}  // namespace memgraph::query
+}  // namespace memgraph::query::test_common
 
 /// All the following macros implicitly pass `storage` variable to functions.
 /// You need to have `AstStorage storage;` somewhere in scope to use them.
@@ -571,6 +631,7 @@ auto GetForeach(AstStorage &storage, NamedExpression *named_expr, const std::vec
   storage.Create<memgraph::query::IndexQuery>(memgraph::query::IndexQuery::Action::CREATE, (label), \
                                               std::vector<memgraph::query::PropertyIx>{(property)})
 #define QUERY(...) memgraph::query::test_common::GetQuery(this->storage, __VA_ARGS__)
+#define PERIODIC_QUERY(...) memgraph::query::test_common::GetPeriodicQuery(this->storage, __VA_ARGS__)
 #define SINGLE_QUERY(...) \
   memgraph::query::test_common::GetSingleQuery(this->storage.template Create<SingleQuery>(), __VA_ARGS__)
 #define UNION(...) \
@@ -584,6 +645,7 @@ auto GetForeach(AstStorage &storage, NamedExpression *named_expr, const std::vec
 #define UMINUS(expr) this->storage.template Create<memgraph::query::UnaryMinusOperator>((expr))
 #define IS_NULL(expr) this->storage.template Create<memgraph::query::IsNullOperator>((expr))
 #define ADD(expr1, expr2) this->storage.template Create<memgraph::query::AdditionOperator>((expr1), (expr2))
+#define RANGE(expr1, expr2) this->storage.template Create<memgraph::query::RangeOperator>((expr1), (expr2))
 #define LESS(expr1, expr2) this->storage.template Create<memgraph::query::LessOperator>((expr1), (expr2))
 #define LESS_EQ(expr1, expr2) this->storage.template Create<memgraph::query::LessEqualOperator>((expr1), (expr2))
 #define GREATER(expr1, expr2) this->storage.template Create<memgraph::query::GreaterOperator>((expr1), (expr2))
@@ -633,9 +695,16 @@ auto GetForeach(AstStorage &storage, NamedExpression *named_expr, const std::vec
   this->storage.template Create<memgraph::query::Extract>( \
       this->storage.template Create<memgraph::query::Identifier>(variable), list, expr)
 #define EXISTS(pattern) this->storage.template Create<memgraph::query::Exists>(pattern)
-#define AUTH_QUERY(action, user, role, user_or_role, password, database, privileges, labels, edgeTypes)      \
-  storage.Create<memgraph::query::AuthQuery>((action), (user), (role), (user_or_role), password, (database), \
-                                             (privileges), (labels), (edgeTypes))
+#define AUTH_QUERY(action, user, role, user_or_role, if_not_exists, password, database, privileges, labels, edgeTypes) \
+  storage.Create<memgraph::query::AuthQuery>((action), (user), (role), (user_or_role), (if_not_exists), password,      \
+                                             (database), (privileges), (labels), (edgeTypes))
 #define DROP_USER(usernames) storage.Create<memgraph::query::DropUser>((usernames))
 #define CALL_PROCEDURE(...) memgraph::query::test_common::GetCallProcedure(storage, __VA_ARGS__)
 #define CALL_SUBQUERY(...) memgraph::query::test_common::GetCallSubquery(this->storage, __VA_ARGS__)
+#define CALL_PERIODIC_SUBQUERY(...) memgraph::query::test_common::GetCallPeriodicSubquery(this->storage, __VA_ARGS__)
+#define PATTERN_COMPREHENSION(variable, pattern, filter, resultExpr) \
+  this->storage.template Create<memgraph::query::PatternComprehension>(variable, pattern, filter, resultExpr)
+#define ENUM_VALUE(...) this->storage.template Create<memgraph::query::EnumValueAccess>(__VA_ARGS__)
+#define COMMIT_FREQUENCY(expr) \
+  memgraph::query::test_common::CommitFrequency { (expr) }
+#define LOAD_CSV(...) memgraph::query::test_common::GetLoadCSV(this->storage, __VA_ARGS__)

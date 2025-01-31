@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -26,6 +26,8 @@ std::filesystem::path data_directory{std::filesystem::temp_directory_path() / "e
 
 class ExpansionBenchFixture : public benchmark::Fixture {
  protected:
+  std::optional<memgraph::system::System> system;
+  std::optional<memgraph::query::AllowEverythingAuthChecker> auth_checker;
   std::optional<memgraph::query::InterpreterContext> interpreter_context;
   std::optional<memgraph::query::Interpreter> interpreter;
   std::optional<memgraph::utils::Gatekeeper<memgraph::dbms::Database>> db_gk;
@@ -40,7 +42,15 @@ class ExpansionBenchFixture : public benchmark::Fixture {
     auto db_acc_opt = db_gk->access();
     MG_ASSERT(db_acc_opt, "Failed to access db");
     auto &db_acc = *db_acc_opt;
-    interpreter_context.emplace(memgraph::query::InterpreterConfig{}, nullptr, &repl_state.value());
+
+    system.emplace();
+    auth_checker.emplace();
+    interpreter_context.emplace(memgraph::query::InterpreterConfig{}, nullptr, &repl_state.value(), *system
+#ifdef MG_ENTERPRISE
+                                ,
+                                std::nullopt
+#endif
+    );
 
     auto label = db_acc->storage()->NameToLabel("Starting");
 
@@ -65,12 +75,15 @@ class ExpansionBenchFixture : public benchmark::Fixture {
     }
 
     interpreter.emplace(&*interpreter_context, std::move(db_acc));
+    interpreter->SetUser(auth_checker->GenQueryUser(std::nullopt, std::nullopt));
   }
 
   void TearDown(const benchmark::State &) override {
     interpreter = std::nullopt;
     interpreter_context = std::nullopt;
     db_gk.reset();
+    auth_checker.reset();
+    system.reset();
     std::filesystem::remove_all(data_directory);
   }
 };
@@ -80,7 +93,7 @@ BENCHMARK_DEFINE_F(ExpansionBenchFixture, Match)(benchmark::State &state) {
 
   while (state.KeepRunning()) {
     ResultStreamFaker results(interpreter->current_db_.db_acc_->get()->storage());
-    interpreter->Prepare(query, {}, {});
+    interpreter->Prepare(query, memgraph::query::no_params_fn, {});
     interpreter->PullAll(&results);
   }
 }
@@ -95,7 +108,7 @@ BENCHMARK_DEFINE_F(ExpansionBenchFixture, Expand)(benchmark::State &state) {
 
   while (state.KeepRunning()) {
     ResultStreamFaker results(interpreter->current_db_.db_acc_->get()->storage());
-    interpreter->Prepare(query, {}, {});
+    interpreter->Prepare(query, memgraph::query::no_params_fn, {});
     interpreter->PullAll(&results);
   }
 }

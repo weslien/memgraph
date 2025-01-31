@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -33,6 +33,8 @@
 #include "test_utils.hpp"
 #include "utils/memory.hpp"
 #include "utils/variant_helpers.hpp"
+
+using memgraph::replication_coordination_glue::ReplicationRole;
 
 #define EXPECT_SUCCESS(...) EXPECT_EQ(__VA_ARGS__, mgp_error::MGP_ERROR_NO_ERROR)
 
@@ -120,7 +122,8 @@ class MgpGraphTest : public ::testing::Test {
  public:
   mgp_graph CreateGraph(const memgraph::storage::View view = memgraph::storage::View::NEW) {
     // the execution context can be null as it shouldn't be used in these tests
-    return mgp_graph{&CreateDbAccessor(memgraph::storage::IsolationLevel::SNAPSHOT_ISOLATION), view, ctx_.get()};
+    return mgp_graph{&CreateDbAccessor(memgraph::storage::IsolationLevel::SNAPSHOT_ISOLATION), view, ctx_.get(),
+                     memgraph::storage::StorageMode::IN_MEMORY_TRANSACTIONAL};
   }
 
   std::array<memgraph::storage::Gid, 2> CreateEdge() {
@@ -178,7 +181,7 @@ class MgpGraphTest : public ::testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(MgpGraphTest, StorageTypes);
+TYPED_TEST_SUITE(MgpGraphTest, StorageTypes);
 
 TYPED_TEST(MgpGraphTest, IsMutable) {
   mgp_graph immutable_graph = this->CreateGraph(memgraph::storage::View::OLD);
@@ -400,7 +403,8 @@ TYPED_TEST(MgpGraphTest, VertexAddLabel) {
     ASSERT_TRUE(maybe_vertex);
     const auto label_ids = maybe_vertex->Labels(memgraph::storage::View::NEW);
     ASSERT_TRUE(label_ids.HasValue());
-    EXPECT_THAT(*label_ids, ::testing::ContainerEq(std::vector{read_uncommited_accessor->NameToLabel(label)}));
+    EXPECT_EQ(label_ids->size(), 1);
+    EXPECT_EQ((*label_ids)[0], read_uncommited_accessor->NameToLabel(label));
   };
   ASSERT_NO_FATAL_FAILURE(check_label());
   EXPECT_SUCCESS(mgp_vertex_add_label(vertex.get(), mgp_label{label.data()}));

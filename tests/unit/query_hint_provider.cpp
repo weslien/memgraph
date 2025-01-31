@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -107,8 +107,8 @@ TEST_F(HintProviderSuite, HintWhenFilteringByLabelAndProperty) {
 }
 
 TEST_F(HintProviderSuite, DontHintWhenLabelPropertyOperatorPresent) {
-  auto scan_all_by_label_prop_value = MakeScanAllByLabelPropertyValue(
-      storage, symbol_table, "n", label, property, "property", storage.template Create<Identifier>("n"));
+  auto scan_all_by_label_prop_value = MakeScanAllByLabelPropertyValue(storage, symbol_table, "n", label, property,
+                                                                      storage.template Create<Identifier>("n"));
   auto produce = MakeProduce(scan_all_by_label_prop_value.op_, nullptr);
 
   const std::vector<std::string> expected_messages{};
@@ -117,8 +117,8 @@ TEST_F(HintProviderSuite, DontHintWhenLabelPropertyOperatorPresent) {
 }
 
 TEST_F(HintProviderSuite, DontHintWhenLabelPropertyOperatorPresentAndAdditionalPropertyFilterPresent) {
-  auto scan_all_by_label_prop_value = MakeScanAllByLabelPropertyValue(
-      storage, symbol_table, "n", label, property, "property", storage.template Create<Identifier>("n"));
+  auto scan_all_by_label_prop_value = MakeScanAllByLabelPropertyValue(storage, symbol_table, "n", label, property,
+                                                                      storage.template Create<Identifier>("n"));
 
   auto *filter_expr =
       EQ(PROPERTY_LOOKUP(*dba, scan_all_by_label_prop_value.node_->identifier_, other_property), LITERAL(42));

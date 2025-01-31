@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -17,12 +17,18 @@
 
 #pragma once
 
+#include <utility>
+
 #include "query/plan/cost_estimator.hpp"
 #include "query/plan/operator.hpp"
 #include "query/plan/preprocess.hpp"
 #include "query/plan/pretty_print.hpp"
+#include "query/plan/rewrite/edge_index_lookup.hpp"
+#include "query/plan/rewrite/enum.hpp"
 #include "query/plan/rewrite/index_lookup.hpp"
 #include "query/plan/rewrite/join.hpp"
+#include "query/plan/rewrite/periodic_delete.hpp"
+#include "query/plan/rewrite/plan_validator.hpp"
 #include "query/plan/rule_based_planner.hpp"
 #include "query/plan/variable_start_planner.hpp"
 #include "query/plan/vertex_count_cache.hpp"
@@ -34,6 +40,12 @@ class SymbolTable;
 
 namespace plan {
 
+// Custom pipe operator to chain functions
+template <typename T, typename F>
+auto operator|(T &&value, F &&func) -> decltype(func(std::forward<T>(value))) {
+  return func(std::forward<T>(value));
+}
+
 class PostProcessor final {
   Parameters parameters_;
 
@@ -42,24 +54,31 @@ class PostProcessor final {
 
   using ProcessedPlan = std::unique_ptr<LogicalOperator>;
 
-  explicit PostProcessor(const Parameters &parameters) : parameters_(parameters) {}
+  explicit PostProcessor(Parameters parameters) : parameters_(std::move(parameters)) {}
 
   template <class TDbAccessor>
-  PostProcessor(const Parameters &parameters, std::vector<IndexHint> index_hints, TDbAccessor *db)
-      : parameters_(parameters), index_hints_(IndexHints(index_hints, db)) {}
+  PostProcessor(Parameters parameters, std::vector<IndexHint> index_hints, TDbAccessor *db)
+      : parameters_(std::move(parameters)), index_hints_(IndexHints(index_hints, db)) {}
 
   template <class TPlanningContext>
   std::unique_ptr<LogicalOperator> Rewrite(std::unique_ptr<LogicalOperator> plan, TPlanningContext *context) {
-    auto index_lookup_plan =
-        RewriteWithIndexLookup(std::move(plan), context->symbol_table, context->ast_storage, context->db, index_hints_);
-    return RewriteWithJoinRewriter(std::move(index_lookup_plan), context->symbol_table, context->ast_storage,
-                                   context->db);
+    auto &ast = context->ast_storage;
+    auto &symbol_table = context->symbol_table;
+    auto &db = context->db;
+
+    return std::move(plan) | [&](auto p) { return RewriteEnumAccess(std::move(p), symbol_table, ast, db); } |
+           [&](auto p) { return RewriteWithIndexLookup(std::move(p), symbol_table, ast, db, index_hints_); } |
+           [&](auto p) { return RewriteWithJoinRewriter(std::move(p), symbol_table, ast, db); } |
+           [&](auto p) { return RewriteWithEdgeIndexRewriter(std::move(p), symbol_table, ast, db); } |
+           [&](auto p) { return RewritePeriodicDelete(std::move(p), symbol_table, ast, db); };
   }
 
+  bool IsValidPlan(const std::unique_ptr<LogicalOperator> &plan) { return query::plan::ValidatePlan(*plan); }
+
   template <class TVertexCounts>
-  double EstimatePlanCost(const std::unique_ptr<LogicalOperator> &plan, TVertexCounts *vertex_counts,
-                          const SymbolTable &table) {
-    return query::plan::EstimatePlanCost(vertex_counts, table, parameters_, *plan);
+  PlanCost EstimatePlanCost(const std::unique_ptr<LogicalOperator> &plan, TVertexCounts *vertex_counts,
+                            const SymbolTable &table) {
+    return query::plan::EstimatePlanCost(vertex_counts, table, parameters_, *plan, index_hints_);
   }
 };
 
@@ -94,9 +113,10 @@ auto MakeLogicalPlanForSingleQuery(QueryParts query_parts, PlanningContext<TDbAc
 /// the estimated cost of that plan as a `double`.
 template <class TPlanningContext, class TPlanPostProcess>
 auto MakeLogicalPlan(TPlanningContext *context, TPlanPostProcess *post_process, bool use_variable_planner) {
-  auto query_parts = CollectQueryParts(*context->symbol_table, *context->ast_storage, context->query);
+  auto query_parts = CollectQueryParts(*context->symbol_table, *context->ast_storage, context->query, false);
   auto &vertex_counts = *context->db;
   double total_cost = std::numeric_limits<double>::max();
+  bool curr_uses_index_hint = false;
 
   using ProcessedPlan = typename TPlanPostProcess::ProcessedPlan;
   ProcessedPlan plan_with_least_cost;
@@ -104,20 +124,39 @@ auto MakeLogicalPlan(TPlanningContext *context, TPlanPostProcess *post_process, 
   std::optional<ProcessedPlan> curr_plan;
   if (use_variable_planner) {
     auto plans = MakeLogicalPlanForSingleQuery<VariableStartPlanner>(query_parts, context);
+    bool valid_plan_found = false;
     for (auto plan : plans) {
+      if (!plan) continue;
       // Plans are generated lazily and the current plan will disappear, so
       // it's ok to move it.
       auto rewritten_plan = post_process->Rewrite(std::move(plan), context);
-      double cost = post_process->EstimatePlanCost(rewritten_plan, &vertex_counts, *context->symbol_table);
-      if (!curr_plan || cost < total_cost) {
+      if (!post_process->IsValidPlan(rewritten_plan)) {
+        continue;
+      }
+      valid_plan_found = true;
+      auto plan_cost = post_process->EstimatePlanCost(rewritten_plan, &vertex_counts, *context->symbol_table);
+      // if we have a plan that uses index hints, we reject all the plans that don't use index hinting because we want
+      // to force the plan using the index hints to be executed
+      if (curr_uses_index_hint && !plan_cost.use_index_hints) continue;
+      // if a plan uses index hints, and there is currently not yet a plan that utilizes it, we will take it regardless
+      if (plan_cost.use_index_hints && !curr_uses_index_hint) {
+        curr_uses_index_hint = plan_cost.use_index_hints;
         curr_plan.emplace(std::move(rewritten_plan));
-        total_cost = cost;
+        total_cost = plan_cost.cost;
+        continue;
+      }
+      // if both plans either use or don't use index hints, we want to use the one with the least cost
+      if (!curr_plan || plan_cost.cost < total_cost) {
+        curr_uses_index_hint = plan_cost.use_index_hints;
+        curr_plan.emplace(std::move(rewritten_plan));
+        total_cost = plan_cost.cost;
       }
     }
+    if (!valid_plan_found) throw QueryException("Could not create a valid query plan, possible ill-formed query");
   } else {
     auto plan = MakeLogicalPlanForSingleQuery<RuleBasedPlanner>(query_parts, context);
     auto rewritten_plan = post_process->Rewrite(std::move(plan), context);
-    total_cost = post_process->EstimatePlanCost(rewritten_plan, &vertex_counts, *context->symbol_table);
+    total_cost = post_process->EstimatePlanCost(rewritten_plan, &vertex_counts, *context->symbol_table).cost;
     curr_plan.emplace(std::move(rewritten_plan));
   }
 
@@ -128,7 +167,7 @@ auto MakeLogicalPlan(TPlanningContext *context, TPlanPostProcess *post_process, 
 
 template <class TPlanningContext>
 auto MakeLogicalPlan(TPlanningContext *context, const Parameters &parameters, bool use_variable_planner) {
-  PostProcessor post_processor(parameters, context->query->index_hints_, context->db);
+  PostProcessor post_processor(parameters, context->query->pre_query_directives_.index_hints_, context->db);
   return MakeLogicalPlan(context, &post_processor, use_variable_planner);
 }
 

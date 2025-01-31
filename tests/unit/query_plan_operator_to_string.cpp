@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -40,7 +40,7 @@ class OperatorToStringTest : public ::testing::Test {
         dba_storage(db->Access()),
         dba(dba_storage.get()) {}
 
-  ~OperatorToStringTest() {
+  ~OperatorToStringTest() override {
     if (std::is_same<StorageType, memgraph::storage::DiskStorage>::value) {
       disk_test_utils::RemoveRocksDbDirs(testSuite);
     }
@@ -58,7 +58,7 @@ class OperatorToStringTest : public ::testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(OperatorToStringTest, StorageTypes);
+TYPED_TEST_SUITE(OperatorToStringTest, StorageTypes);
 
 TYPED_TEST(OperatorToStringTest, Once) {
   std::shared_ptr<LogicalOperator> last_op;
@@ -119,7 +119,7 @@ TYPED_TEST(OperatorToStringTest, ScanAllByLabel) {
 TYPED_TEST(OperatorToStringTest, ScanAllByLabelPropertyRange) {
   std::shared_ptr<LogicalOperator> last_op;
   last_op = std::make_shared<ScanAllByLabelPropertyRange>(
-      nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"), "prop",
+      nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"),
       memgraph::utils::MakeBoundInclusive<Expression *>(LITERAL(1)),
       memgraph::utils::MakeBoundExclusive<Expression *>(LITERAL(20)));
   last_op->dba_ = &this->dba;
@@ -130,9 +130,9 @@ TYPED_TEST(OperatorToStringTest, ScanAllByLabelPropertyRange) {
 
 TYPED_TEST(OperatorToStringTest, ScanAllByLabelPropertyValue) {
   std::shared_ptr<LogicalOperator> last_op;
-  last_op = std::make_shared<ScanAllByLabelPropertyValue>(
-      nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"), "prop",
-      ADD(LITERAL(21), LITERAL(21)));
+  last_op =
+      std::make_shared<ScanAllByLabelPropertyValue>(nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"),
+                                                    this->dba.NameToProperty("prop"), ADD(LITERAL(21), LITERAL(21)));
   last_op->dba_ = &this->dba;
 
   std::string expected_string{"ScanAllByLabelPropertyValue (node :Label {prop})"};
@@ -142,7 +142,7 @@ TYPED_TEST(OperatorToStringTest, ScanAllByLabelPropertyValue) {
 TYPED_TEST(OperatorToStringTest, ScanAllByLabelProperty) {
   std::shared_ptr<LogicalOperator> last_op;
   last_op = std::make_shared<ScanAllByLabelProperty>(nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"),
-                                                     this->dba.NameToProperty("prop"), "prop");
+                                                     this->dba.NameToProperty("prop"));
   last_op->dba_ = &this->dba;
 
   std::string expected_string{"ScanAllByLabelProperty (node :Label {prop})"};
@@ -214,23 +214,22 @@ TYPED_TEST(OperatorToStringTest, Filter) {
   auto node_ident = IDENT("person");
   auto property = this->dba.NameToProperty("name");
   auto property_ix = this->storage.GetPropertyIx("name");
-
-  FilterInfo generic_filter_info = {.type = FilterInfo::Type::Generic, .used_symbols = {node}};
+  auto generic_filter_info = FilterInfo{FilterInfo::Type::Generic, nullptr, {node}};
 
   auto id_filter = IdFilter(this->symbol_table, node, LITERAL(42));
-  FilterInfo id_filter_info = {.type = FilterInfo::Type::Id, .id_filter = id_filter};
+  auto id_filter_info = FilterInfo{FilterInfo::Type::Id, nullptr, {}, {}, id_filter};
 
   std::vector<LabelIx> labels{this->storage.GetLabelIx("Customer"), this->storage.GetLabelIx("Visitor")};
   auto labels_test = LABELS_TEST(node_ident, labels);
-  FilterInfo label_filter_info = {.type = FilterInfo::Type::Label, .expression = labels_test};
+  auto label_filter_info = FilterInfo{FilterInfo::Type::Label, labels_test};
 
   auto labels_test_2 = LABELS_TEST(PROPERTY_LOOKUP(this->dba, "person", property), labels);
-  FilterInfo label_filter_2_info = {.type = FilterInfo::Type::Label, .expression = labels_test_2};
+  auto label_filter_2_info = FilterInfo{FilterInfo::Type::Label, labels_test_2};
 
   auto property_filter = PropertyFilter(node, property_ix, PropertyFilter::Type::EQUAL);
-  FilterInfo property_filter_info = {.type = FilterInfo::Type::Property, .property_filter = property_filter};
+  auto property_filter_info = FilterInfo{FilterInfo::Type::Property, nullptr, {}, property_filter};
 
-  FilterInfo pattern_filter_info = {.type = FilterInfo::Type::Pattern};
+  auto pattern_filter_info = FilterInfo{FilterInfo::Type::Pattern};
 
   Filters filters;
   filters.SetFilters({generic_filter_info, id_filter_info, label_filter_info, label_filter_2_info, property_filter_info,
@@ -291,9 +290,10 @@ TYPED_TEST(OperatorToStringTest, SetProperties) {
 TYPED_TEST(OperatorToStringTest, SetLabels) {
   auto node_sym = this->GetSymbol("node");
   std::shared_ptr<LogicalOperator> last_op = std::make_shared<ScanAll>(nullptr, node_sym);
-  last_op = std::make_shared<plan::SetLabels>(
-      last_op, node_sym,
-      std::vector<memgraph::storage::LabelId>{this->dba.NameToLabel("label1"), this->dba.NameToLabel("label2")});
+  std::vector<StorageLabelType> labels;
+  labels.emplace_back(this->dba.NameToLabel("label1"));
+  labels.emplace_back(this->dba.NameToLabel("label2"));
+  last_op = std::make_shared<plan::SetLabels>(last_op, node_sym, labels);
 
   std::string expected_string{"SetLabels"};
   EXPECT_EQ(last_op->ToString(), expected_string);
@@ -312,9 +312,10 @@ TYPED_TEST(OperatorToStringTest, RemoveProperty) {
 TYPED_TEST(OperatorToStringTest, RemoveLabels) {
   auto node_sym = this->GetSymbol("node");
   std::shared_ptr<LogicalOperator> last_op = std::make_shared<ScanAll>(nullptr, node_sym);
-  last_op = std::make_shared<plan::RemoveLabels>(
-      last_op, node_sym,
-      std::vector<memgraph::storage::LabelId>{this->dba.NameToLabel("label1"), this->dba.NameToLabel("label2")});
+  std::vector<StorageLabelType> labels;
+  labels.emplace_back(this->dba.NameToLabel("label1"));
+  labels.emplace_back(this->dba.NameToLabel("label2"));
+  last_op = std::make_shared<plan::RemoveLabels>(last_op, node_sym, labels);
 
   std::string expected_string{"RemoveLabels"};
   EXPECT_EQ(last_op->ToString(), expected_string);

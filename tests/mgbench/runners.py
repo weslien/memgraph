@@ -416,6 +416,7 @@ class Memgraph(BaseRunner):
     def __init__(self, benchmark_context: BenchmarkContext):
         super().__init__(benchmark_context=benchmark_context)
         self._memgraph_binary = benchmark_context.vendor_binary
+        self._bolt_num_workers = benchmark_context.num_workers_for_benchmark
         self._performance_tracking = benchmark_context.performance_tracking
         self._directory = tempfile.TemporaryDirectory(dir=benchmark_context.temporary_directory)
         self._vendor_args = benchmark_context.vendor_args
@@ -440,6 +441,7 @@ class Memgraph(BaseRunner):
         kwargs["bolt_port"] = self._bolt_port
         kwargs["data_directory"] = data_directory
         kwargs["storage_properties_on_edges"] = True
+        kwargs["bolt_num_workers"] = self._bolt_num_workers
         for key, value in self._vendor_args.items():
             kwargs[key] = value
         return _convert_args_to_flags(self._memgraph_binary, **kwargs)
@@ -486,7 +488,7 @@ class Memgraph(BaseRunner):
             self._stop_event.clear()
             self._rss.clear()
             p.start()
-        self._start(storage_recover_on_startup=True, **self._vendor_args)
+        self._start(data_recovery_on_startup=True, **self._vendor_args)
 
     def stop_db(self, workload):
         if self._performance_tracking:
@@ -632,7 +634,7 @@ class Neo4j(BaseRunner):
             exit_proc = subprocess.run(args=[self._neo4j_binary, "stop"], capture_output=True, check=True)
             return exit_proc.returncode, usage
         else:
-            return 0
+            return 0, 0
 
     def start_db_init(self, workload):
         if self._performance_tracking:
@@ -813,7 +815,7 @@ class MemgraphDocker(BaseRunner):
                 self._bolt_port + ":" + self._bolt_port,
                 "memgraph/memgraph:2.7.0",
                 "--storage_wal_enabled=false",
-                "--storage_recover_on_startup=true",
+                "--data_recovery_on_startup=true",
                 "--storage_snapshot_interval_sec",
                 "0",
             ]

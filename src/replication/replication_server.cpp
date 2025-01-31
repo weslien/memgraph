@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -10,25 +10,9 @@
 // licenses/APL.txt.
 
 #include "replication/replication_server.hpp"
-#include "rpc/messages.hpp"
-#include "slk/serialization.hpp"
-#include "slk/streams.hpp"
+#include "replication_coordination_glue/handler.hpp"
 
-namespace memgraph::slk {
-
-// Serialize code for FrequentHeartbeatRes
-void Save(const memgraph::replication::FrequentHeartbeatRes &self, memgraph::slk::Builder *builder) {
-  memgraph::slk::Save(self.success, builder);
-}
-void Load(memgraph::replication::FrequentHeartbeatRes *self, memgraph::slk::Reader *reader) {
-  memgraph::slk::Load(&self->success, reader);
-}
-
-// Serialize code for FrequentHeartbeatReq
-void Save(const memgraph::replication::FrequentHeartbeatReq &self, memgraph::slk::Builder *builder) {}
-void Load(memgraph::replication::FrequentHeartbeatReq *self, memgraph::slk::Reader *reader) {}
-
-}  // namespace memgraph::slk
+#include <spdlog/spdlog.h>
 
 namespace memgraph::replication {
 namespace {
@@ -39,13 +23,6 @@ auto CreateServerContext(const memgraph::replication::ReplicationServerConfig &c
                       : communication::ServerContext{};
 }
 
-void FrequentHeartbeatHandler(slk::Reader *req_reader, slk::Builder *res_builder) {
-  FrequentHeartbeatReq req;
-  memgraph::slk::Load(&req, req_reader);
-  FrequentHeartbeatRes res{true};
-  memgraph::slk::Save(res, res_builder);
-}
-
 // NOTE: The replication server must have a single thread for processing
 // because there is no need for more processing threads - each replica can
 // have only a single main server. Also, the single-threaded guarantee
@@ -53,44 +30,31 @@ void FrequentHeartbeatHandler(slk::Reader *req_reader, slk::Builder *res_builder
 constexpr auto kReplicationServerThreads = 1;
 }  // namespace
 
-constexpr utils::TypeInfo FrequentHeartbeatReq::kType{utils::TypeId::REP_FREQUENT_HEARTBEAT_REQ, "FrequentHeartbeatReq",
-                                                      nullptr};
-
-constexpr utils::TypeInfo FrequentHeartbeatRes::kType{utils::TypeId::REP_FREQUENT_HEARTBEAT_RES, "FrequentHeartbeatRes",
-                                                      nullptr};
-
-void FrequentHeartbeatReq::Save(const FrequentHeartbeatReq &self, memgraph::slk::Builder *builder) {
-  memgraph::slk::Save(self, builder);
-}
-void FrequentHeartbeatReq::Load(FrequentHeartbeatReq *self, memgraph::slk::Reader *reader) {
-  memgraph::slk::Load(self, reader);
-}
-void FrequentHeartbeatRes::Save(const FrequentHeartbeatRes &self, memgraph::slk::Builder *builder) {
-  memgraph::slk::Save(self, builder);
-}
-void FrequentHeartbeatRes::Load(FrequentHeartbeatRes *self, memgraph::slk::Reader *reader) {
-  memgraph::slk::Load(self, reader);
-}
-
 ReplicationServer::ReplicationServer(const memgraph::replication::ReplicationServerConfig &config)
     : rpc_server_context_{CreateServerContext(config)},
-      rpc_server_{io::network::Endpoint{config.ip_address, config.port}, &rpc_server_context_,
-                  kReplicationServerThreads} {
-  rpc_server_.Register<FrequentHeartbeatRpc>([](auto *req_reader, auto *res_builder) {
+      rpc_server_{config.repl_server, &rpc_server_context_, kReplicationServerThreads} {
+  rpc_server_.Register<replication_coordination_glue::FrequentHeartbeatRpc>([](auto *req_reader, auto *res_builder) {
     spdlog::debug("Received FrequentHeartbeatRpc");
-    FrequentHeartbeatHandler(req_reader, res_builder);
+    replication_coordination_glue::FrequentHeartbeatHandler(req_reader, res_builder);
   });
 }
 
-ReplicationServer::~ReplicationServer() {
+ReplicationServer::~ReplicationServer() { Shutdown(); }
+
+bool ReplicationServer::Start() { return rpc_server_.Start(); }
+
+void ReplicationServer::Shutdown() {
   if (rpc_server_.IsRunning()) {
-    auto const &endpoint = rpc_server_.endpoint();
-    spdlog::trace("Closing replication server on {}:{}", endpoint.address, endpoint.port);
-    rpc_server_.Shutdown();
+    try {
+      // trace can throw
+      auto const &endpoint = rpc_server_.endpoint();
+      spdlog::trace("Closing replication server on {}", endpoint.SocketAddress());
+      rpc_server_.Shutdown();
+      // NOLINTNEXTLINE(bugprone-empty-catch)
+    } catch (std::exception const &) {
+    }
   }
   rpc_server_.AwaitShutdown();
 }
-
-bool ReplicationServer::Start() { return rpc_server_.Start(); }
 
 }  // namespace memgraph::replication

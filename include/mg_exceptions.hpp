@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,8 +11,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <exception>
-#include <iostream>
+#include <iosfwd>
 #include <sstream>
 #include <string>
 
@@ -25,7 +26,7 @@ namespace mg_exception {
 template <typename FirstArg, typename... Args>
 std::string StringSerialize(FirstArg &&firstArg, Args &&...args) {
   std::stringstream stream;
-  stream << firstArg;
+  stream << std::forward<FirstArg>(firstArg);
   ((stream << " " << args), ...);
   return stream.str();
 }
@@ -103,6 +104,10 @@ struct ValueConversionException : public std::exception {
 
 struct SerializationException : public std::exception {
   const char *what() const noexcept override { return "Error in serialization!"; }
+};
+
+struct NotYetImplementedException : public std::exception {
+  const char *what() const noexcept override { return "Not yet implemented!"; }
 };
 
 }  // namespace mg_exception

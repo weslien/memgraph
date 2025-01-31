@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -17,17 +17,18 @@
 #include "storage/v2/inmemory/storage.hpp"
 #include "storage/v2/storage.hpp"
 
+using memgraph::replication_coordination_glue::ReplicationRole;
 using testing::UnorderedElementsAre;
 
 class StorageEdgeTest : public ::testing::TestWithParam<bool> {};
 
-INSTANTIATE_TEST_CASE_P(EdgesWithProperties, StorageEdgeTest, ::testing::Values(true));
-INSTANTIATE_TEST_CASE_P(EdgesWithoutProperties, StorageEdgeTest, ::testing::Values(false));
+INSTANTIATE_TEST_SUITE_P(EdgesWithProperties, StorageEdgeTest, ::testing::Values(true));
+INSTANTIATE_TEST_SUITE_P(EdgesWithoutProperties, StorageEdgeTest, ::testing::Values(false));
 
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeCreateFromSmallerCommit) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_from = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_to = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -218,7 +219,7 @@ TEST_P(StorageEdgeTest, EdgeCreateFromSmallerCommit) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeCreateFromLargerCommit) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_from = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_to = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -391,7 +392,7 @@ TEST_P(StorageEdgeTest, EdgeCreateFromLargerCommit) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeCreateFromSameCommit) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_vertex = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
   // Create vertex
@@ -537,7 +538,7 @@ TEST_P(StorageEdgeTest, EdgeCreateFromSameCommit) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeCreateFromSmallerAbort) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_from = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_to = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -807,7 +808,7 @@ TEST_P(StorageEdgeTest, EdgeCreateFromSmallerAbort) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeCreateFromLargerAbort) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_from = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_to = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -1077,7 +1078,7 @@ TEST_P(StorageEdgeTest, EdgeCreateFromLargerAbort) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeCreateFromSameAbort) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_vertex = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
   // Create vertex
@@ -1304,7 +1305,7 @@ TEST_P(StorageEdgeTest, EdgeCreateFromSameAbort) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeDeleteFromSmallerCommit) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_from = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_to = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -1573,7 +1574,7 @@ TEST_P(StorageEdgeTest, EdgeDeleteFromSmallerCommit) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeDeleteFromLargerCommit) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_from = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_to = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -1842,7 +1843,7 @@ TEST_P(StorageEdgeTest, EdgeDeleteFromLargerCommit) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeDeleteFromSameCommit) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_vertex = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
   // Create vertex
@@ -2068,7 +2069,7 @@ TEST_P(StorageEdgeTest, EdgeDeleteFromSameCommit) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeDeleteFromSmallerAbort) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_from = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_to = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -2491,7 +2492,7 @@ TEST_P(StorageEdgeTest, EdgeDeleteFromSmallerAbort) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeDeleteFromLargerAbort) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_from = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_to = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -2915,7 +2916,7 @@ TEST_P(StorageEdgeTest, EdgeDeleteFromLargerAbort) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, EdgeDeleteFromSameAbort) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_vertex = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
   // Create vertex
@@ -3275,7 +3276,7 @@ TEST_P(StorageEdgeTest, EdgeDeleteFromSameAbort) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, VertexDetachDeleteSingleCommit) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_from = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_to = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -3415,7 +3416,7 @@ TEST_P(StorageEdgeTest, VertexDetachDeleteSingleCommit) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, VertexDetachDeleteMultipleCommit) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_vertex1 = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_vertex2 = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -3745,7 +3746,7 @@ TEST_P(StorageEdgeTest, VertexDetachDeleteMultipleCommit) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, VertexDetachDeleteSingleAbort) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_from = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_to = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -3990,7 +3991,7 @@ TEST_P(StorageEdgeTest, VertexDetachDeleteSingleAbort) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST_P(StorageEdgeTest, VertexDetachDeleteMultipleAbort) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = GetParam()}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = GetParam()}}}));
   memgraph::storage::Gid gid_vertex1 = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   memgraph::storage::Gid gid_vertex2 = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
@@ -4636,7 +4637,7 @@ TEST_P(StorageEdgeTest, VertexDetachDeleteMultipleAbort) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST(StorageWithProperties, EdgePropertyCommit) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = true}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = true}}}));
   memgraph::storage::Gid gid = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   {
     auto acc = store->Access();
@@ -4767,7 +4768,7 @@ TEST(StorageWithProperties, EdgePropertyCommit) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST(StorageWithProperties, EdgePropertyAbort) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = true}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = true}}}));
   memgraph::storage::Gid gid = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
 
   // Create the vertex.
@@ -5059,7 +5060,7 @@ TEST(StorageWithProperties, EdgePropertyAbort) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST(StorageWithProperties, EdgePropertySerializationError) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = true}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = true}}}));
   memgraph::storage::Gid gid = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   {
     auto acc = store->Access();
@@ -5169,7 +5170,7 @@ TEST(StorageWithProperties, EdgePropertySerializationError) {
 
 TEST(StorageWithProperties, EdgePropertyClear) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = true}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = true}}}));
   memgraph::storage::Gid gid;
   auto property1 = store->NameToProperty("property1");
   auto property2 = store->NameToProperty("property2");
@@ -5285,7 +5286,7 @@ TEST(StorageWithProperties, EdgePropertyClear) {
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TEST(StorageWithoutProperties, EdgePropertyAbort) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = false}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = false}}}));
   memgraph::storage::Gid gid = memgraph::storage::Gid::FromUint(std::numeric_limits<uint64_t>::max());
   {
     auto acc = store->Access();
@@ -5354,7 +5355,7 @@ TEST(StorageWithoutProperties, EdgePropertyAbort) {
 
 TEST(StorageWithoutProperties, EdgePropertyClear) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = false}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = false}}}));
   memgraph::storage::Gid gid;
   {
     auto acc = store->Access();
@@ -5381,7 +5382,7 @@ TEST(StorageWithoutProperties, EdgePropertyClear) {
 
 TEST(StorageWithProperties, EdgeNonexistentPropertyAPI) {
   std::unique_ptr<memgraph::storage::Storage> store(
-      new memgraph::storage::InMemoryStorage({.items = {.properties_on_edges = true}}));
+      new memgraph::storage::InMemoryStorage({.salient = {.items = {.properties_on_edges = true}}}));
 
   auto property = store->NameToProperty("property");
 

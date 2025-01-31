@@ -1,9 +1,9 @@
 #!/bin/bash
-
 set -Eeuo pipefail
-
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 source "$DIR/../util.sh"
+
+# IMPORTANT: Deprecated since memgraph v3.0.0.
 
 check_operating_system "ubuntu-20.04"
 check_architecture "x86_64"
@@ -59,6 +59,8 @@ MEMGRAPH_BUILD_DEPS=(
     libtool  # for protobuf code generation
     libsasl2-dev
 )
+
+MEMGRAPH_TEST_DEPS="${MEMGRAPH_BUILD_DEPS[*]}"
 
 MEMGRAPH_RUN_DEPS=(
     logrotate openssl python3 libseccomp2

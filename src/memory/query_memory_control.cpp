@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -12,7 +12,6 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
-#include <iostream>
 #include <optional>
 #include <shared_mutex>
 #include <thread>
@@ -35,25 +34,42 @@ namespace memgraph::memory {
 #if USE_JEMALLOC
 
 void QueriesMemoryControl::UpdateThreadToTransactionId(const std::thread::id &thread_id, uint64_t transaction_id) {
+  const ThreadTrackingBlocker
+      blocker{};  // makes sure we cannot recursevly track allocations
+                  // if allocations could happen here we would try to track that, which calls alloc
   auto accessor = thread_id_to_transaction_id.access();
-  accessor.insert({thread_id, transaction_id});
+  auto elem = accessor.find(thread_id);
+  if (elem == accessor.end()) {
+    accessor.insert({thread_id, {transaction_id, 1}});
+  } else {
+    elem->transaction_id.cnt++;
+  }
 }
 
 void QueriesMemoryControl::EraseThreadToTransactionId(const std::thread::id &thread_id, uint64_t transaction_id) {
+  const ThreadTrackingBlocker
+      blocker{};  // makes sure we cannot recursevly track allocations
+                  // if allocations could happen here we would try to track that, which calls alloc
   auto accessor = thread_id_to_transaction_id.access();
   auto elem = accessor.find(thread_id);
   MG_ASSERT(elem != accessor.end() && elem->transaction_id == transaction_id);
-  accessor.remove(thread_id);
+  elem->transaction_id.cnt--;
+  if (elem->transaction_id.cnt == 0) {
+    accessor.remove(thread_id);
+  }
 }
 
-void QueriesMemoryControl::TrackAllocOnCurrentThread(size_t size) {
+bool QueriesMemoryControl::TrackAllocOnCurrentThread(size_t size) {
+  const ThreadTrackingBlocker
+      blocker{};  // makes sure we cannot recursevly track allocations
+                  // if allocations could happen here we would try to track that, which calls alloc
   auto thread_id_to_transaction_id_accessor = thread_id_to_transaction_id.access();
 
   // we might be just constructing mapping between thread id and transaction id
   // so we miss this allocation
   auto thread_id_to_transaction_id_elem = thread_id_to_transaction_id_accessor.find(std::this_thread::get_id());
   if (thread_id_to_transaction_id_elem == thread_id_to_transaction_id_accessor.end()) {
-    return;
+    return true;
   }
 
   auto transaction_id_to_tracker_accessor = transaction_id_to_tracker.access();
@@ -63,13 +79,16 @@ void QueriesMemoryControl::TrackAllocOnCurrentThread(size_t size) {
   // It can happen that some allocation happens between mapping thread to
   // transaction id, so we miss this allocation
   if (transaction_id_to_tracker == transaction_id_to_tracker_accessor.end()) [[unlikely]] {
-    return;
+    return true;
   }
   auto &query_tracker = transaction_id_to_tracker->tracker;
-  query_tracker.TrackAlloc(size);
+  return query_tracker.TrackAlloc(size);
 }
 
 void QueriesMemoryControl::TrackFreeOnCurrentThread(size_t size) {
+  const ThreadTrackingBlocker
+      blocker{};  // makes sure we cannot recursevly track allocations
+                  // if allocations could happen here we would try to track that, which calls alloc
   auto thread_id_to_transaction_id_accessor = thread_id_to_transaction_id.access();
 
   // we might be just constructing mapping between thread id and transaction id
@@ -93,6 +112,9 @@ void QueriesMemoryControl::TrackFreeOnCurrentThread(size_t size) {
 }
 
 void QueriesMemoryControl::CreateTransactionIdTracker(uint64_t transaction_id, size_t inital_limit) {
+  const ThreadTrackingBlocker
+      blocker{};  // makes sure we cannot recursevly track allocations
+                  // if allocations could happen here we would try to track that, which calls alloc
   auto transaction_id_to_tracker_accessor = transaction_id_to_tracker.access();
 
   auto [elem, result] = transaction_id_to_tracker_accessor.insert({transaction_id, utils::QueryMemoryTracker{}});
@@ -101,18 +123,27 @@ void QueriesMemoryControl::CreateTransactionIdTracker(uint64_t transaction_id, s
 }
 
 bool QueriesMemoryControl::EraseTransactionIdTracker(uint64_t transaction_id) {
+  const ThreadTrackingBlocker
+      blocker{};  // makes sure we cannot recursevly track allocations
+                  // if allocations could happen here we would try to track that, which calls alloc
   auto transaction_id_to_tracker_accessor = transaction_id_to_tracker.access();
-  auto removed = transaction_id_to_tracker.access().remove(transaction_id);
+  auto removed = transaction_id_to_tracker_accessor.remove(transaction_id);
   return removed;
 }
 
 bool QueriesMemoryControl::CheckTransactionIdTrackerExists(uint64_t transaction_id) {
+  const ThreadTrackingBlocker
+      blocker{};  // makes sure we cannot recursevly track allocations
+                  // if allocations could happen here we would try to track that, which calls alloc
   auto transaction_id_to_tracker_accessor = transaction_id_to_tracker.access();
   return transaction_id_to_tracker_accessor.contains(transaction_id);
 }
 
 void QueriesMemoryControl::TryCreateTransactionProcTracker(uint64_t transaction_id, int64_t procedure_id,
                                                            size_t limit) {
+  const ThreadTrackingBlocker
+      blocker{};  // makes sure we cannot recursevly track allocations
+                  // if allocations could happen here we would try to track that, which calls alloc
   auto transaction_id_to_tracker_accessor = transaction_id_to_tracker.access();
   auto query_tracker = transaction_id_to_tracker_accessor.find(transaction_id);
 
@@ -124,6 +155,9 @@ void QueriesMemoryControl::TryCreateTransactionProcTracker(uint64_t transaction_
 }
 
 void QueriesMemoryControl::SetActiveProcIdTracker(uint64_t transaction_id, int64_t procedure_id) {
+  const ThreadTrackingBlocker
+      blocker{};  // makes sure we cannot recursevly track allocations
+                  // if allocations could happen here we would try to track that, which calls alloc
   auto transaction_id_to_tracker_accessor = transaction_id_to_tracker.access();
   auto query_tracker = transaction_id_to_tracker_accessor.find(transaction_id);
 
@@ -135,6 +169,9 @@ void QueriesMemoryControl::SetActiveProcIdTracker(uint64_t transaction_id, int64
 }
 
 void QueriesMemoryControl::PauseProcedureTracking(uint64_t transaction_id) {
+  const ThreadTrackingBlocker
+      blocker{};  // makes sure we cannot recursevly track allocations
+                  // if allocations could happen here we would try to track that, which calls alloc
   auto transaction_id_to_tracker_accessor = transaction_id_to_tracker.access();
   auto query_tracker = transaction_id_to_tracker_accessor.find(transaction_id);
 
@@ -153,6 +190,16 @@ inline int &Get_Thread_Tracker() {
 }
 
 bool QueriesMemoryControl::IsThreadTracked() { return Get_Thread_Tracker() == 1; }
+
+QueriesMemoryControl::ThreadTrackingBlocker::ThreadTrackingBlocker() : prev_state_{Get_Thread_Tracker()} {
+  // Disable thread tracking
+  Get_Thread_Tracker() = 0;
+}
+
+QueriesMemoryControl::ThreadTrackingBlocker::~ThreadTrackingBlocker() {
+  // Reset thread tracking to previous state
+  Get_Thread_Tracker() = prev_state_;
+}
 
 #endif
 

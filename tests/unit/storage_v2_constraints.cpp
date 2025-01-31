@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -22,6 +22,8 @@
 #include "storage/v2/inmemory/storage.hpp"
 
 #include "disk_test_utils.hpp"
+
+using memgraph::replication_coordination_glue::ReplicationRole;
 
 // NOLINTNEXTLINE(google-build-using-namespace)
 using namespace memgraph::storage;
@@ -76,7 +78,7 @@ class ConstraintsTest : public testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(ConstraintsTest, StorageTypes);
+TYPED_TEST_SUITE(ConstraintsTest, StorageTypes);
 
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TYPED_TEST(ConstraintsTest, ExistenceConstraintsCreateAndDrop) {
@@ -1246,18 +1248,301 @@ TYPED_TEST(ConstraintsTest, UniqueConstraintsClearOldData) {
 
     ASSERT_EQ(disk_test_utils::GetRealNumberOfEntriesInRocksDB(tx_db), 1);
 
-    auto acc2 = this->storage->Access(std::nullopt);
+    auto acc2 = this->storage->Access();
     auto vertex2 = acc2->FindVertex(vertex.Gid(), memgraph::storage::View::NEW).value();
     ASSERT_TRUE(vertex2.SetProperty(this->prop1, memgraph::storage::PropertyValue(2)).HasValue());
     ASSERT_FALSE(acc2->Commit().HasError());
 
     ASSERT_EQ(disk_test_utils::GetRealNumberOfEntriesInRocksDB(tx_db), 1);
 
-    auto acc3 = this->storage->Access(std::nullopt);
+    auto acc3 = this->storage->Access();
     auto vertex3 = acc3->FindVertex(vertex.Gid(), memgraph::storage::View::NEW).value();
     ASSERT_TRUE(vertex3.SetProperty(this->prop1, memgraph::storage::PropertyValue(10)).HasValue());
     ASSERT_FALSE(acc3->Commit().HasError());
 
     ASSERT_EQ(disk_test_utils::GetRealNumberOfEntriesInRocksDB(tx_db), 1);
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraints) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_NO_ERROR(res);
+    ASSERT_NO_ERROR(unique_acc->Commit());
+  }
+
+  {
+    auto acc1 = this->storage->Access();
+    auto vertex1 = acc1->CreateVertex();
+
+    ASSERT_NO_ERROR(vertex1.AddLabel(this->label1));
+    ASSERT_THROW(vertex1.SetProperty(this->prop1, PropertyValue("problem")), memgraph::query::QueryException);
+    ASSERT_NO_ERROR(vertex1.SetProperty(this->prop1, PropertyValue(1)));
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraintsInitProperties) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_NO_ERROR(res);
+    ASSERT_NO_ERROR(unique_acc->Commit());
+  }
+
+  {
+    auto acc1 = this->storage->Access();
+    auto vertex1 = acc1->CreateVertex();
+
+    ASSERT_NO_ERROR(vertex1.AddLabel(this->label1));
+    ASSERT_THROW(vertex1.InitProperties({{this->prop1, PropertyValue("problem")}}), memgraph::query::QueryException);
+    ASSERT_NO_ERROR(vertex1.InitProperties({{this->prop1, PropertyValue(1)}}));
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraintsUpdateProperties) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_NO_ERROR(res);
+    ASSERT_NO_ERROR(unique_acc->Commit());
+  }
+
+  {
+    auto acc1 = this->storage->Access();
+    auto vertex1 = acc1->CreateVertex();
+
+    ASSERT_NO_ERROR(vertex1.AddLabel(this->label1));
+    auto properties1 = std::map<PropertyId, PropertyValue>{{this->prop1, PropertyValue("problem")}};
+    ASSERT_THROW(vertex1.UpdateProperties(properties1), memgraph::query::QueryException);
+    auto properties2 = std::map<PropertyId, PropertyValue>{{this->prop1, PropertyValue(1)}};
+    ASSERT_NO_ERROR(vertex1.UpdateProperties(properties2));
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraintsMultiplePropertiesSameLabel) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_NO_ERROR(res);
+    ASSERT_NO_ERROR(unique_acc->Commit());
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop2, TypeConstraintKind::INTEGER);
+    ASSERT_NO_ERROR(res);
+    ASSERT_NO_ERROR(unique_acc->Commit());
+  }
+
+  {
+    auto acc1 = this->storage->Access();
+    auto vertex1 = acc1->CreateVertex();
+
+    ASSERT_NO_ERROR(vertex1.AddLabel(this->label1));
+    ASSERT_THROW(vertex1.SetProperty(this->prop1, PropertyValue("problem")), memgraph::query::QueryException);
+    ASSERT_NO_ERROR(vertex1.SetProperty(this->prop1, PropertyValue(1)));
+    ASSERT_THROW(vertex1.SetProperty(this->prop2, PropertyValue("problem")), memgraph::query::QueryException);
+    ASSERT_NO_ERROR(vertex1.SetProperty(this->prop2, PropertyValue(1)));
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraintsDuplicate) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_NO_ERROR(res);
+    ASSERT_NO_ERROR(unique_acc->Commit());
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_TRUE(res.HasError());
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraintsAddLabelLast) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_NO_ERROR(res);
+    ASSERT_NO_ERROR(unique_acc->Commit());
+  }
+
+  {
+    auto acc1 = this->storage->Access();
+    auto vertex1 = acc1->CreateVertex();
+
+    ASSERT_NO_ERROR(vertex1.SetProperty(this->prop1, PropertyValue("problem")));
+    ASSERT_THROW(vertex1.AddLabel(this->label1), memgraph::query::QueryException);
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraintsAddConstraintLastWithViolation) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto acc1 = this->storage->Access();
+    auto vertex1 = acc1->CreateVertex();
+
+    ASSERT_NO_ERROR(vertex1.SetProperty(this->prop1, PropertyValue("problem")));
+    ASSERT_NO_ERROR(vertex1.AddLabel(this->label1));
+    ASSERT_NO_ERROR(acc1->Commit());
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_TRUE(res.HasError());
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraintsAddConstraintLastWithoutViolation) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto acc1 = this->storage->Access();
+    auto vertex1 = acc1->CreateVertex();
+
+    ASSERT_NO_ERROR(vertex1.SetProperty(this->prop1, PropertyValue(1)));
+    ASSERT_NO_ERROR(vertex1.AddLabel(this->label1));
+    ASSERT_NO_ERROR(acc1->Commit());
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_NO_ERROR(res);
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraintsWhenItDoesNotApply) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_NO_ERROR(res);
+    ASSERT_NO_ERROR(unique_acc->Commit());
+  }
+
+  {
+    auto acc1 = this->storage->Access();
+    auto vertex1 = acc1->CreateVertex();
+
+    ASSERT_NO_ERROR(vertex1.AddLabel(this->label2));
+    ASSERT_NO_ERROR(vertex1.SetProperty(this->prop1, PropertyValue("problem")));
+    ASSERT_NO_ERROR(vertex1.SetProperty(this->prop1, PropertyValue(1)));
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraintsSubtypeCheckForTemporalData) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::DATE);
+    ASSERT_NO_ERROR(res);
+    ASSERT_NO_ERROR(unique_acc->Commit());
+  }
+
+  {
+    auto acc1 = this->storage->Access();
+    auto vertex1 = acc1->CreateVertex();
+
+    ASSERT_NO_ERROR(vertex1.AddLabel(this->label1));
+    ASSERT_THROW(vertex1.SetProperty(this->prop1, PropertyValue("problem")), memgraph::query::QueryException);
+    ASSERT_THROW(vertex1.SetProperty(this->prop1, PropertyValue(TemporalData{TemporalType::LocalDateTime, 0})),
+                 memgraph::query::QueryException);
+    ASSERT_NO_ERROR(vertex1.SetProperty(this->prop1, PropertyValue(TemporalData{TemporalType::Date, 0})));
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraintsSubtypeCheckForTemporalDataAddLabelLast) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::DATE);
+    ASSERT_NO_ERROR(res);
+    ASSERT_NO_ERROR(unique_acc->Commit());
+  }
+
+  {
+    auto acc1 = this->storage->Access();
+    auto vertex1 = acc1->CreateVertex();
+
+    ASSERT_NO_ERROR(vertex1.SetProperty(this->prop1, PropertyValue(TemporalData{TemporalType::LocalDateTime, 0})));
+    ASSERT_THROW(vertex1.AddLabel(this->label1), memgraph::query::QueryException);
+  }
+
+  {
+    auto acc1 = this->storage->Access();
+    auto vertex1 = acc1->CreateVertex();
+
+    ASSERT_NO_ERROR(vertex1.SetProperty(this->prop1, PropertyValue(TemporalData{TemporalType::Date, 0})));
+    ASSERT_NO_ERROR(vertex1.AddLabel(this->label1));
+  }
+}
+
+TYPED_TEST(ConstraintsTest, TypeConstraintsDrop) {
+  if (std::is_same_v<TypeParam, memgraph::storage::DiskStorage>) {
+    GTEST_SKIP() << "Type constraints not implemented for on-disk";
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->DropTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_TRUE(res.HasError());
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res = unique_acc->CreateTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_NO_ERROR(res);
+    ASSERT_NO_ERROR(unique_acc->Commit());
+  }
+
+  {
+    auto unique_acc = this->db_acc_->get()->UniqueAccess();
+    auto res1 = unique_acc->DropTypeConstraint(this->label1, this->prop1, TypeConstraintKind::FLOAT);
+    ASSERT_TRUE(res1.HasError());
+    auto res2 = unique_acc->DropTypeConstraint(this->label1, this->prop1, TypeConstraintKind::INTEGER);
+    ASSERT_NO_ERROR(res2);
   }
 }

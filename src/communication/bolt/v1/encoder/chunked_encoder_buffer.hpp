@@ -1,4 +1,4 @@
-// Copyright 2022 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -48,7 +48,7 @@ namespace memgraph::communication::bolt {
 template <class TOutputStream>
 class ChunkedEncoderBuffer {
  public:
-  ChunkedEncoderBuffer(TOutputStream &output_stream) : output_stream_(output_stream) {}
+  explicit ChunkedEncoderBuffer(TOutputStream &output_stream) : output_stream_(output_stream) {}
 
   /**
    * Writes n values into the buffer. If n is bigger than whole chunk size
@@ -63,7 +63,7 @@ class ChunkedEncoderBuffer {
     while (n > 0) {
       // Define the number of bytes which will be copied into the chunk because
       // the internal storage is a fixed length array.
-      size_t size = n < kChunkMaxDataSize - have_ ? n : kChunkMaxDataSize - have_;
+      const size_t size = std::min(n, kChunkMaxDataSize - have_);
 
       // Copy `size` values to the chunk array.
       std::memcpy(chunk_.data() + kChunkHeaderSize + have_, values + written, size);

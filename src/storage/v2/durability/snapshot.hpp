@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -20,8 +20,10 @@
 #include "storage/v2/constraints/constraints.hpp"
 #include "storage/v2/durability/metadata.hpp"
 #include "storage/v2/edge.hpp"
+#include "storage/v2/enum_store.hpp"
 #include "storage/v2/indices/indices.hpp"
 #include "storage/v2/name_id_mapper.hpp"
+#include "storage/v2/schema_info.hpp"
 #include "storage/v2/transaction.hpp"
 #include "storage/v2/vertex.hpp"
 #include "utils/file_locker.hpp"
@@ -34,8 +36,10 @@ struct SnapshotInfo {
   uint64_t offset_edges;
   uint64_t offset_vertices;
   uint64_t offset_indices;
+  uint64_t offset_edge_indices;
   uint64_t offset_constraints;
   uint64_t offset_mapper;
+  uint64_t offset_enums;
   uint64_t offset_epoch_history;
   uint64_t offset_metadata;
   uint64_t offset_edge_batches;
@@ -62,14 +66,16 @@ SnapshotInfo ReadSnapshotInfo(const std::filesystem::path &path);
 
 /// Function used to load the snapshot data into the storage.
 /// @throw RecoveryFailure
-RecoveredSnapshot LoadSnapshot(const std::filesystem::path &path, utils::SkipList<Vertex> *vertices,
-                               utils::SkipList<Edge> *edges,
+RecoveredSnapshot LoadSnapshot(std::filesystem::path const &path, utils::SkipList<Vertex> *vertices,
+                               utils::SkipList<Edge> *edges, utils::SkipList<EdgeMetadata> *edges_metadata,
                                std::deque<std::pair<std::string, uint64_t>> *epoch_history,
-                               NameIdMapper *name_id_mapper, std::atomic<uint64_t> *edge_count, const Config &config);
+                               NameIdMapper *name_id_mapper, std::atomic<uint64_t> *edge_count, Config const &config,
+                               memgraph::storage::EnumStore *enum_store,
+                               memgraph::storage::SharedSchemaTracking *schema_info);
 
 void CreateSnapshot(Storage *storage, Transaction *transaction, const std::filesystem::path &snapshot_directory,
                     const std::filesystem::path &wal_directory, utils::SkipList<Vertex> *vertices,
-                    utils::SkipList<Edge> *edges, const std::string &uuid,
+                    utils::SkipList<Edge> *edges, utils::UUID const &uuid,
                     const memgraph::replication::ReplicationEpoch &epoch,
                     const std::deque<std::pair<std::string, uint64_t>> &epoch_history,
                     utils::FileRetainer *file_retainer);

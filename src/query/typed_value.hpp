@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -12,7 +12,7 @@
 #pragma once
 
 #include <cstdint>
-#include <iostream>
+#include <iosfwd>
 #include <map>
 #include <memory>
 #include <string>
@@ -20,8 +20,6 @@
 #include <utility>
 #include <vector>
 
-#include "query/db_accessor.hpp"
-#include "query/graph.hpp"
 #include "query/path.hpp"
 #include "utils/exceptions.hpp"
 #include "utils/memory.hpp"
@@ -31,6 +29,17 @@
 #include "utils/temporal.hpp"
 
 namespace memgraph::query {
+
+class Graph;  // fwd declare
+
+namespace {
+template <typename T>
+concept TypedValueValidPrimativeType =
+    std::is_same_v<T, bool> || std::is_same_v<T, int> || std::is_same_v<T, int64_t> || std::is_same_v<T, double> ||
+    std::is_same_v<T, storage::Enum> || std::is_same_v<T, utils::Date> || std::is_same_v<T, utils::LocalTime> ||
+    std::is_same_v<T, utils::LocalDateTime> || std::is_same_v<T, utils::ZonedDateTime> ||
+    std::is_same_v<T, utils::Duration> || std::is_same_v<T, utils::Duration> || std::is_same_v<T, std::string>;
+}
 
 // TODO: Neo4j does overflow checking. Should we also implement it?
 /**
@@ -83,8 +92,13 @@ class TypedValue {
     Date,
     LocalTime,
     LocalDateTime,
+    ZonedDateTime,
     Duration,
-    Graph
+    Graph,
+    Function,
+    Enum,
+    Point2d,
+    Point3d
   };
 
   // TypedValue at this exact moment of compilation is an incomplete type, and
@@ -153,6 +167,11 @@ class TypedValue {
     double_v = value;
   }
 
+  explicit TypedValue(storage::Enum value, utils::MemoryResource *memory = utils::NewDeleteResource())
+      : memory_(memory), type_(Type::Enum) {
+    enum_v = value;
+  }
+
   explicit TypedValue(const utils::Date &value, utils::MemoryResource *memory = utils::NewDeleteResource())
       : memory_(memory), type_(Type::Date) {
     date_v = value;
@@ -168,9 +187,24 @@ class TypedValue {
     local_date_time_v = value;
   }
 
+  explicit TypedValue(const utils::ZonedDateTime &value, utils::MemoryResource *memory = utils::NewDeleteResource())
+      : memory_(memory), type_(Type::ZonedDateTime) {
+    zoned_date_time_v = value;
+  }
+
   explicit TypedValue(const utils::Duration &value, utils::MemoryResource *memory = utils::NewDeleteResource())
       : memory_(memory), type_(Type::Duration) {
     duration_v = value;
+  }
+
+  explicit TypedValue(const storage::Point2d &value, utils::MemoryResource *memory = utils::NewDeleteResource())
+      : memory_(memory), type_(Type::Point2d) {
+    point_2d_v = value;
+  }
+
+  explicit TypedValue(const storage::Point3d &value, utils::MemoryResource *memory = utils::NewDeleteResource())
+      : memory_(memory), type_(Type::Point3d) {
+    point_3d_v = value;
   }
 
   // conversion function to storage::PropertyValue
@@ -213,9 +247,14 @@ class TypedValue {
   /** Construct a copy using the given utils::MemoryResource */
   explicit TypedValue(const std::vector<TypedValue> &value, utils::MemoryResource *memory = utils::NewDeleteResource())
       : memory_(memory), type_(Type::List) {
-    new (&list_v) TVector(memory_);
-    list_v.reserve(value.size());
-    list_v.assign(value.begin(), value.end());
+    new (&list_v) TVector(value.begin(), value.end(), memory_);
+  }
+
+  template <class T>
+  requires TypedValueValidPrimativeType<T>
+  explicit TypedValue(const std::vector<T> &value, utils::MemoryResource *memory = utils::NewDeleteResource())
+      : memory_(memory), type_(Type::List) {
+    new (&list_v) TVector(value.begin(), value.end(), memory_);
   }
 
   /**
@@ -408,17 +447,17 @@ class TypedValue {
    * utils::MemoryResource is obtained from graph. After the move, graph will be
    * left empty.
    */
-  explicit TypedValue(Graph &&graph) noexcept : TypedValue(std::move(graph), graph.GetMemoryResource()) {}
+  explicit TypedValue(Graph &&graph);
 
   /**
    * Construct with the value of graph and use the given MemoryResource.
    * If `*graph.GetMemoryResource() != *memory`, this call will perform an
    * element-wise move and graph is not guaranteed to be empty.
    */
-  TypedValue(Graph &&graph, utils::MemoryResource *memory) : memory_(memory), type_(Type::Graph) {
-    auto *graph_ptr = utils::Allocator<Graph>(memory_).new_object<Graph>(std::move(graph));
-    new (&graph_v) std::unique_ptr<Graph>(graph_ptr);
-  }
+  TypedValue(Graph &&graph, utils::MemoryResource *memory);
+
+  explicit TypedValue(std::function<void(TypedValue *)> &&other)
+      : function_v(std::move(other)), type_(Type::Function) {}
 
   /**
    * Construct with the value of other.
@@ -450,7 +489,10 @@ class TypedValue {
   TypedValue &operator=(const utils::Date &);
   TypedValue &operator=(const utils::LocalTime &);
   TypedValue &operator=(const utils::LocalDateTime &);
+  TypedValue &operator=(const utils::ZonedDateTime &);
   TypedValue &operator=(const utils::Duration &);
+  TypedValue &operator=(const storage::Enum &);
+  TypedValue &operator=(const std::function<void(TypedValue *)> &);
 
   /** Copy assign other, utils::MemoryResource of `this` is used */
   TypedValue &operator=(const TypedValue &other);
@@ -470,47 +512,55 @@ class TypedValue {
 
   Type type() const { return type_; }
 
-  // TODO consider adding getters for primitives by value (and not by ref)
+#define DECLARE_VALUE_AND_TYPE_GETTERS_PRIMITIVE(type_param, type_enum, field) \
+  /** Gets the value of type field. Throws if value is not field*/             \
+  type_param &Value##type_enum();                                              \
+  /** Gets the value of type field. Throws if value is not field*/             \
+  type_param Value##type_enum() const;                                         \
+  /** Checks if it's the value is of the given type */                         \
+  bool Is##type_enum() const;                                                  \
+  /** Get the value of the type field. Unchecked */                            \
+  type_param UnsafeValue##type_enum() const { return field; }
 
-#define DECLARE_VALUE_AND_TYPE_GETTERS(type_param, field)          \
-  /** Gets the value of type field. Throws if value is not field*/ \
-  type_param &Value##field();                                      \
-  /** Gets the value of type field. Throws if value is not field*/ \
-  const type_param &Value##field() const;                          \
-  /** Checks if it's the value is of the given type */             \
-  bool Is##field() const;
+#define DECLARE_VALUE_AND_TYPE_GETTERS(type_param, type_enum, field) \
+  /** Gets the value of type field. Throws if value is not field*/   \
+  type_param &Value##type_enum();                                    \
+  /** Gets the value of type field. Throws if value is not field*/   \
+  const type_param &Value##type_enum() const;                        \
+  /** Checks if it's the value is of the given type */               \
+  bool Is##type_enum() const;                                        \
+  /** Get the value of the type field. Unchecked */                  \
+  type_param const &UnsafeValue##type_enum() const { return field; }
 
-  DECLARE_VALUE_AND_TYPE_GETTERS(bool, Bool)
-  DECLARE_VALUE_AND_TYPE_GETTERS(int64_t, Int)
-  DECLARE_VALUE_AND_TYPE_GETTERS(double, Double)
-  DECLARE_VALUE_AND_TYPE_GETTERS(TString, String)
+  DECLARE_VALUE_AND_TYPE_GETTERS_PRIMITIVE(bool, Bool, bool_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS_PRIMITIVE(int64_t, Int, int_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS_PRIMITIVE(double, Double, double_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(TString, String, string_v)
 
-  /**
-   * Get the list value.
-   * @throw TypedValueException if stored value is not a list.
-   */
-  TVector &ValueList();
+  DECLARE_VALUE_AND_TYPE_GETTERS(TVector, List, list_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(TMap, Map, map_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(VertexAccessor, Vertex, vertex_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(EdgeAccessor, Edge, edge_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(Path, Path, path_v)
 
-  const TVector &ValueList() const;
-
-  /** Check if the stored value is a list value */
-  bool IsList() const;
-
-  DECLARE_VALUE_AND_TYPE_GETTERS(TMap, Map)
-  DECLARE_VALUE_AND_TYPE_GETTERS(VertexAccessor, Vertex)
-  DECLARE_VALUE_AND_TYPE_GETTERS(EdgeAccessor, Edge)
-  DECLARE_VALUE_AND_TYPE_GETTERS(Path, Path)
-
-  DECLARE_VALUE_AND_TYPE_GETTERS(utils::Date, Date)
-  DECLARE_VALUE_AND_TYPE_GETTERS(utils::LocalTime, LocalTime)
-  DECLARE_VALUE_AND_TYPE_GETTERS(utils::LocalDateTime, LocalDateTime)
-  DECLARE_VALUE_AND_TYPE_GETTERS(utils::Duration, Duration)
-  DECLARE_VALUE_AND_TYPE_GETTERS(Graph, Graph)
+  DECLARE_VALUE_AND_TYPE_GETTERS(utils::Date, Date, date_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(utils::LocalTime, LocalTime, local_time_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(utils::LocalDateTime, LocalDateTime, local_date_time_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(utils::ZonedDateTime, ZonedDateTime, zoned_date_time_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(utils::Duration, Duration, duration_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(storage::Enum, Enum, enum_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(storage::Point2d, Point2d, point_2d_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(storage::Point3d, Point3d, point_3d_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(Graph, Graph, *graph_v)
+  DECLARE_VALUE_AND_TYPE_GETTERS(std::function<void(TypedValue *)>, Function, function_v)
 
 #undef DECLARE_VALUE_AND_TYPE_GETTERS
+#undef DECLARE_VALUE_AND_TYPE_GETTERS_PRIMITIVE
+
+  bool ContainsDeleted() const;
 
   /**  Checks if value is a TypedValue::Null. */
-  bool IsNull() const;
+  bool IsNull() const { return type_ == Type::Null; }
 
   /** Convenience function for checking if this TypedValue is either
    * an integer or double */
@@ -523,8 +573,6 @@ class TypedValue {
   utils::MemoryResource *GetMemoryResource() const { return memory_; }
 
  private:
-  void DestroyValue();
-
   // Memory resource for allocations of non primitive values
   utils::MemoryResource *memory_{utils::NewDeleteResource()};
 
@@ -547,9 +595,14 @@ class TypedValue {
     utils::Date date_v;
     utils::LocalTime local_time_v;
     utils::LocalDateTime local_date_time_v;
+    utils::ZonedDateTime zoned_date_time_v;
     utils::Duration duration_v;
+    storage::Enum enum_v;
+    storage::Point2d point_2d_v;
+    storage::Point3d point_3d_v;
     // As the unique_ptr is not allocator aware, it requires special attention when copying or moving graphs
     std::unique_ptr<Graph> graph_v;
+    std::function<void(TypedValue *)> function_v;
   };
 
   /**
@@ -756,7 +809,35 @@ TypedValue operator*(const TypedValue &a, const TypedValue &b);
  */
 TypedValue operator%(const TypedValue &a, const TypedValue &b);
 
+/**
+ * Perform an exponentation operation on two values.
+ *
+ * If any of the values is Null, then Null is returned. The return value
+ * is always a floating-point value, even when called with integers.
+ * The resulting value uses the same MemoryResource as the left hand side
+ * argument.
+ *
+ * @throw TypedValueException if the values are not numeric or Null.
+ */
+TypedValue pow(const TypedValue &a, const TypedValue &b);
+
 /** Output the TypedValue::Type value as a string */
 std::ostream &operator<<(std::ostream &os, const TypedValue::Type &type);
+
+/** Helper method for extract CRS from possible point types */
+inline auto GetCRS(TypedValue const &tv) -> std::optional<storage::CoordinateReferenceSystem> {
+  switch (tv.type()) {
+    using enum TypedValue::Type;
+    case Point2d: {
+      return tv.ValuePoint2d().crs();
+    }
+    case Point3d: {
+      return tv.ValuePoint3d().crs();
+    }
+    default: {
+      return std::nullopt;
+    }
+  }
+}
 
 }  // namespace memgraph::query

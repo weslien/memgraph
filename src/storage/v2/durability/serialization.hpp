@@ -1,4 +1,4 @@
-// Copyright 2022 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -27,7 +27,7 @@ namespace memgraph::storage::durability {
 /// (e.g. file and network).
 class BaseEncoder {
  protected:
-  ~BaseEncoder() {}
+  ~BaseEncoder() = default;
 
  public:
   virtual void WriteMarker(Marker marker) = 0;
@@ -35,6 +35,9 @@ class BaseEncoder {
   virtual void WriteUint(uint64_t value) = 0;
   virtual void WriteDouble(double value) = 0;
   virtual void WriteString(std::string_view value) = 0;
+  virtual void WriteEnum(storage::Enum value) = 0;
+  virtual void WritePoint2d(storage::Point2d value) = 0;
+  virtual void WritePoint3d(storage::Point3d value) = 0;
   virtual void WritePropertyValue(const PropertyValue &value) = 0;
 };
 
@@ -55,6 +58,9 @@ class Encoder final : public BaseEncoder {
   void WriteUint(uint64_t value) override;
   void WriteDouble(double value) override;
   void WriteString(std::string_view value) override;
+  void WriteEnum(storage::Enum value) override;
+  void WritePoint2d(storage::Point2d value) override;
+  void WritePoint3d(storage::Point3d value) override;
   void WritePropertyValue(const PropertyValue &value) override;
 
   uint64_t GetPosition();
@@ -84,7 +90,7 @@ class Encoder final : public BaseEncoder {
 /// (e.g. file and network).
 class BaseDecoder {
  protected:
-  ~BaseDecoder() {}
+  ~BaseDecoder() = default;
 
  public:
   virtual std::optional<Marker> ReadMarker() = 0;
@@ -92,6 +98,9 @@ class BaseDecoder {
   virtual std::optional<uint64_t> ReadUint() = 0;
   virtual std::optional<double> ReadDouble() = 0;
   virtual std::optional<std::string> ReadString() = 0;
+  virtual std::optional<Enum> ReadEnumValue() = 0;
+  virtual std::optional<Point2d> ReadPoint2dValue() = 0;
+  virtual std::optional<Point3d> ReadPoint3dValue() = 0;
   virtual std::optional<PropertyValue> ReadPropertyValue() = 0;
 
   virtual bool SkipString() = 0;
@@ -115,6 +124,9 @@ class Decoder final : public BaseDecoder {
   std::optional<uint64_t> ReadUint() override;
   std::optional<double> ReadDouble() override;
   std::optional<std::string> ReadString() override;
+  std::optional<Enum> ReadEnumValue() override;
+  std::optional<Point2d> ReadPoint2dValue() override;
+  std::optional<Point3d> ReadPoint3dValue() override;
   std::optional<PropertyValue> ReadPropertyValue() override;
 
   bool SkipString() override;

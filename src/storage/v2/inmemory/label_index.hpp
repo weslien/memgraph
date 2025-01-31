@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,7 +11,10 @@
 
 #pragma once
 
+#include <span>
+
 #include "storage/v2/constraints/constraints.hpp"
+#include "storage/v2/durability/recovery_type.hpp"
 #include "storage/v2/indices/label_index.hpp"
 #include "storage/v2/indices/label_index_stats.hpp"
 #include "storage/v2/vertex.hpp"
@@ -19,9 +22,6 @@
 #include "utils/synchronized.hpp"
 
 namespace memgraph::storage {
-
-using ParallelizedIndexCreationInfo =
-    std::pair<std::vector<std::pair<Gid, uint64_t>> /*vertex_recovery_info*/, uint64_t /*thread_count*/>;
 
 class InMemoryLabelIndex : public storage::LabelIndex {
  private:
@@ -45,7 +45,7 @@ class InMemoryLabelIndex : public storage::LabelIndex {
 
   /// @throw std::bad_alloc
   bool CreateIndex(LabelId label, utils::SkipList<Vertex>::Accessor vertices,
-                   const std::optional<ParallelizedIndexCreationInfo> &parallel_exec_info);
+                   const std::optional<durability::ParallelizedSchemaCreationInfo> &parallel_exec_info);
 
   /// Returns false if there was no index to drop
   bool DropIndex(LabelId label) override;
@@ -54,12 +54,17 @@ class InMemoryLabelIndex : public storage::LabelIndex {
 
   std::vector<LabelId> ListIndices() const override;
 
-  void RemoveObsoleteEntries(uint64_t oldest_active_start_timestamp);
+  void RemoveObsoleteEntries(uint64_t oldest_active_start_timestamp, std::stop_token token);
+
+  /// Surgical removal of entries that was inserted this transaction
+  void AbortEntries(LabelId labelId, std::span<Vertex *const> vertices, uint64_t exact_start_timestamp);
+
+  std::vector<LabelId> Analysis() const;
 
   class Iterable {
    public:
-    Iterable(utils::SkipList<Entry>::Accessor index_accessor, LabelId label, View view, Storage *storage,
-             Transaction *transaction);
+    Iterable(utils::SkipList<Entry>::Accessor index_accessor, utils::SkipList<Vertex>::ConstAccessor vertices_accessor,
+             LabelId label, View view, Storage *storage, Transaction *transaction);
 
     class Iterator {
      public:
@@ -85,6 +90,7 @@ class InMemoryLabelIndex : public storage::LabelIndex {
     Iterator end() { return {this, index_accessor_.end()}; }
 
    private:
+    utils::SkipList<Vertex>::ConstAccessor pin_accessor_;
     utils::SkipList<Entry>::Accessor index_accessor_;
     LabelId label_;
     View view_;
@@ -98,6 +104,9 @@ class InMemoryLabelIndex : public storage::LabelIndex {
 
   Iterable Vertices(LabelId label, View view, Storage *storage, Transaction *transaction);
 
+  Iterable Vertices(LabelId label, memgraph::utils::SkipList<memgraph::storage::Vertex>::ConstAccessor vertices_acc,
+                    View view, Storage *storage, Transaction *transaction);
+
   void SetIndexStats(const storage::LabelId &label, const storage::LabelIndexStats &stats);
 
   std::optional<storage::LabelIndexStats> GetIndexStats(const storage::LabelId &label) const;
@@ -105,6 +114,8 @@ class InMemoryLabelIndex : public storage::LabelIndex {
   std::vector<LabelId> ClearIndexStats();
 
   bool DeleteIndexStats(const storage::LabelId &label);
+
+  void DropGraphClearIndices() override;
 
  private:
   std::map<LabelId, utils::SkipList<Entry>> index_;

@@ -1,4 +1,4 @@
-// Copyright 2022 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -44,11 +44,9 @@ struct MockAuth : public memgraph::communication::websocket::AuthenticationInter
     return authentication;
   }
 
-  bool HasUserPermission(const std::string & /*username*/, memgraph::auth::Permission /*permission*/) const override {
-    return authorization;
-  }
+  bool HasPermission(memgraph::auth::Permission /*permission*/) const override { return authorization; }
 
-  bool HasAnyUsers() const override { return has_any_users; }
+  bool AccessControlled() const override { return has_any_users; }
 
   bool authentication{true};
   bool authorization{true};
@@ -65,9 +63,15 @@ class MonitoringServerTest : public ::testing::Test {
     ASSERT_NO_THROW(monitoring_server.AwaitShutdown());
   }
 
-  std::string ServerPort() const { return std::to_string(monitoring_server.GetEndpoint().port()); }
+  std::string ServerPort() const {
+    const auto ep = monitoring_server.GetEndpoint();
+    return ep ? std::to_string(ep->port()) : "";
+  }
 
-  std::string ServerAddress() const { return monitoring_server.GetEndpoint().address().to_string(); }
+  std::string ServerAddress() const {
+    const auto ep = monitoring_server.GetEndpoint();
+    return ep ? monitoring_server.GetEndpoint()->address().to_string() : "";
+  }
 
   void StartLogging(std::vector<std::pair<spdlog::level::level_enum, std::string>> messages) {
     messages_ = std::move(messages);
@@ -144,7 +148,9 @@ TEST(MonitoringServer, MonitoringWorkflow) {
   MockAuth auth;
   memgraph::communication::ServerContext context;
   memgraph::communication::websocket::Server monitoring_server({"0.0.0.0", 0}, &context, auth);
-  const auto port = monitoring_server.GetEndpoint().port();
+  const auto ep = monitoring_server.GetEndpoint();
+  ASSERT_TRUE(ep);
+  const auto port = ep->port();
 
   SCOPED_TRACE(fmt::format("Checking port number different then 0: {}", port));
   EXPECT_NE(port, 0);
@@ -165,7 +171,9 @@ TEST(MonitoringServer, Connection) {
   ASSERT_NO_THROW(monitoring_server.Start());
   {
     Client client;
-    EXPECT_NO_THROW(client.Connect("0.0.0.0", std::to_string(monitoring_server.GetEndpoint().port())));
+    const auto ep = monitoring_server.GetEndpoint();
+    ASSERT_TRUE(ep);
+    EXPECT_NO_THROW(client.Connect("0.0.0.0", std::to_string(ep->port())));
   }
 
   ASSERT_NO_THROW(monitoring_server.Shutdown());

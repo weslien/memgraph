@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -10,8 +10,10 @@
 // licenses/APL.txt.
 #pragma once
 
-#include "utils/spin_lock.hpp"
-#include "utils/synchronized.hpp"
+#include <chrono>
+#include <string>
+#include "utils/observer.hpp"
+#include "utils/scheduler.hpp"
 
 namespace memgraph::flags::run_time {
 
@@ -36,10 +38,41 @@ std::string GetServerName();
 double GetExecutionTimeout();
 
 /**
+ * @brief Get the hops limit partial results value
+ *
+ * @return bool
+ */
+bool GetHopsLimitPartialResults();
+
+/**
  * @brief Get the cartesian product enabled value
  *
  * @return bool
  */
 bool GetCartesianProductEnabled();
+
+/**
+ * @brief Get the current timezone object
+ *
+ * @return const std::chrono::time_zone*
+ */
+const std::chrono::time_zone *GetTimezone();
+
+/**
+ * @brief Get the query log directory value
+ *
+ * @return std::string
+ */
+std::string GetQueryLogDirectory();
+
+/**
+ * @brief Attach observer to the global snapshor period variable
+ */
+void SnapshotPeriodicAttach(std::shared_ptr<utils::Observer<utils::SchedulerInterval>> observer);
+
+/**
+ * @brief Detach observer from the global snapshor period variable
+ */
+void SnapshotPeriodicDetach(std::shared_ptr<utils::Observer<utils::SchedulerInterval>> observer);
 
 }  // namespace memgraph::flags::run_time

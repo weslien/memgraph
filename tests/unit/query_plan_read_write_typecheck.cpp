@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -55,7 +55,7 @@ class ReadWriteTypeCheckTest : public ::testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(ReadWriteTypeCheckTest, StorageTypes);
+TYPED_TEST_SUITE(ReadWriteTypeCheckTest, StorageTypes);
 
 TYPED_TEST(ReadWriteTypeCheckTest, NONEOps) {
   std::shared_ptr<LogicalOperator> once = std::make_shared<Once>();
@@ -82,12 +82,12 @@ TYPED_TEST(ReadWriteTypeCheckTest, Filter) {
 
 TYPED_TEST(ReadWriteTypeCheckTest, ScanAllBy) {
   std::shared_ptr<LogicalOperator> last_op = std::make_shared<ScanAllByLabelPropertyRange>(
-      nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"), "prop",
+      nullptr, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"),
       memgraph::utils::MakeBoundInclusive<Expression *>(LITERAL(1)),
       memgraph::utils::MakeBoundExclusive<Expression *>(LITERAL(20)));
-  last_op = std::make_shared<ScanAllByLabelPropertyValue>(
-      last_op, this->GetSymbol("node"), this->dba.NameToLabel("Label"), this->dba.NameToProperty("prop"), "prop",
-      ADD(LITERAL(21), LITERAL(21)));
+  last_op =
+      std::make_shared<ScanAllByLabelPropertyValue>(last_op, this->GetSymbol("node"), this->dba.NameToLabel("Label"),
+                                                    this->dba.NameToProperty("prop"), ADD(LITERAL(21), LITERAL(21)));
 
   this->CheckPlanType(last_op.get(), RWType::R);
 }
@@ -182,10 +182,10 @@ TYPED_TEST(ReadWriteTypeCheckTest, SetRemovePropertiesLabels) {
       plan::SetProperties::Op::REPLACE);
   last_op = std::make_shared<plan::SetLabels>(
       last_op, node_sym,
-      std::vector<memgraph::storage::LabelId>{this->dba.NameToLabel("label1"), this->dba.NameToLabel("label2")});
+      std::vector<StorageLabelType>{this->dba.NameToLabel("label1"), this->dba.NameToLabel("label2")});
   last_op = std::make_shared<plan::RemoveLabels>(
       last_op, node_sym,
-      std::vector<memgraph::storage::LabelId>{this->dba.NameToLabel("label1"), this->dba.NameToLabel("label2")});
+      std::vector<StorageLabelType>{this->dba.NameToLabel("label1"), this->dba.NameToLabel("label2")});
 
   this->CheckPlanType(last_op.get(), RWType::RW);
 }

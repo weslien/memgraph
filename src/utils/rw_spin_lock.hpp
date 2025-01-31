@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -51,6 +51,12 @@ struct yeilder {
 struct RWSpinLock {
   RWSpinLock() = default;
 
+  ~RWSpinLock() = default;
+  RWSpinLock(const RWSpinLock &) = delete;
+  RWSpinLock &operator=(const RWSpinLock &) = delete;
+  RWSpinLock(RWSpinLock &&) = default;
+  RWSpinLock &operator=(RWSpinLock &&) = default;
+
   void lock() {
     // spin: to grant the UNIQUE_LOCKED bit
     while (true) {
@@ -84,6 +90,11 @@ struct RWSpinLock {
     }
   }
 
+  bool try_lock() {
+    status_t unlocked = 0;
+    return std::atomic_ref{lock_status_}.compare_exchange_strong(unlocked, UNIQUE_LOCKED, std::memory_order_acq_rel);
+  }
+
   void unlock() { std::atomic_ref{lock_status_}.fetch_and(~UNIQUE_LOCKED, std::memory_order_release); }
 
   void lock_shared() {
@@ -109,6 +120,8 @@ struct RWSpinLock {
   }
 
   void unlock_shared() { std::atomic_ref{lock_status_}.fetch_sub(READER, std::memory_order_release); }
+
+  bool is_locked() const { return std::atomic_ref{lock_status_}.load(std::memory_order_relaxed) != 0; }
 
  private:
   using status_t = uint32_t;

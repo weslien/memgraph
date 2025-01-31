@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -9,9 +9,16 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-#include "storage/v2/inmemory/label_property_index.hpp"
-#include "storage/v2/constraints/constraints.hpp"
+#include <cstdint>
+
 #include "storage/v2/indices/indices_utils.hpp"
+#include "storage/v2/inmemory/label_property_index.hpp"
+#include "storage/v2/inmemory/property_constants.hpp"
+#include "storage/v2/inmemory/storage.hpp"
+#include "storage/v2/property_value.hpp"
+#include "utils/bound.hpp"
+#include "utils/counter.hpp"
+#include "utils/logging.hpp"
 
 namespace memgraph::storage {
 
@@ -33,9 +40,9 @@ bool InMemoryLabelPropertyIndex::Entry::operator<(const PropertyValue &rhs) cons
 
 bool InMemoryLabelPropertyIndex::Entry::operator==(const PropertyValue &rhs) const { return value == rhs; }
 
-bool InMemoryLabelPropertyIndex::CreateIndex(LabelId label, PropertyId property,
-                                             utils::SkipList<Vertex>::Accessor vertices,
-                                             const std::optional<ParallelizedIndexCreationInfo> &parallel_exec_info) {
+bool InMemoryLabelPropertyIndex::CreateIndex(
+    LabelId label, PropertyId property, utils::SkipList<Vertex>::Accessor vertices,
+    const std::optional<durability::ParallelizedSchemaCreationInfo> &parallel_exec_info) {
   spdlog::trace("Vertices size when creating index: {}", vertices.size());
   auto create_index_seq = [this](LabelId label, PropertyId property, utils::SkipList<Vertex>::Accessor &vertices,
                                  std::map<std::pair<LabelId, PropertyId>, utils::SkipList<Entry>>::iterator it) {
@@ -52,7 +59,7 @@ bool InMemoryLabelPropertyIndex::CreateIndex(LabelId label, PropertyId property,
   auto create_index_par =
       [this](LabelId label, PropertyId property, utils::SkipList<Vertex>::Accessor &vertices,
              std::map<std::pair<LabelId, PropertyId>, utils::SkipList<Entry>>::iterator label_property_it,
-             const ParallelizedIndexCreationInfo &parallel_exec_info) {
+             const durability::ParallelizedSchemaCreationInfo &parallel_exec_info) {
         using IndexAccessor = decltype(label_property_it->second.access());
 
         CreateIndexOnMultipleThreads(
@@ -101,11 +108,13 @@ void InMemoryLabelPropertyIndex::UpdateOnSetProperty(PropertyId property, const 
     return;
   }
 
-  if (!indices_by_property_.contains(property)) {
+  auto index = indices_by_property_.find(property);
+  if (index == indices_by_property_.end()) {
     return;
   }
 
-  for (const auto &[_, storage] : indices_by_property_.at(property)) {
+  for (const auto &[label, storage] : index->second) {
+    if (!utils::Contains(vertex->labels, label)) continue;
     auto acc = storage->access();
     acc.insert(Entry{value, vertex, tx.start_timestamp});
   }
@@ -136,23 +145,34 @@ std::vector<std::pair<LabelId, PropertyId>> InMemoryLabelPropertyIndex::ListIndi
   return ret;
 }
 
-void InMemoryLabelPropertyIndex::RemoveObsoleteEntries(uint64_t oldest_active_start_timestamp) {
+void InMemoryLabelPropertyIndex::RemoveObsoleteEntries(uint64_t oldest_active_start_timestamp, std::stop_token token) {
+  auto maybe_stop = utils::ResettableCounter<2048>();
+
   for (auto &[label_property, index] : index_) {
+    auto [label_id, prop_id] = label_property;
+    // before starting index, check if stop_requested
+    if (token.stop_requested()) return;
+
     auto index_acc = index.access();
-    for (auto it = index_acc.begin(); it != index_acc.end();) {
+    auto it = index_acc.begin();
+    auto end_it = index_acc.end();
+    if (it == end_it) continue;
+    while (true) {
+      // Hot loop, don't check stop_requested every time
+      if (maybe_stop() && token.stop_requested()) return;
+
       auto next_it = it;
       ++next_it;
 
-      if (it->timestamp >= oldest_active_start_timestamp) {
-        it = next_it;
-        continue;
+      bool has_next = next_it != end_it;
+      if (it->timestamp < oldest_active_start_timestamp) {
+        bool redundant_duplicate = has_next && it->vertex == next_it->vertex && it->value == next_it->value;
+        if (redundant_duplicate ||
+            !AnyVersionHasLabelProperty(*it->vertex, label_id, prop_id, it->value, oldest_active_start_timestamp)) {
+          index_acc.remove(*it);
+        }
       }
-
-      if ((next_it != index_acc.end() && it->vertex == next_it->vertex && it->value == next_it->value) ||
-          !AnyVersionHasLabelProperty(*it->vertex, label_property.first, label_property.second, it->value,
-                                      oldest_active_start_timestamp)) {
-        index_acc.remove(*it);
-      }
+      if (!has_next) break;
       it = next_it;
     }
   }
@@ -176,6 +196,10 @@ InMemoryLabelPropertyIndex::Iterable::Iterator &InMemoryLabelPropertyIndex::Iter
 void InMemoryLabelPropertyIndex::Iterable::Iterator::AdvanceUntilValid() {
   for (; index_iterator_ != self_->index_accessor_.end(); ++index_iterator_) {
     if (index_iterator_->vertex == current_vertex_) {
+      continue;
+    }
+
+    if (!CanSeeEntityWithTimestamp(index_iterator_->timestamp, self_->transaction_)) {
       continue;
     }
 
@@ -207,25 +231,14 @@ void InMemoryLabelPropertyIndex::Iterable::Iterator::AdvanceUntilValid() {
   }
 }
 
-// These constants represent the smallest possible value of each type that is
-// contained in a `PropertyValue`. Note that numbers (integers and doubles) are
-// treated as the same "type" in `PropertyValue`.
-const PropertyValue kSmallestBool = PropertyValue(false);
-// NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
-static_assert(-std::numeric_limits<double>::infinity() < std::numeric_limits<int64_t>::min());
-const PropertyValue kSmallestNumber = PropertyValue(-std::numeric_limits<double>::infinity());
-const PropertyValue kSmallestString = PropertyValue("");
-const PropertyValue kSmallestList = PropertyValue(std::vector<PropertyValue>());
-const PropertyValue kSmallestMap = PropertyValue(std::map<std::string, PropertyValue>());
-const PropertyValue kSmallestTemporalData =
-    PropertyValue(TemporalData{static_cast<TemporalType>(0), std::numeric_limits<int64_t>::min()});
-
-InMemoryLabelPropertyIndex::Iterable::Iterable(utils::SkipList<Entry>::Accessor index_accessor, LabelId label,
+InMemoryLabelPropertyIndex::Iterable::Iterable(utils::SkipList<Entry>::Accessor index_accessor,
+                                               utils::SkipList<Vertex>::ConstAccessor vertices_accessor, LabelId label,
                                                PropertyId property,
                                                const std::optional<utils::Bound<PropertyValue>> &lower_bound,
                                                const std::optional<utils::Bound<PropertyValue>> &upper_bound, View view,
                                                Storage *storage, Transaction *transaction)
-    : index_accessor_(std::move(index_accessor)),
+    : pin_accessor_(std::move(vertices_accessor)),
+      index_accessor_(std::move(index_accessor)),
       label_(label),
       property_(property),
       lower_bound_(lower_bound),
@@ -239,14 +252,6 @@ InMemoryLabelPropertyIndex::Iterable::Iterable(utils::SkipList<Entry>::Accessor 
   // inclusive lower bound of the same type, or an exclusive upper bound of the
   // following type. If neither bound is set we yield all items in the index.
 
-  // First we statically verify that our assumptions about the `PropertyValue`
-  // type ordering holds.
-  static_assert(PropertyValue::Type::Bool < PropertyValue::Type::Int);
-  static_assert(PropertyValue::Type::Int < PropertyValue::Type::Double);
-  static_assert(PropertyValue::Type::Double < PropertyValue::Type::String);
-  static_assert(PropertyValue::Type::String < PropertyValue::Type::List);
-  static_assert(PropertyValue::Type::List < PropertyValue::Type::Map);
-
   // Remove any bounds that are set to `Null` because that isn't a valid value.
   if (lower_bound_ && lower_bound_->value().IsNull()) {
     lower_bound_ = std::nullopt;
@@ -256,8 +261,7 @@ InMemoryLabelPropertyIndex::Iterable::Iterable(utils::SkipList<Entry>::Accessor 
   }
 
   // Check whether the bounds are of comparable types if both are supplied.
-  if (lower_bound_ && upper_bound_ &&
-      !PropertyValue::AreComparableTypes(lower_bound_->value().type(), upper_bound_->value().type())) {
+  if (lower_bound_ && upper_bound_ && !AreComparableTypes(lower_bound_->value().type(), upper_bound_->value().type())) {
     bounds_valid_ = false;
     return;
   }
@@ -290,6 +294,18 @@ InMemoryLabelPropertyIndex::Iterable::Iterable(utils::SkipList<Entry>::Accessor 
         upper_bound_ = utils::MakeBoundExclusive(kSmallestTemporalData);
         break;
       case PropertyValue::Type::TemporalData:
+        upper_bound_ = utils::MakeBoundExclusive(kSmallestZonedTemporalData);
+        break;
+      case PropertyValue::Type::ZonedTemporalData:
+        upper_bound_ = utils::MakeBoundExclusive(kSmallestEnum);
+        break;
+      case PropertyValue::Type::Enum:
+        upper_bound_ = utils::MakeBoundExclusive(kSmallestPoint2d);
+        break;
+      case PropertyValue::Type::Point2d:
+        upper_bound_ = utils::MakeBoundExclusive(kSmallestPoint3d);
+        break;
+      case PropertyValue::Type::Point3d:
         // This is the last type in the order so we leave the upper bound empty.
         break;
     }
@@ -322,6 +338,18 @@ InMemoryLabelPropertyIndex::Iterable::Iterable(utils::SkipList<Entry>::Accessor 
         break;
       case PropertyValue::Type::TemporalData:
         lower_bound_ = utils::MakeBoundInclusive(kSmallestTemporalData);
+        break;
+      case PropertyValue::Type::ZonedTemporalData:
+        lower_bound_ = utils::MakeBoundInclusive(kSmallestZonedTemporalData);
+        break;
+      case PropertyValue::Type::Enum:
+        lower_bound_ = utils::MakeBoundInclusive(kSmallestEnum);
+        break;
+      case PropertyValue::Type::Point2d:
+        lower_bound_ = utils::MakeBoundExclusive(kSmallestPoint2d);
+        break;
+      case PropertyValue::Type::Point3d:
+        lower_bound_ = utils::MakeBoundExclusive(kSmallestPoint3d);
         break;
     }
   }
@@ -428,9 +456,64 @@ InMemoryLabelPropertyIndex::Iterable InMemoryLabelPropertyIndex::Vertices(
     LabelId label, PropertyId property, const std::optional<utils::Bound<PropertyValue>> &lower_bound,
     const std::optional<utils::Bound<PropertyValue>> &upper_bound, View view, Storage *storage,
     Transaction *transaction) {
+  DMG_ASSERT(storage->storage_mode_ == StorageMode::IN_MEMORY_TRANSACTIONAL ||
+                 storage->storage_mode_ == StorageMode::IN_MEMORY_ANALYTICAL,
+             "PropertyLabel index trying to access InMemory vertices from OnDisk!");
+  auto vertices_acc = static_cast<InMemoryStorage const *>(storage)->vertices_.access();
   auto it = index_.find({label, property});
   MG_ASSERT(it != index_.end(), "Index for label {} and property {} doesn't exist", label.AsUint(), property.AsUint());
-  return {it->second.access(), label, property, lower_bound, upper_bound, view, storage, transaction};
+  return {it->second.access(), std::move(vertices_acc), label, property, lower_bound, upper_bound, view, storage,
+          transaction};
+}
+
+InMemoryLabelPropertyIndex::Iterable InMemoryLabelPropertyIndex::Vertices(
+    LabelId label, PropertyId property,
+    memgraph::utils::SkipList<memgraph::storage::Vertex>::ConstAccessor vertices_acc,
+    const std::optional<utils::Bound<PropertyValue>> &lower_bound,
+    const std::optional<utils::Bound<PropertyValue>> &upper_bound, View view, Storage *storage,
+    Transaction *transaction) {
+  auto it = index_.find({label, property});
+  MG_ASSERT(it != index_.end(), "Index for label {} and property {} doesn't exist", label.AsUint(), property.AsUint());
+  return {it->second.access(), std::move(vertices_acc), label, property, lower_bound, upper_bound, view, storage,
+          transaction};
+}
+
+void InMemoryLabelPropertyIndex::AbortEntries(PropertyId property,
+                                              std::span<std::pair<PropertyValue, Vertex *> const> vertices,
+                                              uint64_t exact_start_timestamp) {
+  auto const it = indices_by_property_.find(property);
+  if (it == indices_by_property_.end()) return;
+
+  auto &indices = it->second;
+  for (const auto &[_, index] : indices) {
+    auto index_acc = index->access();
+    for (auto const &[value, vertex] : vertices) {
+      index_acc.remove(Entry{value, vertex, exact_start_timestamp});
+    }
+  }
+}
+
+void InMemoryLabelPropertyIndex::AbortEntries(LabelId label,
+                                              std::span<std::pair<PropertyValue, Vertex *> const> vertices,
+                                              uint64_t exact_start_timestamp) {
+  for (auto &[label_prop, storage] : index_) {
+    if (label_prop.first != label) {
+      continue;
+    }
+
+    auto index_acc = storage.access();
+    for (const auto &[property, vertex] : vertices) {
+      if (!property.IsNull()) {
+        index_acc.remove(Entry{property, vertex, exact_start_timestamp});
+      }
+    }
+  }
+}
+
+void InMemoryLabelPropertyIndex::DropGraphClearIndices() {
+  index_.clear();
+  indices_by_property_.clear();
+  stats_->clear();
 }
 
 }  // namespace memgraph::storage

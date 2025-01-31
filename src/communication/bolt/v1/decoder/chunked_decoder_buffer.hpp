@@ -1,4 +1,4 @@
-// Copyright 2022 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -51,7 +51,7 @@ enum class ChunkState : uint8_t {
 template <typename TBuffer>
 class ChunkedDecoderBuffer {
  public:
-  ChunkedDecoderBuffer(TBuffer &buffer) : buffer_(buffer) { data_.reserve(kChunkMaxDataSize); }
+  explicit ChunkedDecoderBuffer(TBuffer &buffer) : buffer_(buffer) { data_.reserve(kChunkMaxDataSize); }
 
   /**
    * Reads data from the internal buffer.
@@ -63,6 +63,7 @@ class ChunkedDecoderBuffer {
    */
   bool Read(uint8_t *data, size_t len) {
     if (len > Size()) return false;
+    if (len == 0) return true;
     memcpy(data, &data_[pos_], len);
     pos_ += len;
     if (Size() == 0) {

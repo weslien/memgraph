@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,19 +11,29 @@
 
 #include "storage/v2/property_store.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <iterator>
 #include <limits>
+#include <map>
 #include <optional>
-#include <sstream>
+#include <string>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 
+#include "storage/v2/id_types.hpp"
+#include "storage/v2/property_value.hpp"
 #include "storage/v2/temporal.hpp"
 #include "utils/cast.hpp"
+#include "utils/compressor.hpp"
 #include "utils/logging.hpp"
+#include "utils/temporal.hpp"
+
+// NOLINTNEXTLINE (cppcoreguidelines-avoid-non-const-global-variables)
+DEFINE_bool(storage_property_store_compression_enabled, false,
+            "Controls whether the properties should be compressed in the storage.");
 
 namespace memgraph::storage {
 
@@ -78,7 +88,7 @@ namespace {
 //         ++   -> size of property ID (2 bits)
 //           ++ -> size of payload OR size of payload size indicator (2 bits)
 //
-// When encoding integers (`int64_t` and `uint64_t`) they are compressed so that
+// When encoding integers (`int64_t` and `uint32_t`) they are compressed so that
 // they are stored into 1, 2, 4 or 8 bytes depending on their value.
 //
 // The size of the metadata field is very important because it is encoded with
@@ -93,20 +103,20 @@ enum class Size : uint8_t {
   INT64 = 0x03,
 };
 
-// All of these values must have the lowest 4 bits set to zero because they are
-// used to store two `Size` values as described in the comment above.
-enum class Type : uint8_t {
-  EMPTY = 0x00,  // Special value used to indicate end of buffer.
-  NONE = 0x10,   // NONE used instead of NULL because NULL is defined to
-                 // something...
-  BOOL = 0x20,
-  INT = 0x30,
-  DOUBLE = 0x40,
-  STRING = 0x50,
-  LIST = 0x60,
-  MAP = 0x70,
-  TEMPORAL_DATA = 0x80
-};
+constexpr uint32_t SizeToByteSize(Size size) {
+  switch (size) {
+    case Size::INT8:
+      return 1;
+    case Size::INT16:
+      return 2;
+    case Size::INT32:
+      return 4;
+    case Size::INT64:
+      return 8;
+  }
+}
+
+using Type = PropertyStoreType;
 
 const uint8_t kMaskType = 0xf0;
 const uint8_t kMaskIdSize = 0x0c;
@@ -130,13 +140,13 @@ const uint8_t kShiftIdSize = 2;
 //     - encoded value
 //   * STRING
 //     - type; payload size is used to indicate whether the string size is
-//       encoded as `uint8_t`, `uint16_t`, `uint32_t` or `uint64_t`
+//       encoded as `uint8_t`, `uint16_t`, `uint32_t` or `uint32_t`
 //     - encoded property ID
 //     - encoded string size
 //     - string data
 //   * LIST
 //     - type; payload size is used to indicate whether the list size is encoded
-//       as `uint8_t`, `uint16_t`, `uint32_t` or `uint64_t`
+//       as `uint8_t`, `uint16_t`, `uint32_t` or `uint32_t`
 //     - encoded property ID
 //     - encoded list size
 //     - list items
@@ -146,27 +156,64 @@ const uint8_t kShiftIdSize = 2;
 //       + encoded item data
 //   * MAP
 //     - type; payload size is used to indicate whether the map size is encoded
-//       as `uint8_t`, `uint16_t`, `uint32_t` or `uint64_t`
+//       as `uint8_t`, `uint16_t`, `uint32_t` or `uint32_t`
 //     - encoded property ID
 //     - encoded map size
 //     - map items
 //       + type; id size is used to indicate whether the key size is encoded as
-//         `uint8_t`, `uint16_t`, `uint32_t` or `uint64_t`; payload size is used
+//         `uint8_t`, `uint16_t`, `uint32_t` or `uint32_t`; payload size is used
 //         as described above for the inner payload type
 //       + encoded key size
 //       + encoded key data
 //       + encoded value size
 //       + encoded value data
-//   * TEMPORAL_DATE
+//   * TEMPORAL_DATA
 //     - type; payload size isn't used
 //     - encoded property ID
 //     - value saved as Metadata
 //       + type; id size is used to indicate whether the temporal data type is encoded
-//         as `uint8_t`, `uint16_t`, `uint32_t` or `uint64_t`; payload size used to
+//         as `uint8_t`, `uint16_t`, `uint32_t` or `uint32_t`; payload size used to
 //         indicate whether the microseconds are encoded as `uint8_t`, `uint16_t, `uint32_t
-//         or `uint64_t`
+//         or `uint32_t`
 //       + encoded temporal data type value
 //       + encoded microseconds value
+//   * ZONED_TEMPORAL_DATA
+//     - type; payload size isn't used
+//     - encoded property ID
+//     - value saved as Metadata (the same way as in TEMPORAL_DATA)
+//       + timezone offset
+//         + string size (always uint_8; see TZ_NAME_LENGTH_SIZE)
+//         + string data
+//   * OFFSET_ZONED_TEMPORAL_DATA
+//     - type; payload size isn't used
+//     - encoded property ID
+//     - value saved as Metadata (the same way as in TEMPORAL_DATA)
+//       + timezone offset
+//         + encoded value (always uint_16; see tz_offset_int)
+//   * ENUM
+//     - type; payload size is used to indicate whether the enum type and enum value are
+//       encoded as `uint8_t`, `uint16_t`, `uint32_t` or `uint64_t` uses the largest of both
+//     - encoded property ID
+//     - encoded property value as two ints, enum type then enum value, both same size
+//   * POINT
+//     - type; payload size is used to encode the crs type (this only works becuase there are 4 sizes + 4 crs types)
+//     - encoded property ID
+//     - encoded value as 2 (for 2D) or 3 (for 3D) doubles forced to be encoded as int64
+
+const auto TZ_NAME_LENGTH_SIZE = Size::INT8;
+// As the underlying type for zoned temporal data is std::chrono::zoned_time, valid timezone names are limited
+// to those in the IANA time zone database.
+// The timezone names in the IANA database follow https://data.iana.org/time-zones/theory.html#naming rules:
+// * Maximal form: AREA/LOCATION/QUALIFIER
+// * Length of subcomponents (AREA, LOCATION, and QUALIFIER): <= 14
+// * All legacy names are shorter than this
+// Therefore, the longest valid timezone name has the length of 44 (14 + 1 + 14 + 1 + 14), a 8-bit integer.
+
+using tz_offset_int = int16_t;
+// When a zoned temporal value is specified with a UTC offset (as opposed to a timezone name), the following applies:
+// * Offsets are defined in minutes
+// * Valid offsets are in the UTC + [-18h, +18h] range
+// Therefore, every possible value is in the [-1080, +1080] range and it's thus stored with a 16-bit integer.
 
 struct Metadata {
   Type type{Type::EMPTY};
@@ -179,7 +226,7 @@ class Writer {
  public:
   class MetadataHandle {
    public:
-    MetadataHandle() {}
+    MetadataHandle() = default;
 
     explicit MetadataHandle(uint8_t *value) : value_(value) {}
 
@@ -195,9 +242,9 @@ class Writer {
     uint8_t *value_{nullptr};
   };
 
-  Writer() {}
+  Writer() = default;
 
-  Writer(uint8_t *data, uint64_t size) : data_(data), size_(size) {}
+  Writer(uint8_t *data, uint32_t size) : data_(data), size_(size) {}
 
   std::optional<MetadataHandle> WriteMetadata() {
     if (data_ && pos_ + 1 > size_) return std::nullopt;
@@ -236,6 +283,9 @@ class Writer {
   }
 
   std::optional<Size> WriteDouble(double value) { return WriteUint(utils::MemcpyCast<uint64_t>(value)); }
+  bool WriteDoubleForceInt64(double value) { return InternalWriteInt<uint64_t>(utils::MemcpyCast<uint64_t>(value)); }
+
+  bool WriteTimezoneOffset(int64_t offset) { return InternalWriteInt<tz_offset_int>(offset); }
 
   bool WriteBytes(const uint8_t *data, uint64_t size) {
     if (data_ && pos_ + size > size_) return false;
@@ -244,14 +294,37 @@ class Writer {
     return true;
   }
 
-  bool WriteBytes(const char *data, uint64_t size) {
+  bool WriteBytes(const char *data, uint32_t size) {
     static_assert(std::is_same_v<uint8_t, unsigned char>);
     return WriteBytes(reinterpret_cast<const uint8_t *>(data), size);
   }
 
-  uint64_t Written() const { return pos_; }
+  uint32_t Written() const { return pos_; }
 
- private:
+  template <typename T, typename V>
+  static constexpr bool FitsInt(V value) {
+    static_assert(std::numeric_limits<T>::is_integer);
+    static_assert(std::numeric_limits<V>::is_integer);
+    static_assert(std::numeric_limits<T>::is_signed == std::numeric_limits<V>::is_signed);
+    return (std::numeric_limits<T>::min() <= value) && (value <= std::numeric_limits<T>::max());
+  }
+
+  static constexpr std::optional<Size> UIntSize(uint64_t value) {
+    if (FitsInt<uint8_t>(value)) {
+      return Size::INT8;
+    }
+    if (FitsInt<uint16_t>(value)) {
+      return Size::INT16;
+    }
+    if (FitsInt<uint32_t>(value)) {
+      return Size::INT32;
+    }
+    if (FitsInt<uint64_t>(value)) {
+      return Size::INT64;
+    }
+    return std::nullopt;
+  }
+
   template <typename T, typename V>
   bool InternalWriteInt(V value) {
     static_assert(std::numeric_limits<T>::is_integer);
@@ -265,15 +338,19 @@ class Writer {
     return true;
   }
 
+ private:
   uint8_t *data_{nullptr};
-  uint64_t size_{0};
-  uint64_t pos_{0};
+  uint32_t size_{0};
+  uint32_t pos_{0};
 };
 
 // Helper class used to read data from the binary stream.
 class Reader {
  public:
-  Reader(const uint8_t *data, uint64_t size) : data_(data), size_(size), pos_(0) {}
+  Reader(const uint8_t *data, uint32_t size) : data_(data), size_(size) {}
+  Reader(Reader const &other, uint32_t offset, uint32_t size) : data_(other.data_ + offset), size_(size) {
+    DMG_ASSERT(other.size_ - offset >= size);
+  }
 
   std::optional<Metadata> ReadMetadata() {
     if (pos_ + 1 > size_) return std::nullopt;
@@ -353,33 +430,57 @@ class Reader {
     return utils::MemcpyCast<double>(*value);
   }
 
-  bool ReadBytes(uint8_t *data, uint64_t size) {
+  std::optional<double> ReadDoubleForce64() {
+    auto value = InternalReadInt<uint64_t>();
+    if (!value) return std::nullopt;
+    return utils::MemcpyCast<double>(*value);
+  }
+
+  std::optional<utils::Timezone> ReadTimezone(auto type) {
+    if (type == Type::ZONED_TEMPORAL_DATA) {
+      auto tz_str_length = ReadUint(TZ_NAME_LENGTH_SIZE);
+      if (!tz_str_length) return std::nullopt;
+      std::string tz_str_v(*tz_str_length, '\0');
+      if (!ReadBytes(tz_str_v.data(), *tz_str_length)) return std::nullopt;
+      return utils::Timezone(tz_str_v);
+    }
+
+    if (type == Type::OFFSET_ZONED_TEMPORAL_DATA) {
+      auto offset_value = InternalReadInt<tz_offset_int>();
+      if (!offset_value) return std::nullopt;
+      return utils::Timezone(std::chrono::minutes{static_cast<int64_t>(*offset_value)});
+    }
+
+    return std::nullopt;
+  }
+
+  bool ReadBytes(uint8_t *data, uint32_t size) {
     if (pos_ + size > size_) return false;
     memcpy(data, data_ + pos_, size);
     pos_ += size;
     return true;
   }
 
-  bool ReadBytes(char *data, uint64_t size) { return ReadBytes(reinterpret_cast<uint8_t *>(data), size); }
+  bool ReadBytes(char *data, uint32_t size) { return ReadBytes(reinterpret_cast<uint8_t *>(data), size); }
 
-  bool VerifyBytes(const uint8_t *data, uint64_t size) {
+  bool VerifyBytes(const uint8_t *data, uint32_t size) {
     if (pos_ + size > size_) return false;
     if (memcmp(data, data_ + pos_, size) != 0) return false;
     pos_ += size;
     return true;
   }
 
-  bool VerifyBytes(const char *data, uint64_t size) {
+  bool VerifyBytes(const char *data, uint32_t size) {
     return VerifyBytes(reinterpret_cast<const uint8_t *>(data), size);
   }
 
-  bool SkipBytes(uint64_t size) {
+  bool SkipBytes(uint32_t size) {
     if (pos_ + size > size_) return false;
     pos_ += size;
     return true;
   }
 
-  uint64_t GetPosition() const { return pos_; }
+  uint32_t GetPosition() const { return pos_; }
 
  private:
   template <typename T>
@@ -392,15 +493,46 @@ class Reader {
   }
 
   const uint8_t *data_;
-  uint64_t size_;
-  uint64_t pos_;
+  uint32_t size_ = 0;
+  uint32_t pos_ = 0;
 };
+
+auto CrsToSize(CoordinateReferenceSystem value) -> Size {
+  switch (value) {
+    using enum Size;
+    using enum CoordinateReferenceSystem;
+    case WGS84_2d:
+      return INT8;
+    case WGS84_3d:
+      return INT16;
+    case Cartesian_2d:
+      return INT32;
+    case Cartesian_3d:
+      return INT64;
+  }
+}
+
+auto SizeToCrs(Size value) -> CoordinateReferenceSystem {
+  switch (value) {
+    using enum Size;
+    using enum CoordinateReferenceSystem;
+    case INT8:
+      return WGS84_2d;
+    case INT16:
+      return WGS84_3d;
+    case INT32:
+      return Cartesian_2d;
+    case INT64:
+      return Cartesian_3d;
+  }
+}
 
 // Function used to encode a PropertyValue into a byte stream.
 std::optional<std::pair<Type, Size>> EncodePropertyValue(Writer *writer, const PropertyValue &value) {
   switch (value.type()) {
-    case PropertyValue::Type::Null:
+    case PropertyValue::Type::Null: {
       return {{Type::NONE, Size::INT8}};
+    }
     case PropertyValue::Type::Bool: {
       if (value.ValueBool()) {
         return {{Type::BOOL, Size::INT64}};
@@ -469,6 +601,75 @@ std::optional<std::pair<Type, Size>> EncodePropertyValue(Writer *writer, const P
       // We don't need payload size so we set it to a random value
       return {{Type::TEMPORAL_DATA, Size::INT8}};
     }
+    case PropertyValue::Type::ZonedTemporalData: {
+      auto metadata = writer->WriteMetadata();
+      if (!metadata) return std::nullopt;
+
+      const auto zoned_temporal_data = value.ValueZonedTemporalData();
+      auto type_size = writer->WriteUint(utils::UnderlyingCast(zoned_temporal_data.type));
+      if (!type_size) return std::nullopt;
+
+      auto microseconds_size = writer->WriteInt(zoned_temporal_data.IntMicroseconds());
+      if (!microseconds_size) return std::nullopt;
+
+      if (zoned_temporal_data.timezone.InTzDatabase()) {
+        metadata->Set({Type::ZONED_TEMPORAL_DATA, *type_size, *microseconds_size});
+
+        const auto &tz_str = zoned_temporal_data.timezone.TimezoneName();
+        if (!writer->WriteUint(tz_str.size())) return std::nullopt;
+        if (!writer->WriteBytes(tz_str.data(), tz_str.size())) return std::nullopt;
+
+        // We don't need payload size so we set it to a random value
+        return {{Type::ZONED_TEMPORAL_DATA, Size::INT8}};
+      }
+      // Valid timezone offsets may be -18 to +18 hours, with minute precision. This means that the range of possible
+      // offset values is [-1080, +1080], which is represented with 16-bit integers.
+
+      if (!writer->WriteTimezoneOffset(zoned_temporal_data.timezone.DefiningOffset())) return std::nullopt;
+      metadata->Set({Type::OFFSET_ZONED_TEMPORAL_DATA, *type_size, *microseconds_size});
+      // We don't need payload size so we set it to a random value
+      return {{Type::OFFSET_ZONED_TEMPORAL_DATA, Size::INT8}};
+    }
+    case PropertyValue::Type::Enum: {
+      auto const &[e_type, e_value] = value.ValueEnum();
+
+      auto merged = e_type.value_of() | e_value.value_of();
+      auto size = Writer::UIntSize(merged);
+      if (!size) return std::nullopt;
+      switch (*size) {
+        case Size::INT8:
+          if (!writer->InternalWriteInt<uint8_t>(e_type.value_of())) return std::nullopt;
+          if (!writer->InternalWriteInt<uint8_t>(e_value.value_of())) return std::nullopt;
+          break;
+        case Size::INT16:
+          if (!writer->InternalWriteInt<uint16_t>(e_type.value_of())) return std::nullopt;
+          if (!writer->InternalWriteInt<uint16_t>(e_value.value_of())) return std::nullopt;
+          break;
+        case Size::INT32:
+          if (!writer->InternalWriteInt<uint32_t>(e_type.value_of())) return std::nullopt;
+          if (!writer->InternalWriteInt<uint32_t>(e_value.value_of())) return std::nullopt;
+          break;
+        case Size::INT64:
+          if (!writer->InternalWriteInt<uint64_t>(e_type.value_of())) return std::nullopt;
+          if (!writer->InternalWriteInt<uint64_t>(e_value.value_of())) return std::nullopt;
+          break;
+      }
+
+      return {{Type::ENUM, *size}};
+    }
+    case PropertyValue::Type::Point2d: {
+      auto const &point = value.ValuePoint2d();
+      if (!writer->WriteDoubleForceInt64(point.x())) return std::nullopt;
+      if (!writer->WriteDoubleForceInt64(point.y())) return std::nullopt;
+      return {{Type::POINT, CrsToSize(point.crs())}};
+    }
+    case PropertyValue::Type::Point3d: {
+      auto const &point = value.ValuePoint3d();
+      if (!writer->WriteDoubleForceInt64(point.x())) return std::nullopt;
+      if (!writer->WriteDoubleForceInt64(point.y())) return std::nullopt;
+      if (!writer->WriteDoubleForceInt64(point.z())) return std::nullopt;
+      return {{Type::POINT, CrsToSize(point.crs())}};
+    }
   }
 }
 
@@ -484,6 +685,82 @@ std::optional<TemporalData> DecodeTemporalData(Reader &reader) {
   if (!microseconds_value) return std::nullopt;
 
   return TemporalData{static_cast<TemporalType>(*type_value), *microseconds_value};
+}
+
+std::optional<uint32_t> DecodeTemporalDataSize(Reader &reader) {
+  uint32_t temporal_data_size = 0;
+
+  auto metadata = reader.ReadMetadata();
+  if (!metadata || metadata->type != Type::TEMPORAL_DATA) return std::nullopt;
+
+  temporal_data_size += 1;
+
+  auto type_value = reader.ReadUint(metadata->id_size);
+  if (!type_value) return std::nullopt;
+
+  temporal_data_size += SizeToByteSize(metadata->id_size);
+
+  auto microseconds_value = reader.ReadInt(metadata->payload_size);
+  if (!microseconds_value) return std::nullopt;
+
+  temporal_data_size += SizeToByteSize(metadata->payload_size);
+
+  return temporal_data_size;
+}
+
+std::optional<ZonedTemporalData> DecodeZonedTemporalData(Reader &reader) {
+  auto metadata = reader.ReadMetadata();
+
+  if (!metadata ||
+      (metadata->type != Type::ZONED_TEMPORAL_DATA && metadata->type != Type::OFFSET_ZONED_TEMPORAL_DATA)) {
+    return std::nullopt;
+  }
+
+  auto type_value = reader.ReadUint(metadata->id_size);
+  if (!type_value) return std::nullopt;
+
+  auto microseconds_value = reader.ReadInt(metadata->payload_size);
+  if (!microseconds_value) return std::nullopt;
+
+  auto timezone = reader.ReadTimezone(metadata->type);
+  if (!timezone) return std::nullopt;
+
+  return ZonedTemporalData{static_cast<ZonedTemporalType>(*type_value), utils::AsSysTime(*microseconds_value),
+                           *timezone};
+}
+
+std::optional<uint64_t> DecodeZonedTemporalDataSize(Reader &reader) {
+  uint64_t zoned_temporal_data_size = 0;
+
+  auto metadata = reader.ReadMetadata();
+  if (!metadata ||
+      (metadata->type != Type::ZONED_TEMPORAL_DATA && metadata->type != Type::OFFSET_ZONED_TEMPORAL_DATA)) {
+    return std::nullopt;
+  }
+
+  zoned_temporal_data_size += 1;
+
+  auto type_value = reader.ReadUint(metadata->id_size);
+  if (!type_value) return std::nullopt;
+
+  zoned_temporal_data_size += SizeToByteSize(metadata->id_size);
+
+  auto microseconds_value = reader.ReadInt(metadata->payload_size);
+  if (!microseconds_value) return std::nullopt;
+
+  zoned_temporal_data_size += SizeToByteSize(metadata->payload_size);
+
+  if (metadata->type == Type::ZONED_TEMPORAL_DATA) {
+    auto tz_str_length = reader.ReadUint(TZ_NAME_LENGTH_SIZE);
+    if (!tz_str_length) return std::nullopt;
+    zoned_temporal_data_size += (1 + *tz_str_length);
+    reader.SkipBytes(*tz_str_length);
+  } else if (metadata->type == Type::OFFSET_ZONED_TEMPORAL_DATA) {
+    zoned_temporal_data_size += 2;  // tz_offset_int is 16-bit
+    reader.SkipBytes(2);
+  }
+
+  return zoned_temporal_data_size;
 }
 
 }  // namespace
@@ -533,7 +810,7 @@ std::optional<TemporalData> DecodeTemporalData(Reader &reader) {
       if (!size) return false;
       std::vector<PropertyValue> list;
       list.reserve(*size);
-      for (uint64_t i = 0; i < *size; ++i) {
+      for (uint32_t i = 0; i < *size; ++i) {
         auto metadata = reader->ReadMetadata();
         if (!metadata) return false;
         PropertyValue item;
@@ -546,8 +823,9 @@ std::optional<TemporalData> DecodeTemporalData(Reader &reader) {
     case Type::MAP: {
       auto size = reader->ReadUint(payload_size);
       if (!size) return false;
-      std::map<std::string, PropertyValue> map;
-      for (uint64_t i = 0; i < *size; ++i) {
+      auto map = PropertyValue::map_t{};
+      map.reserve(*size);
+      for (uint32_t i = 0; i < *size; ++i) {
         auto metadata = reader->ReadMetadata();
         if (!metadata) return false;
         auto key_size = reader->ReadUint(metadata->id_size);
@@ -561,12 +839,144 @@ std::optional<TemporalData> DecodeTemporalData(Reader &reader) {
       value = PropertyValue(std::move(map));
       return true;
     }
-
     case Type::TEMPORAL_DATA: {
       const auto maybe_temporal_data = DecodeTemporalData(*reader);
       if (!maybe_temporal_data) return false;
       value = PropertyValue(*maybe_temporal_data);
+      return true;
+    }
+    case Type::ZONED_TEMPORAL_DATA:
+    case Type::OFFSET_ZONED_TEMPORAL_DATA: {
+      const auto maybe_zoned_temporal_data = DecodeZonedTemporalData(*reader);
+      if (!maybe_zoned_temporal_data) return false;
+      value = PropertyValue(*maybe_zoned_temporal_data);
+      return true;
+    }
+    case Type::ENUM: {
+      auto e_type = reader->ReadUint(payload_size);
+      if (!e_type) return false;
+      auto e_value = reader->ReadUint(payload_size);
+      if (!e_value) return false;
+      value = PropertyValue(Enum{EnumTypeId{*e_type}, EnumValueId{*e_value}});
+      return true;
+    }
+    case Type::POINT: {
+      auto crs = SizeToCrs(payload_size);
+      auto x_opt = reader->ReadDouble(Size::INT64);  // because we forced it as int64 on write
+      if (!x_opt) return false;
+      auto y_opt = reader->ReadDouble(Size::INT64);  // because we forced it as int64 on write
+      if (!y_opt) return false;
+      if (valid2d(crs)) {
+        value = PropertyValue(Point2d{crs, *x_opt, *y_opt});
+      } else {
+        auto z_opt = reader->ReadDouble(Size::INT64);  // because we forced it as int64 on write
+        if (!z_opt) return false;
+        value = PropertyValue(Point3d{crs, *x_opt, *y_opt, *z_opt});
+      }
+      return true;
+    }
+  }
+}
 
+[[nodiscard]] bool DecodePropertyValueSize(Reader *reader, Type type, Size payload_size, uint32_t &property_size) {
+  switch (type) {
+    case Type::EMPTY: {
+      return false;
+    }
+    case Type::NONE:
+    case Type::BOOL: {
+      return true;
+    }
+    case Type::INT:
+    case Type::DOUBLE: {
+      const auto size = SizeToByteSize(payload_size);
+      property_size += size;
+      reader->SkipBytes(size);
+      return true;
+    }
+    case Type::STRING: {
+      auto size = reader->ReadUint(payload_size);
+      if (!size) return false;
+      property_size += SizeToByteSize(payload_size);
+
+      if (!reader->SkipBytes(*size)) return false;
+      property_size += *size;
+
+      return true;
+    }
+    case Type::LIST: {
+      auto size = reader->ReadUint(payload_size);
+      if (!size) return false;
+
+      uint32_t list_property_size = SizeToByteSize(payload_size);
+
+      for (uint32_t i = 0; i < *size; ++i) {
+        auto metadata = reader->ReadMetadata();
+        if (!metadata) return false;
+
+        list_property_size += 1;
+        if (!DecodePropertyValueSize(reader, metadata->type, metadata->payload_size, list_property_size)) return false;
+      }
+
+      property_size += list_property_size;
+      return true;
+    }
+    case Type::MAP: {
+      auto size = reader->ReadUint(payload_size);
+      if (!size) return false;
+
+      uint32_t map_property_size = SizeToByteSize(payload_size);
+
+      for (uint32_t i = 0; i < *size; ++i) {
+        auto metadata = reader->ReadMetadata();
+        if (!metadata) return false;
+
+        map_property_size += 1;
+
+        auto key_size = reader->ReadUint(metadata->id_size);
+        if (!key_size) return false;
+
+        map_property_size += SizeToByteSize(metadata->id_size);
+
+        if (!reader->SkipBytes(*key_size)) return false;
+
+        map_property_size += *key_size;
+
+        if (!DecodePropertyValueSize(reader, metadata->type, metadata->payload_size, map_property_size)) return false;
+      }
+
+      property_size += map_property_size;
+      return true;
+    }
+    case Type::TEMPORAL_DATA: {
+      const auto maybe_temporal_data_size = DecodeTemporalDataSize(*reader);
+      if (!maybe_temporal_data_size) return false;
+
+      property_size += *maybe_temporal_data_size;
+      return true;
+    }
+    case Type::ZONED_TEMPORAL_DATA:
+    case Type::OFFSET_ZONED_TEMPORAL_DATA: {
+      const auto maybe_zoned_temporal_data_size = DecodeZonedTemporalDataSize(*reader);
+      if (!maybe_zoned_temporal_data_size) return false;
+
+      property_size += *maybe_zoned_temporal_data_size;
+      return true;
+    }
+    case Type::ENUM: {
+      // double payload
+      // - first for enum type
+      // - second for enum value
+      auto const bytes = SizeToByteSize(payload_size) * 2;
+      if (!reader->SkipBytes(bytes)) return false;
+      property_size += bytes;
+      return true;
+    }
+    case Type::POINT: {
+      auto payload_members = valid2d(SizeToCrs(payload_size)) ? 2 : 3;
+      auto bytes_size = payload_members * SizeToByteSize(Size::INT64);
+      if (!reader->SkipBytes(bytes_size)) return false;
+      property_size += bytes_size;
       return true;
     }
   }
@@ -600,7 +1010,7 @@ std::optional<TemporalData> DecodeTemporalData(Reader &reader) {
       auto const size = reader->ReadUint(payload_size);
       if (!size) return false;
       auto size_val = *size;
-      for (uint64_t i = 0; i != size_val; ++i) {
+      for (uint32_t i = 0; i != size_val; ++i) {
         auto metadata = reader->ReadMetadata();
         if (!metadata) return false;
         if (!SkipPropertyValue(reader, metadata->type, metadata->payload_size)) return false;
@@ -611,7 +1021,7 @@ std::optional<TemporalData> DecodeTemporalData(Reader &reader) {
       auto const size = reader->ReadUint(payload_size);
       if (!size) return false;
       auto size_val = *size;
-      for (uint64_t i = 0; i != size_val; ++i) {
+      for (uint32_t i = 0; i != size_val; ++i) {
         auto metadata = reader->ReadMetadata();
         if (!metadata) return false;
         auto key_size = reader->ReadUint(metadata->id_size);
@@ -621,9 +1031,21 @@ std::optional<TemporalData> DecodeTemporalData(Reader &reader) {
       }
       return true;
     }
-
     case Type::TEMPORAL_DATA: {
       return DecodeTemporalData(*reader).has_value();
+    }
+    case Type::ZONED_TEMPORAL_DATA:
+    case Type::OFFSET_ZONED_TEMPORAL_DATA: {
+      return DecodeZonedTemporalData(*reader).has_value();
+    }
+    case Type::ENUM: {
+      auto bytes_to_skip = 2 * SizeToByteSize(payload_size);
+      return reader->SkipBytes(bytes_to_skip);
+    }
+    case Type::POINT: {
+      auto payload_members = valid2d(SizeToCrs(payload_size)) ? 2 : 3;
+      auto bytes_to_skip = payload_members * SizeToByteSize(Size::INT64);
+      return reader->SkipBytes(bytes_to_skip);
     }
   }
 }
@@ -691,7 +1113,7 @@ std::optional<TemporalData> DecodeTemporalData(Reader &reader) {
       auto size = reader->ReadUint(payload_size);
       if (!size) return false;
       if (*size != list.size()) return false;
-      for (uint64_t i = 0; i < *size; ++i) {
+      for (uint32_t i = 0; i < *size; ++i) {
         auto metadata = reader->ReadMetadata();
         if (!metadata) return false;
         if (!ComparePropertyValue(reader, metadata->type, metadata->payload_size, list[i])) return false;
@@ -724,6 +1146,41 @@ std::optional<TemporalData> DecodeTemporalData(Reader &reader) {
       }
 
       return *maybe_temporal_data == value.ValueTemporalData();
+    }
+    case Type::ZONED_TEMPORAL_DATA:
+    case Type::OFFSET_ZONED_TEMPORAL_DATA: {
+      if (!value.IsZonedTemporalData()) return false;
+
+      const auto maybe_zoned_temporal_data = DecodeZonedTemporalData(*reader);
+      if (!maybe_zoned_temporal_data) {
+        return false;
+      }
+
+      return *maybe_zoned_temporal_data == value.ValueZonedTemporalData();
+    }
+    case Type::ENUM: {
+      if (!value.IsEnum()) return false;
+      auto e_type = reader->ReadUint(payload_size);
+      if (!e_type) return false;
+      auto e_value = reader->ReadUint(payload_size);
+      if (!e_value) return false;
+      return value.ValueEnum() == Enum{EnumTypeId{*e_type}, EnumValueId{*e_value}};
+    }
+    case Type::POINT: {
+      auto crs = SizeToCrs(payload_size);
+      auto x_opt = reader->ReadDouble(Size::INT64);  // because we forced it as int64 on write
+      if (!x_opt) return false;
+      auto y_opt = reader->ReadDouble(Size::INT64);  // because we forced it as int64 on write
+      if (!y_opt) return false;
+      if (valid2d(crs) && value.IsPoint2d()) {
+        return value.ValuePoint2d() == Point2d{crs, *x_opt, *y_opt};
+      }
+      if (valid3d(crs) && value.IsPoint3d()) {
+        auto z_opt = reader->ReadDouble(Size::INT64);  // because we forced it as int64 on write
+        if (!z_opt) return false;
+        return value.ValuePoint3d() == Point3d{crs, *x_opt, *y_opt, *z_opt};
+      }
+      return false;
     }
   }
 }
@@ -788,6 +1245,108 @@ enum class ExpectedPropertyStatus {
                                                      : ExpectedPropertyStatus::GREATER;
 }
 
+[[nodiscard]] ExpectedPropertyStatus DecodeExpectedPropertySize(Reader *reader, PropertyId expected_property,
+                                                                uint32_t &size) {
+  auto metadata = reader->ReadMetadata();
+  if (!metadata) return ExpectedPropertyStatus::MISSING_DATA;
+
+  auto property_id = reader->ReadUint(metadata->id_size);
+  if (!property_id) return ExpectedPropertyStatus::MISSING_DATA;
+
+  if (*property_id == expected_property.AsUint()) {
+    // Add one byte for reading metadata + add the number of bytes for the property key
+    size += (1 + SizeToByteSize(metadata->id_size));
+    if (!DecodePropertyValueSize(reader, metadata->type, metadata->payload_size, size))
+      return ExpectedPropertyStatus::MISSING_DATA;
+    return ExpectedPropertyStatus::EQUAL;
+  }
+  // Don't load the value if this isn't the expected property.
+  if (!SkipPropertyValue(reader, metadata->type, metadata->payload_size)) return ExpectedPropertyStatus::MISSING_DATA;
+  return (*property_id < expected_property.AsUint()) ? ExpectedPropertyStatus::SMALLER
+                                                     : ExpectedPropertyStatus::GREATER;
+}
+
+[[nodiscard]] ExpectedPropertyStatus DecodeExpectedPropertyType(Reader *reader, PropertyId expected_property,
+                                                                ExtendedPropertyType &type) {
+  auto metadata = reader->ReadMetadata();
+  if (!metadata) return ExpectedPropertyStatus::MISSING_DATA;
+
+  auto property_id = reader->ReadUint(metadata->id_size);
+  if (!property_id) return ExpectedPropertyStatus::MISSING_DATA;
+
+  switch (metadata->type) {
+    using enum Type;
+    case EMPTY:
+    case NONE:
+      type = ExtendedPropertyType{PropertyValue::Type::Null};
+      break;
+    case BOOL:
+      type = ExtendedPropertyType{PropertyValue::Type::Bool};
+      break;
+    case INT:
+      type = ExtendedPropertyType{PropertyValue::Type::Int};
+      break;
+    case DOUBLE:
+      type = ExtendedPropertyType{PropertyValue::Type::Double};
+      break;
+    case STRING:
+      type = ExtendedPropertyType{PropertyValue::Type::String};
+      break;
+    case LIST:
+      type = ExtendedPropertyType{PropertyValue::Type::List};
+      break;
+    case MAP:
+      type = ExtendedPropertyType{PropertyValue::Type::Map};
+      break;
+    case TEMPORAL_DATA: {
+      // Found the property
+      if (*property_id == expected_property.AsUint()) {
+        PropertyValue value;
+        if (!DecodePropertyValue(reader, metadata->type, metadata->payload_size, value))
+          return ExpectedPropertyStatus::MISSING_DATA;
+        type = ExtendedPropertyType{value.ValueTemporalData().type};
+        return ExpectedPropertyStatus::EQUAL;
+      }
+      break;
+    }
+    case ZONED_TEMPORAL_DATA:
+    case OFFSET_ZONED_TEMPORAL_DATA:
+      type = ExtendedPropertyType{PropertyValue::Type::ZonedTemporalData};  // NOT SURE
+      break;
+    case ENUM: {
+      // Found the property
+      if (*property_id == expected_property.AsUint()) {
+        PropertyValue value;
+        if (!DecodePropertyValue(reader, metadata->type, metadata->payload_size, value))
+          return ExpectedPropertyStatus::MISSING_DATA;
+        type = ExtendedPropertyType{value.ValueEnum().type_id()};
+        return ExpectedPropertyStatus::EQUAL;
+      }
+    } break;
+    case POINT: {
+      // Found the property
+      if (*property_id == expected_property.AsUint()) {
+        PropertyValue value;
+        if (!DecodePropertyValue(reader, metadata->type, metadata->payload_size, value))
+          return ExpectedPropertyStatus::MISSING_DATA;
+        type = ExtendedPropertyType{
+            value.type()};  // PropertyStoreType has only Point; while PropertyValueType has point 2d and 3d
+        return ExpectedPropertyStatus::EQUAL;
+      }
+    } break;
+  }
+
+  if (*property_id == expected_property.AsUint()) {
+    return ExpectedPropertyStatus::EQUAL;
+  }
+
+  // Don't load the value if this isn't the expected property.
+  if (!SkipPropertyValue(reader, metadata->type, metadata->payload_size)) return ExpectedPropertyStatus::MISSING_DATA;
+
+  return (*property_id < expected_property.AsUint()) ? ExpectedPropertyStatus::SMALLER
+                                                     : ExpectedPropertyStatus::GREATER;
+}
+
 // Function used to check a property exists (PropertyId) from a byte stream.
 // It will skip the encoded PropertyValue.
 //
@@ -822,6 +1381,25 @@ enum class ExpectedPropertyStatus {
   }
 }
 
+[[nodiscard]] auto NextPropertyAndType(Reader *reader) -> std::optional<PropertyStoreMemberInfo> {
+  auto metadata = reader->ReadMetadata();
+  if (!metadata) return std::nullopt;
+
+  auto property_id = reader->ReadUint(metadata->id_size);
+  if (!property_id) return std::nullopt;
+
+  // Special case: TEMPORAL_DATA has a subtype we need to extract
+  if (metadata->type == Type::TEMPORAL_DATA) {
+    auto temporal_data = DecodeTemporalData(*reader);
+    if (!temporal_data) return std::nullopt;
+    return PropertyStoreMemberInfo{PropertyId::FromUint(*property_id), metadata->type, temporal_data->type};
+  }
+
+  if (!SkipPropertyValue(reader, metadata->type, metadata->payload_size)) return std::nullopt;
+
+  return PropertyStoreMemberInfo{PropertyId::FromUint(*property_id), metadata->type, std::nullopt};
+}
+
 // Function used to decode a property (PropertyId, PropertyValue) from a byte
 // stream.
 //
@@ -835,6 +1413,67 @@ enum class ExpectedPropertyStatus {
   if (!property_id) return std::nullopt;
 
   if (!DecodePropertyValue(reader, metadata->type, metadata->payload_size, value)) return std::nullopt;
+
+  return PropertyId::FromUint(*property_id);
+}
+
+[[nodiscard]] std::optional<PropertyId> DecodeAnyExtendedPropertyType(Reader *reader, ExtendedPropertyType &type) {
+  auto metadata = reader->ReadMetadata();
+  if (!metadata) return std::nullopt;
+
+  auto property_id = reader->ReadUint(metadata->id_size);
+  if (!property_id) return std::nullopt;
+
+  switch (metadata->type) {
+    using enum Type;
+    case EMPTY:
+    case NONE:
+      type = ExtendedPropertyType{PropertyValue::Type::Null};
+      break;
+    case BOOL:
+      type = ExtendedPropertyType{PropertyValue::Type::Bool};
+      break;
+    case INT:
+      type = ExtendedPropertyType{PropertyValue::Type::Int};
+      break;
+    case DOUBLE:
+      type = ExtendedPropertyType{PropertyValue::Type::Double};
+      break;
+    case STRING:
+      type = ExtendedPropertyType{PropertyValue::Type::String};
+      break;
+    case LIST:
+      type = ExtendedPropertyType{PropertyValue::Type::List};
+      break;
+    case MAP:
+      type = ExtendedPropertyType{PropertyValue::Type::Map};
+      break;
+    case TEMPORAL_DATA: {
+      PropertyValue value;
+      if (!DecodePropertyValue(reader, metadata->type, metadata->payload_size, value)) return std::nullopt;
+      type = ExtendedPropertyType{value.ValueTemporalData().type};
+      return PropertyId::FromUint(*property_id);
+    }
+    case ZONED_TEMPORAL_DATA:
+    case OFFSET_ZONED_TEMPORAL_DATA:
+      type = ExtendedPropertyType{PropertyValue::Type::ZonedTemporalData};  // NOT SURE
+      break;
+    case ENUM: {
+      PropertyValue value;
+      if (!DecodePropertyValue(reader, metadata->type, metadata->payload_size, value)) return std::nullopt;
+      type = ExtendedPropertyType{value.ValueEnum().type_id()};
+      return PropertyId::FromUint(*property_id);
+    }
+    case POINT: {
+      PropertyValue value;
+      if (!DecodePropertyValue(reader, metadata->type, metadata->payload_size, value)) return std::nullopt;
+      type = ExtendedPropertyType{
+          value.type()};  // PropertyStoreType has only Point; while PropertyValueType has point 2d and 3d
+      return PropertyId::FromUint(*property_id);
+    }
+  }
+
+  if (!SkipPropertyValue(reader, metadata->type, metadata->payload_size)) return std::nullopt;
 
   return PropertyId::FromUint(*property_id);
 }
@@ -875,6 +1514,23 @@ enum class ExpectedPropertyStatus {
   }
 }
 
+[[nodiscard]] ExpectedPropertyStatus FindSpecificPropertySize(Reader *reader, PropertyId property, uint32_t &size) {
+  ExpectedPropertyStatus ret = ExpectedPropertyStatus::SMALLER;
+  while ((ret = DecodeExpectedPropertySize(reader, property, size)) == ExpectedPropertyStatus::SMALLER) {
+  }
+  return ret;
+}
+
+[[nodiscard]] ExpectedPropertyStatus FindSpecificExtendedPropertyType(Reader *reader, PropertyId property,
+                                                                      ExtendedPropertyType &value) {
+  while (true) {
+    auto ret = DecodeExpectedPropertyType(reader, property, value);
+    if (ret != ExpectedPropertyStatus::SMALLER) {
+      return ret;
+    }
+  }
+}
+
 // Function used to find if property is set. It relies on the fact that the properties
 // are sorted (by ID) in the buffer.
 //
@@ -895,12 +1551,20 @@ enum class ExpectedPropertyStatus {
 
 // Struct used to return info about the property position and buffer size.
 struct SpecificPropertyAndBufferInfo {
+  uint32_t property_begin;
+  uint32_t property_end;
+  uint32_t property_size;
+  uint32_t all_begin;
+  uint32_t all_end;
+  uint32_t all_size;
+};
+
+// Struct used to return info about the property position
+struct SpecificPropertyAndBufferInfoMinimal {
   uint64_t property_begin;
   uint64_t property_end;
-  uint64_t property_size;
-  uint64_t all_begin;
-  uint64_t all_end;
-  uint64_t all_size;
+
+  auto property_size() const { return property_end - property_begin; }
 };
 
 // Function used to find the position where the property should be in the data
@@ -915,10 +1579,10 @@ struct SpecificPropertyAndBufferInfo {
 //
 // @sa FindSpecificProperty
 SpecificPropertyAndBufferInfo FindSpecificPropertyAndBufferInfo(Reader *reader, PropertyId property) {
-  uint64_t property_begin = reader->GetPosition();
-  uint64_t property_end = reader->GetPosition();
-  uint64_t all_begin = reader->GetPosition();
-  uint64_t all_end = reader->GetPosition();
+  uint32_t property_begin = reader->GetPosition();
+  uint32_t property_end = reader->GetPosition();
+  const uint32_t all_begin = reader->GetPosition();
+  uint32_t all_end = reader->GetPosition();
   while (true) {
     auto ret = HasExpectedProperty(reader, property);
     if (ret == ExpectedPropertyStatus::MISSING_DATA) {
@@ -935,9 +1599,30 @@ SpecificPropertyAndBufferInfo FindSpecificPropertyAndBufferInfo(Reader *reader, 
   return {property_begin, property_end, property_end - property_begin, all_begin, all_end, all_end - all_begin};
 }
 
-// All data buffers will be allocated to a power of 8 size.
-uint64_t ToPowerOf8(uint64_t size) {
-  uint64_t mod = size % 8;
+// Like FindSpecificPropertyAndBufferInfo, but will early exit. No need to find the "all" information
+SpecificPropertyAndBufferInfoMinimal FindSpecificPropertyAndBufferInfoMinimal(Reader *reader, PropertyId property) {
+  uint64_t property_begin = reader->GetPosition();
+  while (true) {
+    switch (HasExpectedProperty(reader, property)) {
+      case ExpectedPropertyStatus::MISSING_DATA:
+        [[fallthrough]];
+      case ExpectedPropertyStatus::GREATER: {
+        return {0, 0};
+      }
+      case ExpectedPropertyStatus::EQUAL: {
+        return {property_begin, reader->GetPosition()};
+      }
+      case ExpectedPropertyStatus::SMALLER: {
+        property_begin = reader->GetPosition();
+        break;
+      }
+    }
+  }
+}
+
+// All data buffers will be allocated to a multiple of 8 size.
+uint32_t ToMultipleOf8(uint32_t size) {
+  const uint32_t mod = size % 8;
   if (mod == 0) return size;
   return size - mod + 8;
 }
@@ -969,23 +1654,208 @@ uint64_t ToPowerOf8(uint64_t size) {
 // of the two sets of data is currently active. Because the first byte of the
 // buffer is used to distinguish which of the two sets of data is used, we can
 // only use the leftover 15 bytes for raw data storage.
+static_assert(std::endian::native == std::endian::little, "Our code assumes little endian");
 
 const uint8_t kUseLocalBuffer = 0x01;
+const uint8_t kUseCompressedBuffer = 0x02;
+static_assert(kUseLocalBuffer % 8 != 0, "Special storage modes need to be not a multiple of 8");
+static_assert(kUseCompressedBuffer % 8 != 0, "Special storage modes need to be not a multiple of 8");
+
+enum class StorageMode : uint8_t {
+  EMPTY,
+  BUFFER,
+  LOCAL,
+  COMPRESSED,
+};
+
+struct DecodedBufferConst {
+  std::span<uint8_t const> view;
+  StorageMode storage_mode;
+};
+struct DecodedBuffer {
+  std::span<uint8_t> view;
+  StorageMode storage_mode;
+
+  // implicit conversion operator
+  // NOLINTNEXTLINE( hicpp-explicit-conversions )
+  explicit(false) operator DecodedBufferConst() {
+    return {
+        .view = view,
+        .storage_mode = storage_mode,
+    };
+  }
+};
+
+void FreeMemory(DecodedBuffer const &buffer_info) {
+  switch (buffer_info.storage_mode) {
+    case StorageMode::BUFFER:
+    case StorageMode::COMPRESSED:
+      delete[] buffer_info.view.data();
+      break;
+    case StorageMode::LOCAL:
+    case StorageMode::EMPTY:
+      break;
+  }
+}
+
+void SetSizeData(uint8_t *buffer, uint32_t size, uint8_t *data) {
+  memcpy(buffer, &size, sizeof(size));
+  memcpy(buffer + sizeof(size), &data, sizeof(uint8_t *));
+}
+DecodedBuffer SetupLocalBuffer(uint8_t (&buffer)[12]) {
+  buffer[0] = kUseLocalBuffer;
+  return DecodedBuffer{
+      .view = std::span{&buffer[1], sizeof(buffer) - 1},
+      .storage_mode = StorageMode::LOCAL,
+  };
+}
+DecodedBuffer SetupExternalBuffer(uint32_t size) {
+  auto alloc_size = ToMultipleOf8(size);
+  auto *alloc_data = new uint8_t[alloc_size];
+
+  return DecodedBuffer{
+      .view = std::span{alloc_data, alloc_size},
+      .storage_mode = StorageMode::BUFFER,
+  };
+}
+DecodedBuffer SetupBuffer(uint8_t (&buffer)[12], uint32_t size) {
+  auto can_fit_in_local = size <= sizeof(buffer) - 1;
+  return can_fit_in_local ? SetupLocalBuffer(buffer) : SetupExternalBuffer(size);
+}
+
+std::optional<utils::DecompressedBuffer> DecompressBuffer(DecodedBufferConst const &buffer_info) {
+  if (buffer_info.storage_mode != StorageMode::COMPRESSED) return std::nullopt;
+
+  // Memory (hex):
+  // 00 00 00 00 00 00 00
+  // |------------|         -> original size
+  //                ||      -> size modifier to get back to non multiple of 8
+  //                   |--- -> compressed data
+  // 0  1  2  3  4  5  6  (positions)
+
+  uint32_t original_size = 0;
+  auto const *data = buffer_info.view.data();
+  memcpy(&original_size, data, sizeof(uint32_t));
+
+  // we have to restore the original size of the compressed buffer + the size of the original buffer
+  auto modifier = data[sizeof(uint32_t)];
+  auto buffer_size = buffer_info.view.size_bytes();
+  auto compressed_size = (modifier != 0) ? (buffer_size - 8 + modifier) : buffer_size;
+
+  auto data_offset = sizeof(uint32_t) + 1;
+  auto compressed_buffer = std::span(data + data_offset, compressed_size - data_offset);
+  auto const *compressor = utils::Compressor::GetInstance();
+  auto decompressed_buffer = compressor->Decompress(compressed_buffer, original_size);
+
+  if (!decompressed_buffer) [[unlikely]] {
+    throw PropertyValueException("Failed to decompress buffer");
+  }
+
+  return decompressed_buffer;
+}
+
+void CompressBuffer(uint8_t (&buffer)[12], DecodedBuffer const &buffer_info) {
+  if (buffer_info.storage_mode != StorageMode::BUFFER) {
+    return;
+  }
+  auto uncompressed_size = buffer_info.view.size_bytes();
+
+  auto const *compressor = utils::Compressor::GetInstance();
+  auto compressed_buffer = compressor->Compress(buffer_info.view);
+  if (!compressed_buffer) {
+    throw PropertyValueException("Failed to compress buffer");
+  }
+
+  auto compressed_view = compressed_buffer->view();
+  auto const metadata_size = sizeof(uint32_t) + 1;
+  auto size_needed = compressed_view.size_bytes() + metadata_size;
+  auto compressed_size_to_multiple_of_8 = ToMultipleOf8(size_needed);
+  if (compressed_size_to_multiple_of_8 >= uncompressed_size) {
+    // Compressed buffer + metadata are larger than the original buffer, so we don't perform the compression.
+    return;
+  }
+
+  auto compressed_data = std::make_unique_for_overwrite<uint8_t[]>(compressed_size_to_multiple_of_8);
+
+  // We have compressed data + new buffer to put it into, no need for old uncompressed buffer
+  FreeMemory(buffer_info);
+
+  // first 4 bytes are the size of the original buffer
+  auto orig_size = compressed_buffer->original_size();
+  memcpy(compressed_data.get(), &orig_size, sizeof(uint32_t));
+
+  // next byte is the mod before multiple of 8
+  const uint8_t mod = size_needed % 8;
+  compressed_data[sizeof(uint32_t)] = mod;
+
+  // the rest of the buffer is the compressed data
+  memcpy(compressed_data.get() + metadata_size, compressed_view.data(), compressed_view.size_bytes());
+
+  SetSizeData(buffer, compressed_size_to_multiple_of_8 + kUseCompressedBuffer, compressed_data.release());
+}
 
 // Helper functions used to retrieve/store `size` and `data` from/into the
 // `buffer_`.
+auto GetDecodedBuffer(uint8_t (&buffer)[12]) -> DecodedBuffer {
+  uint32_t size = 0;
+  uint8_t *data = nullptr;
+  memcpy(&size, buffer, sizeof(uint32_t));
+  memcpy(&data, buffer + sizeof(uint32_t), sizeof(uint8_t *));
 
-std::pair<uint64_t, uint8_t *> GetSizeData(const uint8_t *buffer) {
-  uint64_t size;
-  uint8_t *data;
-  memcpy(&size, buffer, sizeof(uint64_t));
-  memcpy(&data, buffer + sizeof(uint64_t), sizeof(uint8_t *));
-  return {size, data};
+  if (size == 0) {
+    return {std::span<uint8_t>{}, StorageMode::EMPTY};
+  }
+
+  if (size % 8 == 0) {
+    return {std::span{data, size}, StorageMode::BUFFER};
+  }
+
+  auto special_mode_value = static_cast<uint8_t>(size & (sizeof(uint8_t) * CHAR_BIT - 1));
+  switch (special_mode_value) {
+    case kUseLocalBuffer: {
+      auto *local_start = &buffer[1];
+      auto local_size = static_cast<uint32_t>(sizeof(buffer) - 1);
+      return {std::span{local_start, local_size}, StorageMode::LOCAL};
+    }
+    case kUseCompressedBuffer: {
+      auto real_size = static_cast<uint32_t>(size & ~(sizeof(uint8_t) * CHAR_BIT - 1));
+      return {std::span{data, real_size}, StorageMode::COMPRESSED};
+    }
+    default: {
+      MG_ASSERT(false, "Corrupt property storage");
+    }
+  }
 }
 
-void SetSizeData(uint8_t *buffer, uint64_t size, uint8_t *data) {
-  memcpy(buffer, &size, sizeof(uint64_t));
-  memcpy(buffer + sizeof(uint64_t), &data, sizeof(uint8_t *));
+auto GetDecodedBuffer(uint8_t const (&buffer)[12]) -> DecodedBufferConst {
+  uint32_t size = 0;
+  uint8_t *data = nullptr;
+  memcpy(&size, buffer, sizeof(uint32_t));
+  memcpy(&data, buffer + sizeof(uint32_t), sizeof(uint8_t *));
+
+  if (size == 0) {
+    return {std::span<uint8_t>{}, StorageMode::EMPTY};
+  }
+
+  if (size % 8 == 0) {
+    return {std::span{data, size}, StorageMode::BUFFER};
+  }
+
+  auto special_mode_value = static_cast<uint8_t>(size & (sizeof(uint8_t) * CHAR_BIT - 1));
+  switch (special_mode_value) {
+    case kUseLocalBuffer: {
+      auto const *local_start = &buffer[1];
+      auto local_size = static_cast<uint32_t>(sizeof(buffer) - 1);
+      return {std::span{local_start, local_size}, StorageMode::LOCAL};
+    }
+    case kUseCompressedBuffer: {
+      auto real_size = static_cast<uint32_t>(size & ~(sizeof(uint8_t) * CHAR_BIT - 1));
+      return {std::span{data, real_size}, StorageMode::COMPRESSED};
+    }
+    default: {
+      MG_ASSERT(false, "Corrupt property storage");
+    }
+  }
 }
 
 }  // namespace
@@ -998,66 +1868,76 @@ PropertyStore::PropertyStore(PropertyStore &&other) noexcept {
 }
 
 PropertyStore &PropertyStore::operator=(PropertyStore &&other) noexcept {
-  uint64_t size;
-  uint8_t *data;
-  std::tie(size, data) = GetSizeData(buffer_);
-  if (size % 8 == 0) {
-    // We are storing the data in an external buffer.
-    delete[] data;
-  }
+  if (this == std::addressof(other)) return *this;
 
+  auto buffer_info = GetDecodedBuffer(buffer_);
+  FreeMemory(buffer_info);
+
+  // copy over the buffer
   memcpy(buffer_, other.buffer_, sizeof(buffer_));
+  // make other empty
   memset(other.buffer_, 0, sizeof(other.buffer_));
 
   return *this;
 }
 
 PropertyStore::~PropertyStore() {
-  uint64_t size;
-  uint8_t *data;
-  std::tie(size, data) = GetSizeData(buffer_);
-  if (size % 8 == 0) {
-    // We are storing the data in an external buffer.
-    delete[] data;
+  auto buffer_info = GetDecodedBuffer(buffer_);
+  FreeMemory(buffer_info);
+}
+
+template <typename Func>
+auto PropertyStore::WithReader(Func &&func) const {
+  auto buffer_info = GetDecodedBuffer(buffer_);
+  if (buffer_info.storage_mode == StorageMode::COMPRESSED) {
+    auto decompressed_buffer = DecompressBuffer(buffer_info);
+    auto view = decompressed_buffer->view();
+    Reader reader(view.data(), view.size_bytes());
+    return std::forward<Func>(func)(reader);
   }
+  Reader reader(buffer_info.view.data(), buffer_info.view.size_bytes());
+  return std::forward<Func>(func)(reader);
 }
 
 PropertyValue PropertyStore::GetProperty(PropertyId property) const {
-  uint64_t size;
-  const uint8_t *data;
-  std::tie(size, data) = GetSizeData(buffer_);
-  if (size % 8 != 0) {
-    // We are storing the data in the local buffer.
-    size = sizeof(buffer_) - 1;
-    data = &buffer_[1];
-  }
-  Reader reader(data, size);
-  PropertyValue value;
-  if (FindSpecificProperty(&reader, property, value) != ExpectedPropertyStatus::EQUAL) return {};
-  return value;
+  auto get_property = [&](Reader &reader) -> PropertyValue {
+    PropertyValue value;
+    if (FindSpecificProperty(&reader, property, value) != ExpectedPropertyStatus::EQUAL) return {};
+    return value;
+  };
+  return WithReader(get_property);
+}
+
+ExtendedPropertyType PropertyStore::GetExtendedPropertyType(PropertyId property) const {
+  auto get_property_type = [&](Reader &reader) -> ExtendedPropertyType {
+    ExtendedPropertyType type{};
+    if (FindSpecificExtendedPropertyType(&reader, property, type) != ExpectedPropertyStatus::EQUAL) return {};
+    return type;
+  };
+  return WithReader(get_property_type);
+}
+
+uint32_t PropertyStore::PropertySize(PropertyId property) const {
+  auto get_property_size = [&](Reader &reader) -> uint32_t {
+    uint32_t property_size = 0;
+    if (FindSpecificPropertySize(&reader, property, property_size) != ExpectedPropertyStatus::EQUAL) return 0;
+    return property_size;
+  };
+  return WithReader(get_property_size);
 }
 
 bool PropertyStore::HasProperty(PropertyId property) const {
-  uint64_t size;
-  const uint8_t *data;
-  std::tie(size, data) = GetSizeData(buffer_);
-  if (size % 8 != 0) {
-    // We are storing the data in the local buffer.
-    size = sizeof(buffer_) - 1;
-    data = &buffer_[1];
-  }
-  Reader reader(data, size);
-  return ExistsSpecificProperty(&reader, property) == ExpectedPropertyStatus::EQUAL;
+  auto property_exists = [&](Reader &reader) -> uint32_t {
+    return ExistsSpecificProperty(&reader, property) == ExpectedPropertyStatus::EQUAL;
+  };
+  return WithReader(property_exists);
 }
 
-/// TODO: andi write a unit test for it
 bool PropertyStore::HasAllProperties(const std::set<PropertyId> &properties) const {
   return std::all_of(properties.begin(), properties.end(), [this](const auto &prop) { return HasProperty(prop); });
 }
 
-/// TODO: andi write a unit test for it
 bool PropertyStore::HasAllPropertyValues(const std::vector<PropertyValue> &property_values) const {
-  /// TODO: andi extract this into a private method
   auto property_map = Properties();
   std::vector<PropertyValue> all_property_values;
   transform(property_map.begin(), property_map.end(), back_inserter(all_property_values),
@@ -1084,86 +1964,65 @@ std::optional<std::vector<PropertyValue>> PropertyStore::ExtractPropertyValues(
 }
 
 bool PropertyStore::IsPropertyEqual(PropertyId property, const PropertyValue &value) const {
-  uint64_t size;
-  const uint8_t *data;
-  std::tie(size, data) = GetSizeData(buffer_);
-  if (size % 8 != 0) {
-    // We are storing the data in the local buffer.
-    size = sizeof(buffer_) - 1;
-    data = &buffer_[1];
-  }
-  Reader reader(data, size);
-  auto info = FindSpecificPropertyAndBufferInfo(&reader, property);
-  if (info.property_size == 0) return value.IsNull();
-  Reader prop_reader(data + info.property_begin, info.property_size);
-  if (!CompareExpectedProperty(&prop_reader, property, value)) return false;
-  return prop_reader.GetPosition() == info.property_size;
+  auto property_equal = [&](Reader &reader) -> uint32_t {
+    auto const orig_reader = reader;
+    auto info = FindSpecificPropertyAndBufferInfoMinimal(&reader, property);
+    auto property_size = info.property_size();
+    if (property_size == 0) return value.IsNull();
+    auto prop_reader = Reader(orig_reader, info.property_begin, property_size);
+    if (!CompareExpectedProperty(&prop_reader, property, value)) return false;
+    return prop_reader.GetPosition() == property_size;
+  };
+  return WithReader(property_equal);
 }
 
 std::map<PropertyId, PropertyValue> PropertyStore::Properties() const {
-  uint64_t size;
-  const uint8_t *data;
-  std::tie(size, data) = GetSizeData(buffer_);
-  if (size % 8 != 0) {
-    // We are storing the data in the local buffer.
-    size = sizeof(buffer_) - 1;
-    data = &buffer_[1];
-  }
-  Reader reader(data, size);
-  std::map<PropertyId, PropertyValue> props;
-  while (true) {
+  auto get_properties = [&](Reader &reader) {
+    std::map<PropertyId, PropertyValue> props;
     PropertyValue value;
-    auto prop = DecodeAnyProperty(&reader, value);
-    if (!prop) break;
-    props.emplace(*prop, std::move(value));
-  }
-  return props;
+    while (true) {
+      auto prop = DecodeAnyProperty(&reader, value);
+      if (!prop) break;
+      props.emplace(*prop, std::move(value));
+    }
+    return props;
+  };
+  return WithReader(get_properties);
+}
+
+std::map<PropertyId, ExtendedPropertyType> PropertyStore::ExtendedPropertyTypes() const {
+  auto get_properties = [&](Reader &reader) {
+    std::map<PropertyId, ExtendedPropertyType> props;
+    while (true) {
+      ExtendedPropertyType type{PropertyValue::Type::Null};
+      auto prop = DecodeAnyExtendedPropertyType(&reader, type);
+      if (!prop) break;
+      props.emplace(*prop, type);
+    }
+    return props;
+  };
+  return WithReader(get_properties);
 }
 
 bool PropertyStore::SetProperty(PropertyId property, const PropertyValue &value) {
-  uint64_t property_size = 0;
+  uint32_t property_size = 0;
   if (!value.IsNull()) {
     Writer writer;
     EncodeProperty(&writer, property, value);
     property_size = writer.Written();
   }
 
-  bool in_local_buffer = false;
-  uint64_t size;
-  uint8_t *data;
-  std::tie(size, data) = GetSizeData(buffer_);
-  if (size % 8 != 0) {
-    // We are storing the data in the local buffer.
-    size = sizeof(buffer_) - 1;
-    data = &buffer_[1];
-    in_local_buffer = true;
-  }
+  auto buffer_info = GetDecodedBuffer(buffer_);
 
   bool existed = false;
-  if (!size) {
+  if (buffer_info.storage_mode == StorageMode::EMPTY) {
     if (!value.IsNull()) {
-      // We don't have a data buffer. Allocate a new one.
-      auto property_size_to_power_of_8 = ToPowerOf8(property_size);
-      if (property_size <= sizeof(buffer_) - 1) {
-        // Use the local buffer.
-        buffer_[0] = kUseLocalBuffer;
-        size = sizeof(buffer_) - 1;
-        data = &buffer_[1];
-        in_local_buffer = true;
-      } else {
-        // Allocate a new external buffer.
-        auto *alloc_data = new uint8_t[property_size_to_power_of_8];
-        auto alloc_size = property_size_to_power_of_8;
-
-        SetSizeData(buffer_, alloc_size, alloc_data);
-
-        size = alloc_size;
-        data = alloc_data;
-        in_local_buffer = false;
-      }
+      // We don't have a data buffer. Setup on for writting
+      auto new_buffer_info = SetupBuffer(buffer_, property_size);
+      auto new_view = new_buffer_info.view;
 
       // Encode the property into the data buffer.
-      Writer writer(data, size);
+      Writer writer(new_view.data(), new_view.size());
       MG_ASSERT(EncodeProperty(&writer, property, value), "Invalid database state!");
       auto metadata = writer.WriteMetadata();
       if (metadata) {
@@ -1171,73 +2030,104 @@ bool PropertyStore::SetProperty(PropertyId property, const PropertyValue &value)
         // indicate that there are no more properties to be decoded.
         metadata->Set({Type::EMPTY});
       }
+
+      // Make buffer perminant
+      if (new_buffer_info.storage_mode == StorageMode::BUFFER) {
+        SetSizeData(buffer_, new_view.size_bytes(), new_view.data());
+      }
+
+      buffer_info = new_buffer_info;
     } else {
       // We don't have to do anything. We don't have a buffer and we are trying
       // to set a property to `Null` (we are trying to remove the property).
+      return !existed;
     }
   } else {
-    Reader reader(data, size);
+    std::optional<utils::DecompressedBuffer> decompressed_buffer;
+
+    auto current_view = std::invoke([&] {
+      if (buffer_info.storage_mode == StorageMode::COMPRESSED) {
+        decompressed_buffer = DecompressBuffer(buffer_info);
+        return decompressed_buffer->view();
+      }
+      return buffer_info.view;
+    });
+
+    auto reader = Reader(current_view.data(), current_view.size_bytes());
     auto info = FindSpecificPropertyAndBufferInfo(&reader, property);
     existed = info.property_size != 0;
     auto new_size = info.all_size - info.property_size + property_size;
-    auto new_size_to_power_of_8 = ToPowerOf8(new_size);
-    if (new_size_to_power_of_8 == 0) {
+    auto new_size_to_multiple_of_8 = ToMultipleOf8(new_size);
+
+    if (new_size == 0) {
       // We don't have any data to encode anymore.
-      if (!in_local_buffer) delete[] data;
+      FreeMemory(buffer_info);
       SetSizeData(buffer_, 0, nullptr);
-      data = nullptr;
-      size = 0;
-    } else if (new_size_to_power_of_8 > size || new_size_to_power_of_8 <= size * 2 / 3) {
+      return !existed;
+    }
+
+    if (new_size_to_multiple_of_8 > current_view.size_bytes() ||
+        new_size_to_multiple_of_8 <= current_view.size_bytes() * 2 / 3) {
       // We need to enlarge/shrink the buffer.
-      bool current_in_local_buffer = false;
-      uint8_t *current_data = nullptr;
-      uint64_t current_size = 0;
-      if (new_size <= sizeof(buffer_) - 1) {
-        // Use the local buffer.
-        buffer_[0] = kUseLocalBuffer;
-        current_size = sizeof(buffer_) - 1;
-        current_data = &buffer_[1];
-        current_in_local_buffer = true;
-      } else {
-        // Allocate a new external buffer.
-        current_data = new uint8_t[new_size_to_power_of_8];
-        current_size = new_size_to_power_of_8;
-        current_in_local_buffer = false;
-      }
+      auto new_buffer_info = SetupBuffer(buffer_, new_size);
+      auto new_view = new_buffer_info.view;
+
       // Copy everything before the property to the new buffer.
-      memmove(current_data, data, info.property_begin);
+      memmove(new_view.data(), current_view.data(), info.property_begin);
       // Copy everything after the property to the new buffer.
-      memmove(current_data + info.property_begin + property_size, data + info.property_end,
+      memmove(new_view.data() + info.property_begin + property_size, current_view.data() + info.property_end,
               info.all_end - info.property_end);
-      // Free the old buffer.
-      if (!in_local_buffer) delete[] data;
-      // Permanently remember the new buffer.
-      if (!current_in_local_buffer) {
-        SetSizeData(buffer_, current_size, current_data);
+
+      // Make buffer perminant
+      if (new_buffer_info.storage_mode == StorageMode::BUFFER) {
+        SetSizeData(buffer_, new_view.size_bytes(), new_view.data());
       }
-      // Set the proxy variables.
-      data = current_data;
-      size = current_size;
-      in_local_buffer = current_in_local_buffer;
+
+      // Free the old buffers
+      decompressed_buffer.reset();  // no longer needed, if it existed we have now copied from it
+      FreeMemory(buffer_info);      // original buffer no longer needed
+      buffer_info = new_buffer_info;
+      current_view = new_buffer_info.view;
+
     } else if (property_size != info.property_size) {
       // We can keep the data in the same buffer, but the new property is
       // larger/smaller than the old property. We need to move the following
       // properties to the right/left.
-      memmove(data + info.property_begin + property_size, data + info.property_end, info.all_end - info.property_end);
+      memmove(current_view.data() + info.property_begin + property_size, current_view.data() + info.property_end,
+              info.all_end - info.property_end);
+    }
+
+    // If we still started with compressed buffer
+    // take ownership of the decompressed buffer before writing
+    if (buffer_info.storage_mode == StorageMode::COMPRESSED) {
+      // remove compressed buffer
+      FreeMemory(buffer_info);
+      // take ownership of decompressed buffer
+      decompressed_buffer->release();
+      SetSizeData(buffer_, current_view.size_bytes(), current_view.data());
+      decompressed_buffer.reset();
+      buffer_info = DecodedBuffer{
+          .view = current_view,
+          .storage_mode = StorageMode::BUFFER,  // decompressed buffer is now a regular buffer
+      };
     }
 
     if (!value.IsNull()) {
       // We need to encode the new value.
-      Writer writer(data + info.property_begin, property_size);
+      Writer writer(current_view.data() + info.property_begin, property_size);
       MG_ASSERT(EncodeProperty(&writer, property, value), "Invalid database state!");
     }
 
     // We need to recreate the tombstone (if possible).
-    Writer writer(data + new_size, size - new_size);
+    Writer writer(current_view.data() + new_size, current_view.size_bytes() - new_size);
     auto metadata = writer.WriteMetadata();
     if (metadata) {
       metadata->Set({Type::EMPTY});
     }
+  }
+
+  if (FLAGS_storage_property_store_compression_enabled) {
+    CompressBuffer(buffer_, buffer_info);
   }
 
   return !existed;
@@ -1245,14 +2135,12 @@ bool PropertyStore::SetProperty(PropertyId property, const PropertyValue &value)
 
 template <typename TContainer>
 bool PropertyStore::DoInitProperties(const TContainer &properties) {
-  uint64_t size = 0;
-  uint8_t *data = nullptr;
-  std::tie(size, data) = GetSizeData(buffer_);
-  if (size != 0) {
+  auto orig_buffer_info = GetDecodedBuffer(buffer_);
+  if (orig_buffer_info.storage_mode != StorageMode::EMPTY) {
     return false;
   }
 
-  uint64_t property_size = 0;
+  uint32_t property_size = 0;
   {
     Writer writer;
     for (const auto &[property, value] : properties) {
@@ -1264,25 +2152,11 @@ bool PropertyStore::DoInitProperties(const TContainer &properties) {
     }
   }
 
-  auto property_size_to_power_of_8 = ToPowerOf8(property_size);
-  if (property_size <= sizeof(buffer_) - 1) {
-    // Use the local buffer.
-    buffer_[0] = kUseLocalBuffer;
-    size = sizeof(buffer_) - 1;
-    data = &buffer_[1];
-  } else {
-    // Allocate a new external buffer.
-    auto *alloc_data = new uint8_t[property_size_to_power_of_8];
-    auto alloc_size = property_size_to_power_of_8;
-
-    SetSizeData(buffer_, alloc_size, alloc_data);
-
-    size = alloc_size;
-    data = alloc_data;
-  }
+  auto buffer_info = SetupBuffer(buffer_, property_size);
+  auto view = buffer_info.view;
 
   // Encode the property into the data buffer.
-  Writer writer(data, size);
+  Writer writer(view.data(), view.size_bytes());
 
   for (const auto &[property, value] : properties) {
     if (value.IsNull()) {
@@ -1299,6 +2173,15 @@ bool PropertyStore::DoInitProperties(const TContainer &properties) {
     metadata->Set({Type::EMPTY});
   }
 
+  // Make buffer perminant
+  if (buffer_info.storage_mode == StorageMode::BUFFER) {
+    SetSizeData(buffer_, view.size_bytes(), view.data());
+  }
+
+  if (FLAGS_storage_property_store_compression_enabled) {
+    CompressBuffer(buffer_, buffer_info);
+  }
+
   return true;
 }
 
@@ -1311,7 +2194,7 @@ std::vector<std::tuple<PropertyId, PropertyValue, PropertyValue>> PropertyStore:
   id_old_new_change.reserve(properties.size() + old_properties.size());
   for (const auto &[prop_id, new_value] : properties) {
     if (!old_properties.contains(prop_id)) {
-      id_old_new_change.emplace_back(std::make_tuple(prop_id, PropertyValue(), new_value));
+      id_old_new_change.emplace_back(prop_id, PropertyValue(), new_value);
     }
   }
 
@@ -1319,7 +2202,7 @@ std::vector<std::tuple<PropertyId, PropertyValue, PropertyValue>> PropertyStore:
     auto [it, inserted] = properties.emplace(old_key, old_value);
     if (!inserted) {
       auto &new_value = it->second;
-      id_old_new_change.emplace_back(std::make_tuple(it->first, old_value, new_value));
+      id_old_new_change.emplace_back(it->first, old_value, new_value);
     }
   }
 
@@ -1343,35 +2226,18 @@ bool PropertyStore::InitProperties(std::vector<std::pair<storage::PropertyId, st
 }
 
 bool PropertyStore::ClearProperties() {
-  bool in_local_buffer = false;
-  uint64_t size;
-  uint8_t *data;
-  std::tie(size, data) = GetSizeData(buffer_);
-  if (size % 8 != 0) {
-    // We are storing the data in the local buffer.
-    size = sizeof(buffer_) - 1;
-    data = &buffer_[1];
-    in_local_buffer = true;
-  }
-  if (!size) return false;
-  if (!in_local_buffer) delete[] data;
+  auto buffer_info = GetDecodedBuffer(buffer_);
+
+  if (buffer_info.storage_mode == StorageMode::EMPTY) return false;
+  FreeMemory(buffer_info);
   SetSizeData(buffer_, 0, nullptr);
+
   return true;
 }
 
 std::string PropertyStore::StringBuffer() const {
-  uint64_t size = 0;
-  const uint8_t *data = nullptr;
-  std::tie(size, data) = GetSizeData(buffer_);
-  if (size % 8 != 0) {  // We are storing the data in the local buffer.
-    size = sizeof(buffer_) - 1;
-    data = &buffer_[1];
-  }
-  std::string arr(size, ' ');
-  for (uint i = 0; i < size; ++i) {
-    arr[i] = static_cast<char>(data[i]);
-  }
-  return arr;
+  auto buffer_info = GetDecodedBuffer(buffer_);
+  return {buffer_info.view.begin(), buffer_info.view.end()};
 }
 
 void PropertyStore::SetBuffer(const std::string_view buffer) {
@@ -1379,20 +2245,94 @@ void PropertyStore::SetBuffer(const std::string_view buffer) {
     return;
   }
 
-  uint64_t size = 0;
-  uint8_t *data = nullptr;
-  size = buffer.size();
-  if (buffer.size() == sizeof(buffer_) - 1) {  // use local buffer
-    buffer_[0] = kUseLocalBuffer;
-    data = &buffer_[1];
-  } else {
-    data = new uint8_t[size];
-    SetSizeData(buffer_, size, data);
-  }
+  auto size = buffer.size();
+  auto buffer_info = SetupBuffer(buffer_, size);
+  auto view = buffer_info.view;
 
   for (uint i = 0; i < size; ++i) {
-    data[i] = static_cast<uint8_t>(buffer[i]);
+    view[i] = static_cast<uint8_t>(buffer[i]);
   }
+
+  // Make buffer perminant
+  if (buffer_info.storage_mode == StorageMode::BUFFER) {
+    SetSizeData(buffer_, view.size_bytes(), view.data());
+  }
+}
+
+std::vector<PropertyId> PropertyStore::PropertiesOfTypes(std::span<Type const> types) const {
+  auto get_properties = [&](Reader &reader) {
+    std::vector<PropertyId> props;
+    while (true) {
+      auto metadata = reader.ReadMetadata();
+      if (!metadata || metadata->type == Type::EMPTY) break;
+
+      auto property_id = reader.ReadUint(metadata->id_size);
+      if (!property_id) break;
+
+      if (utils::Contains(types, metadata->type)) {
+        props.emplace_back(PropertyId::FromUint(*property_id));
+      }
+
+      if (!SkipPropertyValue(&reader, metadata->type, metadata->payload_size)) break;
+    }
+    return props;
+  };
+  return WithReader(get_properties);
+}
+
+std::optional<PropertyValue> PropertyStore::GetPropertyOfTypes(PropertyId property, std::span<Type const> types) const {
+  auto get_properties = [&](Reader &reader) -> std::optional<PropertyValue> {
+    PropertyValue value;
+    while (true) {
+      auto metadata = reader.ReadMetadata();
+      if (!metadata || metadata->type == Type::EMPTY) {
+        return std::nullopt;
+      }
+
+      auto property_id = reader.ReadUint(metadata->id_size);
+      if (!property_id) {
+        return std::nullopt;
+      }
+
+      // found property
+      if (*property_id == property.AsUint()) {
+        // check its the type we are looking for
+        if (!utils::Contains(types, metadata->type)) {
+          return std::nullopt;
+        }
+        if (!DecodePropertyValue(&reader, metadata->type, metadata->payload_size, value)) {
+          return std::nullopt;
+        }
+
+        return value;
+      }
+      // Don't load the value if this isn't the expected property.
+      if (!SkipPropertyValue(&reader, metadata->type, metadata->payload_size)) {
+        return std::nullopt;
+      }
+      if (*property_id > property.AsUint()) return std::nullopt;
+    }
+    return std::nullopt;
+  };
+
+  return WithReader(get_properties);
+}
+
+auto PropertyStore::PropertiesMatchTypes(TypeConstraintsValidator const &constraint) const
+    -> std::optional<PropertyStoreConstraintViolation> {
+  if (constraint.empty()) return std::nullopt;
+
+  auto property_matches_types = [&](Reader &reader) -> std::optional<PropertyStoreConstraintViolation> {
+    while (true) {
+      auto res = NextPropertyAndType(&reader);
+      if (!res) return std::nullopt;  // No more properties to read
+
+      if (auto violation = constraint.validate(*res); violation) {
+        return violation;
+      }
+    }
+  };
+  return WithReader(property_matches_types);
 }
 
 }  // namespace memgraph::storage

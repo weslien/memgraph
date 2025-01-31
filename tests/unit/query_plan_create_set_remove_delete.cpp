@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -38,6 +38,7 @@
 
 using namespace memgraph::query;
 using namespace memgraph::query::plan;
+using memgraph::replication_coordination_glue::ReplicationRole;
 
 template <typename StorageType>
 class QueryPlanTest : public testing::Test {
@@ -55,7 +56,7 @@ class QueryPlanTest : public testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(QueryPlanTest, StorageTypes);
+TYPED_TEST_SUITE(QueryPlanTest, StorageTypes);
 
 TYPED_TEST(QueryPlanTest, CreateNodeWithAttributes) {
   auto storage_dba = this->db->Access();
@@ -360,7 +361,7 @@ class CreateExpandWithAuthFixture : public QueryPlanTest<StorageType> {
   }
 };
 
-TYPED_TEST_CASE(CreateExpandWithAuthFixture, StorageTypes);
+TYPED_TEST_SUITE(CreateExpandWithAuthFixture, StorageTypes);
 
 TYPED_TEST(CreateExpandWithAuthFixture, CreateExpandWithNoGrantsOnCreateDelete) {
   // All labels denied, All edge types denied
@@ -496,7 +497,7 @@ class MatchCreateNodeWithAuthFixture : public QueryPlanTest<StorageType> {
     NodeCreationInfo m{};
 
     m.symbol = symbol_table.CreateSymbol("m", true);
-    std::vector<memgraph::storage::LabelId> labels{dba.NameToLabel("l2")};
+    std::vector<StorageLabelType> labels{dba.NameToLabel("l2")};
     m.labels = labels;
     // creation op
     auto create_node = std::make_shared<CreateNode>(n_scan_all.op_, m);
@@ -518,7 +519,7 @@ class MatchCreateNodeWithAuthFixture : public QueryPlanTest<StorageType> {
   }
 };
 
-TYPED_TEST_CASE(MatchCreateNodeWithAuthFixture, StorageTypes);
+TYPED_TEST_SUITE(MatchCreateNodeWithAuthFixture, StorageTypes);
 
 TYPED_TEST(MatchCreateNodeWithAuthFixture, MatchCreateWithAllLabelsDeniedThrows) {
   // All labels denied
@@ -626,7 +627,7 @@ class MatchCreateExpandWithAuthFixture : public QueryPlanTest<StorageType> {
     // data for the second node
     NodeCreationInfo m;
     m.symbol = cycle ? n_scan_all.sym_ : symbol_table.CreateSymbol("m", true);
-    std::vector<memgraph::storage::LabelId> labels{dba.NameToLabel("l2")};
+    std::vector<StorageLabelType> labels{dba.NameToLabel("l2")};
     m.labels = labels;
 
     EdgeCreationInfo r;
@@ -655,7 +656,7 @@ class MatchCreateExpandWithAuthFixture : public QueryPlanTest<StorageType> {
   }
 };
 
-TYPED_TEST_CASE(MatchCreateExpandWithAuthFixture, StorageTypes);
+TYPED_TEST_SUITE(MatchCreateExpandWithAuthFixture, StorageTypes);
 
 TYPED_TEST(MatchCreateExpandWithAuthFixture, MatchCreateExpandThrowsWhenDeniedEverything) {
   // All labels denied, All edge types denied
@@ -895,7 +896,7 @@ class DeleteOperatorWithAuthFixture : public QueryPlanTest<StorageType> {
   }
 };
 
-TYPED_TEST_CASE(DeleteOperatorWithAuthFixture, StorageTypes);
+TYPED_TEST_SUITE(DeleteOperatorWithAuthFixture, StorageTypes);
 
 TYPED_TEST(DeleteOperatorWithAuthFixture, DeleteNodeThrowsExceptionWhenAllLabelsDenied) {
   // All labels denied
@@ -1230,12 +1231,14 @@ TYPED_TEST(QueryPlanTest, SetLabels) {
   ASSERT_TRUE(dba.InsertVertex().AddLabel(label1).HasValue());
   ASSERT_TRUE(dba.InsertVertex().AddLabel(label1).HasValue());
   dba.AdvanceCommand();
+  std::vector<StorageLabelType> labels;
+  labels.emplace_back(label2);
+  labels.emplace_back(label3);
 
   SymbolTable symbol_table;
 
   auto n = MakeScanAll(this->storage, symbol_table, "n");
-  auto label_set =
-      std::make_shared<plan::SetLabels>(n.op_, n.sym_, std::vector<memgraph::storage::LabelId>{label2, label3});
+  auto label_set = std::make_shared<plan::SetLabels>(n.op_, n.sym_, labels);
   auto context = MakeContext(this->storage, symbol_table, &dba);
   EXPECT_EQ(2, PullAll(*label_set, &context));
 
@@ -1254,12 +1257,14 @@ TYPED_TEST(QueryPlanTest, SetLabelsWithFineGrained) {
     ASSERT_TRUE(dba.InsertVertex().AddLabel(labels[0]).HasValue());
     ASSERT_TRUE(dba.InsertVertex().AddLabel(labels[0]).HasValue());
     dba.AdvanceCommand();
+    std::vector<StorageLabelType> labels_variant;
+    labels_variant.emplace_back(labels[1]);
+    labels_variant.emplace_back(labels[2]);
 
     SymbolTable symbol_table;
 
     auto n = MakeScanAll(this->storage, symbol_table, "n");
-    auto label_set =
-        std::make_shared<plan::SetLabels>(n.op_, n.sym_, std::vector<memgraph::storage::LabelId>{labels[1], labels[2]});
+    auto label_set = std::make_shared<plan::SetLabels>(n.op_, n.sym_, labels_variant);
     memgraph::glue::FineGrainedAuthChecker auth_checker{user, &dba};
     auto context = MakeContextWithFineGrainedChecker(this->storage, symbol_table, &dba, &auth_checker);
 
@@ -1395,12 +1400,14 @@ TYPED_TEST(QueryPlanTest, RemoveLabels) {
   ASSERT_TRUE(v2.AddLabel(label1).HasValue());
   ASSERT_TRUE(v2.AddLabel(label3).HasValue());
   dba.AdvanceCommand();
+  std::vector<StorageLabelType> labels;
+  labels.emplace_back(label1);
+  labels.emplace_back(label2);
 
   SymbolTable symbol_table;
 
   auto n = MakeScanAll(this->storage, symbol_table, "n");
-  auto label_remove =
-      std::make_shared<plan::RemoveLabels>(n.op_, n.sym_, std::vector<memgraph::storage::LabelId>{label1, label2});
+  auto label_remove = std::make_shared<plan::RemoveLabels>(n.op_, n.sym_, labels);
   auto context = MakeContext(this->storage, symbol_table, &dba);
   EXPECT_EQ(2, PullAll(*label_remove, &context));
 
@@ -1424,12 +1431,14 @@ TYPED_TEST(QueryPlanTest, RemoveLabelsFineGrainedFiltering) {
     ASSERT_TRUE(v2.AddLabel(labels[0]).HasValue());
     ASSERT_TRUE(v2.AddLabel(labels[2]).HasValue());
     dba.AdvanceCommand();
+    std::vector<StorageLabelType> labels_variant;
+    labels_variant.emplace_back(labels[0]);
+    labels_variant.emplace_back(labels[1]);
 
     SymbolTable symbol_table;
 
     auto n = MakeScanAll(this->storage, symbol_table, "n");
-    auto label_remove = std::make_shared<plan::RemoveLabels>(
-        n.op_, n.sym_, std::vector<memgraph::storage::LabelId>{labels[0], labels[1]});
+    auto label_remove = std::make_shared<plan::RemoveLabels>(n.op_, n.sym_, labels_variant);
     memgraph::glue::FineGrainedAuthChecker auth_checker{user, &dba};
 
     auto context = MakeContextWithFineGrainedChecker(this->storage, symbol_table, &dba, &auth_checker);
@@ -1568,15 +1577,16 @@ TYPED_TEST(QueryPlanTest, SetRemove) {
   auto label1 = dba.NameToLabel("label1");
   auto label2 = dba.NameToLabel("label2");
   dba.AdvanceCommand();
+  std::vector<StorageLabelType> labels;
+  labels.emplace_back(label1);
+  labels.emplace_back(label2);
   // Create operations which match (v) and set and remove v :label.
   // The expected result is single (v) as it was at the start.
   SymbolTable symbol_table;
   // MATCH (n) SET n :label1 :label2 REMOVE n :label1 :label2
   auto scan_all = MakeScanAll(this->storage, symbol_table, "n");
-  auto set = std::make_shared<plan::SetLabels>(scan_all.op_, scan_all.sym_,
-                                               std::vector<memgraph::storage::LabelId>{label1, label2});
-  auto rem =
-      std::make_shared<plan::RemoveLabels>(set, scan_all.sym_, std::vector<memgraph::storage::LabelId>{label1, label2});
+  auto set = std::make_shared<plan::SetLabels>(scan_all.op_, scan_all.sym_, labels);
+  auto rem = std::make_shared<plan::RemoveLabels>(set, scan_all.sym_, labels);
   auto context = MakeContext(this->storage, symbol_table, &dba);
   EXPECT_EQ(1, PullAll(*rem, &context));
   dba.AdvanceCommand();
@@ -1772,10 +1782,12 @@ TYPED_TEST(QueryPlanTest, SetLabelsOnNull) {
   auto storage_dba = this->db->Access();
   memgraph::query::DbAccessor dba(storage_dba.get());
   auto label = dba.NameToLabel("label");
+  std::vector<StorageLabelType> labels;
+  labels.emplace_back(label);
   SymbolTable symbol_table;
   auto n = MakeScanAll(this->storage, symbol_table, "n");
   auto optional = std::make_shared<plan::Optional>(nullptr, n.op_, std::vector<Symbol>{n.sym_});
-  auto set_op = std::make_shared<plan::SetLabels>(optional, n.sym_, std::vector<memgraph::storage::LabelId>{label});
+  auto set_op = std::make_shared<plan::SetLabels>(optional, n.sym_, labels);
   EXPECT_EQ(0, CountIterable(dba.Vertices(memgraph::storage::View::OLD)));
   auto context = MakeContext(this->storage, symbol_table, &dba);
   EXPECT_EQ(1, PullAll(*set_op, &context));
@@ -1800,11 +1812,12 @@ TYPED_TEST(QueryPlanTest, RemoveLabelsOnNull) {
   auto storage_dba = this->db->Access();
   memgraph::query::DbAccessor dba(storage_dba.get());
   auto label = dba.NameToLabel("label");
+  std::vector<StorageLabelType> labels;
+  labels.emplace_back(label);
   SymbolTable symbol_table;
   auto n = MakeScanAll(this->storage, symbol_table, "n");
   auto optional = std::make_shared<plan::Optional>(nullptr, n.op_, std::vector<Symbol>{n.sym_});
-  auto remove_op =
-      std::make_shared<plan::RemoveLabels>(optional, n.sym_, std::vector<memgraph::storage::LabelId>{label});
+  auto remove_op = std::make_shared<plan::RemoveLabels>(optional, n.sym_, labels);
   EXPECT_EQ(0, CountIterable(dba.Vertices(memgraph::storage::View::OLD)));
   auto context = MakeContext(this->storage, symbol_table, &dba);
   EXPECT_EQ(1, PullAll(*remove_op, &context));
@@ -1905,7 +1918,7 @@ TYPED_TEST(QueryPlanTest, DeleteRemoveLabels) {
   auto n = MakeScanAll(this->storage, symbol_table, "n");
   auto n_get = this->storage.template Create<Identifier>("n")->MapTo(n.sym_);
   auto delete_op = std::make_shared<plan::Delete>(n.op_, std::vector<Expression *>{n_get}, false);
-  std::vector<memgraph::storage::LabelId> labels{dba.NameToLabel("label")};
+  std::vector<StorageLabelType> labels{dba.NameToLabel("label")};
   auto rem_op = std::make_shared<plan::RemoveLabels>(delete_op, n.sym_, labels);
   auto accumulate_op = std::make_shared<plan::Accumulate>(rem_op, rem_op->ModifiedSymbols(symbol_table), true);
 
@@ -2099,7 +2112,7 @@ class UpdatePropertiesWithAuthFixture : public QueryPlanTest<StorageType> {
   };
 };
 
-TYPED_TEST_CASE(UpdatePropertiesWithAuthFixture, StorageTypes);
+TYPED_TEST_SUITE(UpdatePropertiesWithAuthFixture, StorageTypes);
 
 TYPED_TEST(UpdatePropertiesWithAuthFixture, SetPropertyWithAuthChecker) {
   // Add a single vertex
@@ -2626,7 +2639,7 @@ class DynamicExpandFixture : public testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(DynamicExpandFixture, StorageTypes);
+TYPED_TEST_SUITE(DynamicExpandFixture, StorageTypes);
 
 TYPED_TEST(DynamicExpandFixture, Expand) {
   using ExpandCursor = memgraph::query::plan::Expand::ExpandCursor;

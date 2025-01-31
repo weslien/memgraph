@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -14,6 +14,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "communication/bolt/v1/codes.hpp"
@@ -34,8 +35,8 @@ class FailureResponseException : public utils::BasicException {
 
   explicit FailureResponseException(const std::string &message) : utils::BasicException{message} {}
 
-  FailureResponseException(const std::string &code, const std::string &message)
-      : utils::BasicException{message}, code_{code} {}
+  FailureResponseException(std::string code, const std::string &message)
+      : utils::BasicException{message}, code_{std::move(code)} {}
 
   const std::string &code() const { return code_; }
   SPECIALIZE_GET_EXCEPTION_NAME(FailureResponseException)
@@ -82,7 +83,7 @@ class ServerMalformedDataException : public ClientFatalException {
 struct QueryData {
   std::vector<std::string> fields;
   std::vector<std::vector<Value>> records;
-  std::map<std::string, Value> metadata;
+  map_t metadata;
 };
 
 /// Bolt client.
@@ -112,7 +113,7 @@ class Client final {
   ///                              executing the query (eg. mistyped query,
   ///                              etc.)
   /// @throws ClientFatalException when we couldn't communicate with the server
-  QueryData Execute(const std::string &query, const std::map<std::string, Value> &parameters);
+  QueryData Execute(const std::string &query, const map_t &parameters);
 
   /// Close the active client connection.
   void Close();
@@ -122,15 +123,14 @@ class Client final {
   void Reset();
 
   /// Can be used to send a route message.
-  std::optional<std::map<std::string, Value>> Route(const std::map<std::string, Value> &routing,
-                                                    const std::vector<Value> &bookmarks,
-                                                    const std::optional<std::string> &db);
+  std::optional<map_t> Route(const map_t &routing, const std::vector<Value> &bookmarks,
+                             const std::optional<std::string> &db);
 
  private:
   using ClientEncoder = ClientEncoder<ChunkedEncoderBuffer<communication::ClientOutputStream>>;
 
   template <typename TException = FailureResponseException>
-  [[noreturn]] void HandleFailure(const std::map<std::string, Value> &response_map) {
+  [[noreturn]] void HandleFailure(const map_t &response_map) {
     Reset();
     auto it = response_map.find("message");
     if (it != response_map.end()) {

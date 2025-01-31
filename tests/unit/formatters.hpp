@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -83,6 +83,13 @@ inline std::string ToString(const memgraph::utils::LocalDateTime) { return ""; }
 
 inline std::string ToString(const memgraph::utils::Duration) { return ""; }
 
+// TODO: formatting of enum and points
+inline std::string ToString(const memgraph::storage::Enum) { return ""; }
+inline std::string ToString(const memgraph::storage::Point2d) { return ""; }
+inline std::string ToString(const memgraph::storage::Point3d) { return ""; }
+
+inline std::string ToString(const memgraph::utils::ZonedDateTime &zdt) { return zdt.ToString(); }
+
 template <class TAccessor>
 inline std::string ToString(const memgraph::query::TypedValue &value, const TAccessor &acc) {
   std::ostringstream os;
@@ -136,8 +143,22 @@ inline std::string ToString(const memgraph::query::TypedValue &value, const TAcc
     case memgraph::query::TypedValue::Type::Duration:
       os << ToString(value.ValueDuration());
       break;
+    case memgraph::query::TypedValue::Type::Enum:
+      os << ToString(value.ValueEnum());
+      break;
+    case memgraph::query::TypedValue::Type::ZonedDateTime:
+      os << ToString(value.ValueZonedDateTime());
+      break;
     case memgraph::query::TypedValue::Type::Graph:
       throw std::logic_error{"Not implemented"};
+    case memgraph::query::TypedValue::Type::Function:
+      throw std::logic_error{"Not implemented"};
+    case memgraph::query::TypedValue::Type::Point2d:
+      os << ToString(value.ValuePoint2d());
+      break;
+    case memgraph::query::TypedValue::Type::Point3d:
+      os << ToString(value.ValuePoint3d());
+      break;
   }
   return os.str();
 }

@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,12 +11,12 @@
 
 #include "general.hpp"
 
-#include "glue/auth_global.hpp"
 #include "storage/v2/config.hpp"
 #include "utils/file.hpp"
 #include "utils/flag_validation.hpp"
 #include "utils/string.hpp"
 
+#include <iostream>
 #include <thread>
 
 // Short help flag.
@@ -51,7 +51,7 @@ DEFINE_string(init_data_file, "", "Path to cypherl file that is used for creatin
 DEFINE_string(data_directory, "mg_data", "Path to directory in which to save all permanent data.");
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-DEFINE_bool(data_recovery_on_startup, false, "Controls whether the database recovers persisted data on startup.");
+DEFINE_bool(data_recovery_on_startup, true, "Controls whether the database recovers persisted data on startup.");
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 DEFINE_uint64(memory_warning_threshold, 1024,
@@ -65,21 +65,15 @@ DEFINE_bool(allow_load_csv, true, "Controls whether LOAD CSV clause is allowed i
 // Storage flags.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 DEFINE_VALIDATED_uint64(storage_gc_cycle_sec, 30, "Storage garbage collector interval (in seconds).",
-                        FLAG_IN_RANGE(1, 24 * 3600));
+                        FLAG_IN_RANGE(1, 24UL * 3600));
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+DEFINE_VALIDATED_uint64(storage_python_gc_cycle_sec, 180,
+                        "Storage python full garbage collection interval (in seconds).", FLAG_IN_RANGE(1, 24UL * 3600));
 // NOTE: The `storage_properties_on_edges` flag must be the same here and in
 // `mg_import_csv`. If you change it, make sure to change it there as well.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 DEFINE_bool(storage_properties_on_edges, false, "Controls whether edges have properties.");
 
-// storage_recover_on_startup deprecated; use data_recovery_on_startup instead
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-DEFINE_HIDDEN_bool(storage_recover_on_startup, false,
-                   "Controls whether the storage recovers persisted data on startup.");
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-DEFINE_VALIDATED_uint64(storage_snapshot_interval_sec, 0,
-                        "Storage snapshot creation interval (in seconds). Set "
-                        "to 0 to disable periodic snapshot creation.",
-                        FLAG_IN_RANGE(0, 7 * 24 * 3600));
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 DEFINE_bool(storage_wal_enabled, false,
             "Controls whether the storage uses write-ahead-logging. To enable "
@@ -104,9 +98,19 @@ DEFINE_bool(storage_snapshot_on_exit, false, "Controls whether the storage creat
 DEFINE_uint64(storage_items_per_batch, memgraph::storage::Config::Durability().items_per_batch,
               "The number of edges and vertices stored in a batch in a snapshot file.");
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables,misc-unused-parameters)
+DEFINE_VALIDATED_bool(
+    storage_parallel_index_recovery, false,
+    "Controls whether the index creation can be done in a multithreaded fashion.", {
+      spdlog::warn(
+          "storage_parallel_index_recovery flag is deprecated. Check storage_mode_parallel_schema_recovery for more "
+          "details.");
+      return true;
+    });
+
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-DEFINE_bool(storage_parallel_index_recovery, false,
-            "Controls whether the index creation can be done in a multithreaded fashion.");
+DEFINE_bool(storage_parallel_schema_recovery, false,
+            "Controls whether the indices and constraints creation can be done in a multithreaded fashion.");
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 DEFINE_uint64(storage_recovery_thread_count,
@@ -114,11 +118,27 @@ DEFINE_uint64(storage_recovery_thread_count,
                        memgraph::storage::Config::Durability().recovery_thread_count),
               "The number of threads used to recover persisted data from disk.");
 
-#ifdef MG_ENTERPRISE
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-DEFINE_bool(storage_delete_on_drop, true,
-            "If set to true the query 'DROP DATABASE x' will delete the underlying storage as well.");
-#endif
+DEFINE_bool(storage_enable_schema_metadata, false,
+            "Controls whether metadata should be collected about the resident labels and edge types.");
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+DEFINE_bool(storage_automatic_label_index_creation_enabled, false,
+            "Controls whether label indexes on vertices should be created automatically.");
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+DEFINE_bool(storage_automatic_edge_type_index_creation_enabled, false,
+            "Controls whether edge-type indexes on relationships should be created automatically.");
+DEFINE_bool(storage_enable_edges_metadata, false,
+            "Controls whether additional metadata should be stored about the edges in order to do faster traversals on "
+            "certain queries.");
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+DEFINE_bool(storage_delta_on_identical_property_update, true,
+            "Controls whether updating a property with the same value should create a delta object.");
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+DEFINE_bool(schema_info_enabled, false, "Set to true to enable run-time schema info tracking.");
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 DEFINE_bool(telemetry_enabled, false,
@@ -144,13 +164,6 @@ DEFINE_string(kafka_bootstrap_servers, "",
 DEFINE_string(pulsar_service_url, "", "Default URL used while connecting to Pulsar brokers.");
 
 // Query flags.
-
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-DEFINE_uint64(replication_replica_check_frequency_sec, 1,
-              "The time duration between two replica checks/pings. If < 1, replicas will NOT be checked at all. NOTE: "
-              "The MAIN instance allocates a new thread for each REPLICA.");
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-DEFINE_bool(replication_restore_state_on_startup, false, "Restore replication state on startup, e.g. recover replica");
 
 DEFINE_VALIDATED_string(query_modules_directory, "",
                         "Directory where modules with custom query procedures are stored. "
@@ -188,6 +201,3 @@ DEFINE_string(query_callable_mappings_path, "",
 DEFINE_HIDDEN_string(license_key, "", "License key for Memgraph Enterprise.");
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 DEFINE_HIDDEN_string(organization_name, "", "Organization name.");
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-DEFINE_string(auth_user_or_role_name_regex, memgraph::glue::kDefaultUserRoleRegex.data(),
-              "Set to the regular expression that each user or role name must fulfill.");

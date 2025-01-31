@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -34,7 +34,7 @@ namespace memgraph::communication {
 class Buffer final {
  private:
   // Initial capacity of the internal buffer.
-  const size_t kBufferInitialSize = 65536;
+  static constexpr size_t kBufferInitialSize = 65'536;
 
  public:
   Buffer();
@@ -68,6 +68,8 @@ class Buffer final {
     void Resize(size_t len);
 
     void Clear();
+
+    void ShrinkBuffer(size_t size);
 
    private:
     Buffer *buffer_;
@@ -104,12 +106,14 @@ class Buffer final {
    * buffer.
    */
   ReadEnd *read_end();
+  const ReadEnd *read_end() const;
 
   /**
    * This function returns a pointer to the associated WriteEnd object for
    * this buffer.
    */
   WriteEnd *write_end();
+  const WriteEnd *write_end() const;
 
  private:
   /**
@@ -168,6 +172,12 @@ class Buffer final {
    * space.
    */
   void Clear();
+
+  /**
+   * This method resizes the internal data buffer.
+   * It can only shrink the buffer to the larger of size and len
+   */
+  void ShrinkBuffer(size_t new_size);
 
   std::vector<uint8_t> data_;
   size_t have_{0};

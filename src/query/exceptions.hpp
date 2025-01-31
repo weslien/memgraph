@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -109,6 +109,21 @@ class IndexInMulticommandTxException : public QueryException {
   SPECIALIZE_GET_EXCEPTION_NAME(IndexInMulticommandTxException)
 };
 
+class EdgeIndexDisabledPropertiesOnEdgesException : public QueryException {
+ public:
+  using QueryException::QueryException;
+  EdgeIndexDisabledPropertiesOnEdgesException()
+      : QueryException("Edge indices are allowed only if properties are allowed on edges.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(EdgeIndexDisabledPropertiesOnEdgesException)
+};
+
+class SchemaAssertInMulticommandTxException : public QueryException {
+ public:
+  using QueryException::QueryException;
+  SchemaAssertInMulticommandTxException() : QueryException("SCHEMA.ASSERT not allowed in multicommand transactions.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(SchemaAssertInMulticommandTxException)
+};
+
 class ConstraintInMulticommandTxException : public QueryException {
  public:
   using QueryException::QueryException;
@@ -124,6 +139,12 @@ class InfoInMulticommandTxException : public QueryException {
   using QueryException::QueryException;
   InfoInMulticommandTxException() : QueryException("Info reporting not allowed in multicommand transactions.") {}
   SPECIALIZE_GET_EXCEPTION_NAME(InfoInMulticommandTxException)
+};
+
+class UserAlreadyExistsException : public QueryException {
+ public:
+  using QueryException::QueryException;
+  SPECIALIZE_GET_EXCEPTION_NAME(UserAlreadyExistsException)
 };
 
 /**
@@ -189,6 +210,12 @@ class DatabaseContextRequiredException : public QueryRuntimeException {
   SPECIALIZE_GET_EXCEPTION_NAME(DatabaseContextRequiredException)
 };
 
+class ConcurrentSystemQueriesException : public QueryRuntimeException {
+ public:
+  using QueryRuntimeException::QueryRuntimeException;
+  SPECIALIZE_GET_EXCEPTION_NAME(ConcurrentSystemQueriesException)
+};
+
 class WriteVertexOperationInEdgeImportModeException : public QueryException {
  public:
   WriteVertexOperationInEdgeImportModeException()
@@ -245,6 +272,13 @@ class ReplicationModificationInMulticommandTxException : public QueryException {
   ReplicationModificationInMulticommandTxException()
       : QueryException("Replication clause not allowed in multicommand transactions.") {}
   SPECIALIZE_GET_EXCEPTION_NAME(ReplicationModificationInMulticommandTxException)
+};
+
+class CoordinatorModificationInMulticommandTxException : public QueryException {
+ public:
+  CoordinatorModificationInMulticommandTxException()
+      : QueryException("Coordinator clause not allowed in multicommand transactions.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(CoordinatorModificationInMulticommandTxException)
 };
 
 class ReplicationDisabledOnDiskStorage : public QueryException {
@@ -351,6 +385,32 @@ class CreateSnapshotDisabledOnDiskStorage final : public QueryException {
   SPECIALIZE_GET_EXCEPTION_NAME(CreateSnapshotDisabledOnDiskStorage)
 };
 
+class RecoverSnapshotInMulticommandTxException final : public QueryException {
+ public:
+  RecoverSnapshotInMulticommandTxException()
+      : QueryException("Snapshot cannot be recovered in multicommand transactions.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(RecoverSnapshotInMulticommandTxException)
+};
+
+class RecoverSnapshotDisabledOnDiskStorage final : public QueryException {
+ public:
+  RecoverSnapshotDisabledOnDiskStorage() : QueryException("Snapshot recovery is not supported for on-disk") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(RecoverSnapshotDisabledOnDiskStorage)
+};
+
+class ShowSnapshotsInMulticommandTxException final : public QueryException {
+ public:
+  ShowSnapshotsInMulticommandTxException()
+      : QueryException("SHOW SNAPSHOTS not allowed in multicommand transactions.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(ShowSnapshotsInMulticommandTxException)
+};
+
+class ShowSnapshotsDisabledOnDiskStorage final : public QueryException {
+ public:
+  ShowSnapshotsDisabledOnDiskStorage() : QueryException("SHOW SNAPSHOTS is not supported for on-disk") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(ShowSnapshotsDisabledOnDiskStorage)
+};
+
 class EdgeImportModeQueryDisabledOnDiskStorage final : public QueryException {
  public:
   EdgeImportModeQueryDisabledOnDiskStorage()
@@ -388,6 +448,20 @@ class ReplicationException : public utils::BasicException {
   SPECIALIZE_GET_EXCEPTION_NAME(ReplicationException)
 };
 
+class WriteQueryOnReplicaException : public QueryException {
+ public:
+  WriteQueryOnReplicaException() : QueryException("Write query forbidden on the replica!") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(WriteQueryOnReplicaException)
+};
+
+class WriteQueryOnMainException : public QueryException {
+ public:
+  WriteQueryOnMainException()
+      : QueryException(
+            "Write query forbidden on the main! Coordinator needs to enable writing on main by sending RPC message.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(WriteQueryOnMainException)
+};
+
 class TransactionQueueInMulticommandTxException : public QueryException {
  public:
   TransactionQueueInMulticommandTxException()
@@ -412,6 +486,58 @@ class MultiDatabaseQueryInMulticommandTxException : public QueryException {
   MultiDatabaseQueryInMulticommandTxException()
       : QueryException("Multi-database queries are not allowed in multicommand transactions.") {}
   SPECIALIZE_GET_EXCEPTION_NAME(MultiDatabaseQueryInMulticommandTxException)
+};
+
+class DropGraphInMulticommandTxException : public QueryException {
+ public:
+  DropGraphInMulticommandTxException()
+      : QueryException("Drop graph can not be executed in multicommand transactions.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(DropGraphInMulticommandTxException)
+};
+
+class TextSearchException : public QueryException {
+  using QueryException::QueryException;
+  SPECIALIZE_GET_EXCEPTION_NAME(TextSearchException)
+};
+
+class TextSearchDisabledException : public TextSearchException {
+ public:
+  TextSearchDisabledException()
+      : TextSearchException(
+            "To use text indices and text search, start Memgraph with the experimental text search feature enabled.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(TextSearchDisabledException)
+};
+
+class VectorSearchException : public QueryException {
+  using QueryException::QueryException;
+  SPECIALIZE_GET_EXCEPTION_NAME(VectorSearchException)
+};
+
+class EnumModificationInMulticommandTxException : public QueryException {
+ public:
+  EnumModificationInMulticommandTxException()
+      : QueryException("Enum creation or modifications can not be executed in multicommand transactions.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(EnumModificationInMulticommandTxException)
+};
+
+class TtlInMulticommandTxException : public QueryException {
+ public:
+  TtlInMulticommandTxException()
+      : QueryException("TTL configuration can not be executed in multicommand transactions.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(TtlInMulticommandTxException)
+};
+
+class ShowSchemaInfoOnDiskException : public QueryException {
+ public:
+  ShowSchemaInfoOnDiskException() : QueryException("Show schema info is not supported for OnDisk.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(ShowSchemaInfoOnDiskException)
+};
+
+class ShowSchemaInfoInMulticommandTxException : public QueryException {
+ public:
+  ShowSchemaInfoInMulticommandTxException()
+      : QueryException("Show schema info cannot be executed in multicommand transactions.") {}
+  SPECIALIZE_GET_EXCEPTION_NAME(ShowSchemaInfoInMulticommandTxException)
 };
 
 }  // namespace memgraph::query

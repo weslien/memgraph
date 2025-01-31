@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,15 +11,24 @@
 
 #include "utils/temporal.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <compare>
+#include <cstdint>
 #include <ctime>
+#include <format>
 #include <limits>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <variant>
 
+#include "flags/run_time_configurable.hpp"
 #include "utils/exceptions.hpp"
 #include "utils/fnv.hpp"
+
+#include <fmt/core.h>
 
 namespace memgraph::utils {
 namespace {
@@ -43,6 +52,18 @@ std::optional<T> ParseNumber(const std::string_view string, const size_t size) {
   }
 
   return value;
+}
+
+auto Params2Time(const DateParameters &date_parameters, const LocalTimeParameters &local_time_parameters) {
+  auto us_since_epoch_local = std::chrono::microseconds{Date{date_parameters}.MicrosecondsSinceEpoch() +
+                                                        LocalTime{local_time_parameters}.MicrosecondsSinceEpoch()};
+  if (const auto *tz = flags::run_time::GetTimezone(); tz) {
+    // APPLY TIMEZONE (local to UTC)
+    return tz->to_sys(
+        std::chrono::local_time<std::chrono::microseconds>(std::chrono::microseconds(us_since_epoch_local)));
+  }
+  // Fallback to UTC
+  return std::chrono::sys_time<std::chrono::microseconds>(std::chrono::microseconds(us_since_epoch_local));
 }
 
 }  // namespace
@@ -80,14 +101,22 @@ Date::Date(const DateParameters &date_parameters) {
   day = date_parameters.day;
 }
 
-Date CurrentDate() { return CurrentLocalDateTime().date; }
+Date CurrentDate() { return CurrentLocalDateTime().date(); }
 
-LocalTime CurrentLocalTime() { return CurrentLocalDateTime().local_time; }
+LocalTime CurrentLocalTime() { return CurrentLocalDateTime().local_time(); }
 
 LocalDateTime CurrentLocalDateTime() {
   namespace chrono = std::chrono;
   auto ts = chrono::time_point_cast<chrono::microseconds>(chrono::system_clock::now());
   return LocalDateTime(ts.time_since_epoch().count());
+}
+
+Timezone DefaultTimezone() { return Timezone("Etc/UTC"); }
+
+ZonedDateTime CurrentZonedDateTime() {
+  namespace chrono = std::chrono;
+  auto ts = chrono::time_point_cast<chrono::microseconds>(chrono::system_clock::now());
+  return ZonedDateTime(chrono::zoned_time{utils::DefaultTimezone(), ts});
 }
 
 namespace {
@@ -181,7 +210,7 @@ std::string Date::ToString() const {
 }
 
 size_t DateHash::operator()(const Date &date) const {
-  utils::HashCombine<uint64_t, uint64_t> hasher;
+  const utils::HashCombine<uint64_t, uint64_t> hasher;
   size_t result = hasher(0, date.year);
   result = hasher(result, date.month);
   result = hasher(result, date.day);
@@ -392,7 +421,7 @@ std::string LocalTime::ToString() const {
 }
 
 size_t LocalTimeHash::operator()(const LocalTime &local_time) const {
-  utils::HashCombine<uint64_t, uint64_t> hasher;
+  const utils::HashCombine<uint64_t, uint64_t> hasher;
   size_t result = hasher(0, local_time.hour);
   result = hasher(result, local_time.minute);
   result = hasher(result, local_time.second);
@@ -403,7 +432,7 @@ size_t LocalTimeHash::operator()(const LocalTime &local_time) const {
 
 namespace {
 inline constexpr auto *kSupportedLocalDateTimeFormatsHelpMessage = R"help(
-String representing the LocalDateTime should be in one of the following formats:
+String representing LocalDateTime should be in one of the following formats:
 
 - YYYY-MM-DDThh:mm:ss
 - YYYY-MM-DDThh:mm
@@ -436,6 +465,7 @@ It's important to note that the date and time parts should use both the correspo
 or both parts should be written in their basic forms without the separators.)help";
 
 }  // namespace
+
 std::pair<DateParameters, LocalTimeParameters> ParseLocalDateTimeParameters(std::string_view string) {
   auto t_position = string.find('T');
   if (t_position == std::string_view::npos) {
@@ -470,21 +500,43 @@ std::pair<DateParameters, LocalTimeParameters> ParseLocalDateTimeParameters(std:
   }
 }
 
-LocalDateTime::LocalDateTime(const int64_t microseconds) {
-  auto chrono_microseconds = std::chrono::microseconds(microseconds);
-  static constexpr int64_t one_day_in_microseconds = std::chrono::microseconds{std::chrono::days{1}}.count();
-  if (microseconds < 0 && (microseconds % one_day_in_microseconds != 0)) {
-    date = Date(microseconds - one_day_in_microseconds);
-  } else {
-    date = Date(microseconds);
-  }
-  chrono_microseconds -= std::chrono::microseconds{date.MicrosecondsSinceEpoch()};
-  local_time = LocalTime(chrono_microseconds.count());
+LocalDateTime::LocalDateTime(const int64_t offset_epoch_us)
+    : us_since_epoch_(std::chrono::sys_time<std::chrono::microseconds>(std::chrono::microseconds(offset_epoch_us))) {
+  // Already UTC
 }
 
-// return microseconds normilized with regard to epoch time point
+LocalDateTime::LocalDateTime(const DateParameters &date_parameters, const LocalTimeParameters &local_time_parameters)
+    : us_since_epoch_(Params2Time(date_parameters, local_time_parameters)) {}
+
+LocalDateTime::LocalDateTime(std::tm tm)
+    : us_since_epoch_{Params2Time(DateParameters{.year = tm.tm_year + 1900, .month = tm.tm_mon + 1, .day = tm.tm_mday},
+                                  LocalTimeParameters{.hour = tm.tm_hour, .minute = tm.tm_min, .second = tm.tm_sec})} {}
+
+LocalDateTime::LocalDateTime(const Date &date, const LocalTime &local_time) {
+  auto us_since_epoch_local =
+      std::chrono::microseconds{date.MicrosecondsSinceEpoch() + local_time.MicrosecondsSinceEpoch()};
+  const auto *tz = flags::run_time::GetTimezone();
+  if (tz) {
+    // APPLY TIMEZONE (local to UTC)
+    us_since_epoch_ =
+        tz->to_sys(std::chrono::local_time<std::chrono::microseconds>(std::chrono::microseconds(us_since_epoch_local)));
+  } else {
+    // Fallback to UTC
+    us_since_epoch_ = std::chrono::sys_time<std::chrono::microseconds>(std::chrono::microseconds(us_since_epoch_local));
+  }
+}
+
+// return microseconds normalized with regard to epoch time point
+int64_t LocalDateTime::SysMicrosecondsSinceEpoch() const { return us_since_epoch_.time_since_epoch().count(); }
+
 int64_t LocalDateTime::MicrosecondsSinceEpoch() const {
-  return date.MicrosecondsSinceEpoch() + local_time.MicrosecondsSinceEpoch();
+  const auto *tz = flags::run_time::GetTimezone();
+  if (tz) {
+    // APPLY TIMEZONE (UTC to local)
+    return tz->to_local(us_since_epoch_).time_since_epoch().count();
+  }
+  // Fallback to UTC
+  return us_since_epoch_.time_since_epoch().count();
 }
 
 int64_t LocalDateTime::SecondsSinceEpoch() const {
@@ -494,23 +546,370 @@ int64_t LocalDateTime::SecondsSinceEpoch() const {
 
 int64_t LocalDateTime::SubSecondsAsNanoseconds() const {
   namespace chrono = std::chrono;
-  const auto milli_as_nanos = chrono::duration_cast<chrono::nanoseconds>(chrono::milliseconds(local_time.millisecond));
-  const auto micros_as_nanos = chrono::duration_cast<chrono::nanoseconds>(chrono::microseconds(local_time.microsecond));
-
-  return (milli_as_nanos + micros_as_nanos).count();
+  return chrono::duration_cast<chrono::nanoseconds>(chrono::microseconds(MicrosecondsSinceEpoch()) -
+                                                    chrono::seconds(SecondsSinceEpoch()))
+      .count();
 }
 
-std::string LocalDateTime::ToString() const { return date.ToString() + 'T' + local_time.ToString(); }
+// NOTE: Should be removed, but too many tests relly on it
+std::string LocalDateTime::ToString() const { return std::format("{:%Y-%m-%dT%H:%M:%S}", zoned_time()); }
+std::string LocalDateTime::ToStringWTZ() const { return std::format("{:%Y-%m-%dT%H:%M:%S%z}", zoned_time()); }
 
-LocalDateTime::LocalDateTime(const DateParameters &date_parameters, const LocalTimeParameters &local_time_parameters)
-    : date(date_parameters), local_time(local_time_parameters) {}
+Date LocalDateTime::date() const {
+  // Date does not support timezones; use calendar time offset
+  return Date{MicrosecondsSinceEpoch()};
+}
 
-LocalDateTime::LocalDateTime(const Date &date, const LocalTime &local_time) : date(date), local_time(local_time) {}
+LocalTime LocalDateTime::local_time() const {
+  // LocalTime does not support timezones; use calendar time offset
+  auto local_datetime = std::chrono::microseconds(MicrosecondsSinceEpoch());
+  /* remove everything above hours */ GetAndSubtractDuration<std::chrono::days>(local_datetime);
+  if (local_datetime.count() < 0) local_datetime += std::chrono::hours(24);
+  return LocalTime{local_datetime.count()};
+}
+
+std::chrono::zoned_time<std::chrono::microseconds> LocalDateTime::zoned_time() const {
+  const auto *tz = flags::run_time::GetTimezone();
+  if (tz) {
+    // APPLY TIMEZONE (UTC to local)
+    return {tz, us_since_epoch_};
+  }
+  return {"UTC", us_since_epoch_};  // Default to UTC
+}
+
+std::tm LocalDateTime::tm() const {
+  using namespace std::chrono_literals;
+  std::tm out;
+
+  const auto this_date = date();
+  out.tm_mday = this_date.day;
+  out.tm_mon = this_date.month - 1;     // 0 based
+  out.tm_year = this_date.year - 1900;  // Counts from 1900
+
+  const auto this_time = local_time();
+  out.tm_sec = this_time.second;
+  out.tm_min = this_time.minute;
+  out.tm_hour = this_time.hour;
+
+  const auto ztime = zoned_time();
+  const auto days = std::chrono::local_days{time_point_cast<std::chrono::days>(ztime.get_local_time())};
+  out.tm_wday = static_cast<int>(std::chrono::weekday{days}.c_encoding());
+  out.tm_yday = static_cast<int>(
+      std::chrono::duration_cast<std::chrono::days>((days - DaysSinceEpoch(this_date.year, 1, 1)).time_since_epoch())
+          .count());
+  const auto info = ztime.get_time_zone()->get_info(us_since_epoch_);
+  out.tm_isdst = info.save != 0s;
+  out.tm_gmtoff = info.offset.count();
+  out.tm_zone = ztime.get_time_zone()->name().data();
+
+  return out;
+}
 
 size_t LocalDateTimeHash::operator()(const LocalDateTime &local_date_time) const {
-  utils::HashCombine<uint64_t, uint64_t> hasher;
-  size_t result = hasher(0, LocalTimeHash{}(local_date_time.local_time));
-  result = hasher(result, DateHash{}(local_date_time.date));
+  // Use system time since it is in a fixed timezone
+  const utils::HashCombine<uint64_t, uint64_t> hasher;
+  return hasher(0, local_date_time.SysMicrosecondsSinceEpoch());
+}
+
+Timezone::Timezone(const std::chrono::minutes offset) {
+  if (std::abs(offset.count()) > MAX_OFFSET_MINUTES) {
+    throw utils::BasicException("Zone offset not in valid range: -18:00 to +18:00");
+  }
+  offset_ = offset;
+}
+
+namespace {
+inline constexpr auto *kSupportedZonedDateTimeFormatsHelpMessage = R"help(
+A string representing ZonedDateTime should have the following structure:
+
+- <DateTime><timezone>
+
+The <DateTime> substring should use one of the following formats:
+
+- YYYY-MM-DDThh:mm:ss
+- YYYY-MM-DDThh:mm
+
+or
+
+- YYYYMMDDThhmmss
+- YYYYMMDDThhmm
+- YYYYMMDDThh
+
+The <timezone> substring should use one of the following formats:
+
+- Z
+- ±hh:mm
+- ±hh:mm[ZoneName]
+- ±hhmm
+- ±hhmm[ZoneName]
+- ±hh
+- ±hh[ZoneName]
+- [ZoneName]
+
+Symbol table:
+|---|---------|
+| Y | YEAR    |
+|---|---------|
+| M | MONTH   |
+|---|---------|
+| D | DAY     |
+|---|---------|
+| h | HOURS   |
+|---|---------|
+| m | MINUTES |
+|---|---------|
+| s | SECONDS |
+|---|---------|
+| Z | UTC     |
+|---|---------|
+
+ZoneName is a standardized timezone name from the IANA time zone database, given without quote marks.
+
+Additionally, seconds can be defined as decimal fractions with 3 or 6 digits after the decimal point.
+First 3 digits represent milliseconds, while the second 3 digits represent microseconds.
+
+It's important to note that the date and time parts should use both the corresponding separators
+or both parts should be written in their basic forms without the separators.)help";
+}  // namespace
+
+Timezone ParseTimezoneFromName(std::string_view timezone_string) {
+  if (!timezone_string.starts_with('[') || !timezone_string.ends_with(']')) {
+    throw temporal::InvalidArgumentException("Timezone name is not enclosed by '[' ']'.");
+  }
+
+  auto timezone_name = timezone_string.substr(1, timezone_string.size() - 2);
+  try {
+    return Timezone{std::chrono::locate_zone(timezone_name)};
+  } catch (...) {
+    throw temporal::InvalidArgumentException("Timezone name is not in the IANA time zone database.");
+  }
+}
+
+std::pair<Timezone, uint64_t> ParseTimezoneFromOffset(std::string_view timezone_offset_string) {
+  // Supported formats:
+  //  ±hh:mm
+  //  ±hhmm
+  //  ±hh
+
+  auto compute_offset = [](const char sign, const int64_t hours, const int64_t minutes) {
+    return std::chrono::minutes{(sign == '+' ? 1 : -1) * (60 * hours + minutes)};
+  };
+
+  const auto sign = timezone_offset_string.front();
+  if (sign != '+' && sign != '-') {
+    throw temporal::InvalidArgumentException("The timezone offset starts with either a '+' sign or a '-' sign.");
+  }
+
+  timezone_offset_string.remove_prefix(1);
+
+  const auto maybe_hours = ParseNumber<int64_t>(timezone_offset_string, 2);
+  if (!maybe_hours) {
+    throw temporal::InvalidArgumentException("Invalid hour value in the timezone offset. {}",
+                                             kSupportedZonedDateTimeFormatsHelpMessage);
+  }
+  if (maybe_hours.value() > 18) {
+    throw temporal::InvalidArgumentException("Zone offset not in valid range: -18:00 to +18:00");
+  }
+  timezone_offset_string.remove_prefix(2);
+
+  if (timezone_offset_string.empty()) {
+    return {Timezone(compute_offset(sign, maybe_hours.value(), 0)), 0};
+  }
+
+  if (timezone_offset_string.starts_with('[')) {
+    return {Timezone(compute_offset(sign, maybe_hours.value(), 0)), timezone_offset_string.length()};
+  }
+
+  const bool has_colon = timezone_offset_string.starts_with(':');
+  if (has_colon) {
+    timezone_offset_string.remove_prefix(1);
+  }
+
+  if (timezone_offset_string.empty()) {
+    throw temporal::InvalidArgumentException("Invalid format for the timezone offset. {}",
+                                             kSupportedZonedDateTimeFormatsHelpMessage);
+  }
+
+  const auto maybe_minutes = ParseNumber<int64_t>(timezone_offset_string, 2);
+  if (!maybe_minutes) {
+    throw temporal::InvalidArgumentException("Invalid minute value in the timezone offset. {}",
+                                             kSupportedZonedDateTimeFormatsHelpMessage);
+  }
+  if (maybe_minutes.value() > 59) {
+    throw temporal::InvalidArgumentException(
+        "Zone offset minutes not in valid range: value is not in the range -59 to 59");
+  }
+  timezone_offset_string.remove_prefix(2);
+
+  return {Timezone(compute_offset(sign, maybe_hours.value(), maybe_minutes.value())), timezone_offset_string.length()};
+}
+
+ZonedDateTimeParameters ParseZonedDateTimeParameters(std::string_view string) {
+  // https://en.wikipedia.org/wiki/ISO_8601#Time_zone_designators
+
+  auto get_offset_sign = [](std::string_view string) {
+    const auto plus_position = string.find('+');
+    if (plus_position != std::string::npos) {
+      return plus_position;
+    }
+
+    // The '-' is the same as the hyphens in the date substring (YYYY-MM-DD), but the date substring is always
+    // right-delimited by 'T'
+    return string.find('-', string.find('T'));
+  };
+
+  auto get_timezone_designator_start_position = [&get_offset_sign](std::string_view string) {
+    const auto utc_position = string.find('Z');
+    const auto offset_sign_position = get_offset_sign(string);
+    const auto timezone_name_position = string.find('[');  // Timezone names are enclosed by '[' ']'
+
+    return std::min({utc_position, offset_sign_position, timezone_name_position});
+  };
+
+  const auto timezone_designator_start_position = get_timezone_designator_start_position(string);
+
+  if (timezone_designator_start_position == std::string::npos) {
+    throw temporal::InvalidArgumentException("Timezone is not designated.");
+  }
+
+  const std::string ldt_substring = {string.data(), timezone_designator_start_position};
+  string.remove_prefix(timezone_designator_start_position);
+
+  auto [date_parameters, local_time_parameters] = ParseLocalDateTimeParameters(ldt_substring);
+
+  if (string.empty()) {
+    throw temporal::InvalidArgumentException("Timezone is not designated.");
+  }
+
+  if (string.starts_with('Z')) {
+    if (string.length() != 1) {
+      throw temporal::InvalidArgumentException("Invalid timezone format. {}",
+                                               kSupportedZonedDateTimeFormatsHelpMessage);
+    }
+
+    return ZonedDateTimeParameters{
+        .date = date_parameters,
+        .local_time = local_time_parameters,
+        .timezone = Timezone(std::chrono::locate_zone("Etc/UTC")),
+    };
+  }
+
+  if (string.starts_with('[')) {
+    return ZonedDateTimeParameters{
+        .date = date_parameters,
+        .local_time = local_time_parameters,
+        .timezone = ParseTimezoneFromName(string),
+    };
+  }
+
+  auto [timezone_from_offset, maybe_timezone_name_length] = ParseTimezoneFromOffset(string);
+  string.remove_prefix(string.length() - maybe_timezone_name_length);
+
+  if (string.empty()) {
+    return ZonedDateTimeParameters{
+        .date = date_parameters,
+        .local_time = local_time_parameters,
+        .timezone = timezone_from_offset,
+    };
+  }
+
+  auto timezone_from_name = ParseTimezoneFromName(string);
+
+  auto unzoned_date_time = std::chrono::sys_time<std::chrono::microseconds>{
+      std::chrono::microseconds{LocalDateTime(date_parameters, local_time_parameters).MicrosecondsSinceEpoch()}};
+  if (timezone_from_name.OffsetDuration(unzoned_date_time) != timezone_from_offset.OffsetDuration(unzoned_date_time)) {
+    throw temporal::InvalidArgumentException("The number offset doesn’t match the timezone offset.");
+  }
+
+  return ZonedDateTimeParameters{
+      .date = date_parameters,
+      .local_time = local_time_parameters,
+      .timezone = timezone_from_name,
+  };
+}
+
+std::chrono::sys_time<std::chrono::microseconds> AsSysTime(int64_t microseconds) {
+  return std::chrono::sys_time<std::chrono::microseconds>{std::chrono::microseconds(microseconds)};
+}
+
+std::chrono::local_time<std::chrono::microseconds> AsLocalTime(int64_t microseconds) {
+  return std::chrono::local_time<std::chrono::microseconds>{std::chrono::microseconds(microseconds)};
+}
+
+ZonedDateTime::ZonedDateTime(const ZonedDateTimeParameters &zoned_date_time_parameters) {
+  auto timezone = zoned_date_time_parameters.timezone;
+  const std::chrono::local_time<std::chrono::microseconds> duration{std::chrono::microseconds(
+      LocalDateTime(zoned_date_time_parameters.date, zoned_date_time_parameters.local_time).MicrosecondsSinceEpoch())};
+  zoned_time = std::chrono::zoned_time(timezone, duration, std::chrono::choose::earliest);
+}
+
+ZonedDateTime::ZonedDateTime(const std::chrono::sys_time<std::chrono::microseconds> duration, const Timezone timezone) {
+  zoned_time = std::chrono::zoned_time(timezone, duration);
+}
+
+ZonedDateTime::ZonedDateTime(const std::chrono::local_time<std::chrono::microseconds> duration,
+                             const Timezone timezone) {
+  zoned_time = std::chrono::zoned_time(timezone, duration, std::chrono::choose::earliest);
+}
+
+ZonedDateTime::ZonedDateTime(const std::chrono::zoned_time<std::chrono::microseconds, Timezone> &zoned_time)
+    : zoned_time(zoned_time) {}
+
+std::chrono::sys_time<std::chrono::microseconds> ZonedDateTime::SysTimeSinceEpoch() const {
+  return zoned_time.get_sys_time();
+}
+
+std::chrono::microseconds ZonedDateTime::SysMicrosecondsSinceEpoch() const {
+  return zoned_time.get_sys_time().time_since_epoch();
+}
+
+std::chrono::seconds ZonedDateTime::SysSecondsSinceEpoch() const {
+  return std::chrono::duration_cast<std::chrono::seconds>(zoned_time.get_sys_time().time_since_epoch());
+}
+
+std::chrono::nanoseconds ZonedDateTime::SysSubSecondsAsNanoseconds() const {
+  const auto time_since_epoch = zoned_time.get_sys_time().time_since_epoch();
+  const auto full_seconds = std::chrono::duration_cast<std::chrono::seconds>(time_since_epoch);
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(time_since_epoch - full_seconds);
+}
+
+std::string ZonedDateTime::ToString() const {
+  const auto &timezone = zoned_time.get_time_zone();
+  if (timezone.InTzDatabase()) {
+    return std::format("{0:%Y}-{0:%m}-{0:%d}T{0:%H}:{0:%M}:{0:%S}{0:%Ez}[{1}]", zoned_time, timezone.TimezoneName());
+  }
+  return std::format("{0:%Y}-{0:%m}-{0:%d}T{0:%H}:{0:%M}:{0:%S}{0:%Ez}", zoned_time);
+}
+
+bool ZonedDateTime::operator==(const ZonedDateTime &other) const {
+  return SysMicrosecondsSinceEpoch().count() == other.SysMicrosecondsSinceEpoch().count() &&
+         OffsetDuration() == other.OffsetDuration() && TimezoneName() == other.TimezoneName();
+}
+
+std::strong_ordering ZonedDateTime::operator<=>(const ZonedDateTime &other) const {
+  const auto duration_ordering = SysMicrosecondsSinceEpoch() <=> other.SysMicrosecondsSinceEpoch();
+  if (duration_ordering != std::strong_ordering::equal) {
+    return duration_ordering;
+  }
+
+  const auto offset_ordering = OffsetDuration() <=> other.OffsetDuration();
+  if (offset_ordering != std::strong_ordering::equal) {
+    return offset_ordering;
+  }
+
+  const auto timezone_name_ordering = TimezoneName() <=> other.TimezoneName();
+  return timezone_name_ordering;
+}
+
+size_t ZonedDateTimeHash::operator()(const ZonedDateTime &zoned_date_time) const {
+  const utils::HashCombine<size_t, int64_t> hasher;
+  size_t result = hasher(0, zoned_date_time.SysMicrosecondsSinceEpoch().count());
+  const auto offset = zoned_date_time.GetTimezone().GetOffset();
+  if (std::holds_alternative<const std::chrono::time_zone *>(offset)) {
+    result = hasher(result, reinterpret_cast<intptr_t>(std::get<const std::chrono::time_zone *>(offset)));
+    return result;
+  }
+  result = hasher(result, std::get<std::chrono::minutes>(offset).count());
   return result;
 }
 

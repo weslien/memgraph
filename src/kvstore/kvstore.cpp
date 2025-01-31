@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -23,7 +23,7 @@ struct KVStore::impl {
   rocksdb::Options options;
 };
 
-KVStore::KVStore(std::filesystem::path storage) : pimpl_(std::make_unique<impl>()) {
+KVStore::KVStore(std::filesystem::path const &storage) : pimpl_(std::make_unique<impl>()) {
   pimpl_->storage = storage;
   if (!utils::EnsureDir(pimpl_->storage))
     throw KVStoreError("Folder for the key-value store " + pimpl_->storage.string() + " couldn't be initialized!");
@@ -37,6 +37,7 @@ KVStore::KVStore(std::filesystem::path storage) : pimpl_(std::make_unique<impl>(
 }
 
 KVStore::~KVStore() {
+  if (pimpl_ == nullptr) return;
   spdlog::debug("Destroying KVStore at {}", pimpl_->storage.string());
   const auto sync = pimpl_->db->SyncWAL();
   if (!sync.ok()) spdlog::error("KVStore sync failed!");
@@ -51,7 +52,7 @@ KVStore &KVStore::operator=(KVStore &&other) {
   return *this;
 }
 
-bool KVStore::Put(const std::string &key, const std::string &value) {
+bool KVStore::Put(std::string_view key, std::string_view value) {
   auto s = pimpl_->db->Put(rocksdb::WriteOptions(), key, value);
   return s.ok();
 }
@@ -65,7 +66,7 @@ bool KVStore::PutMultiple(const std::map<std::string, std::string> &items) {
   return s.ok();
 }
 
-std::optional<std::string> KVStore::Get(const std::string &key) const noexcept {
+std::optional<std::string> KVStore::Get(std::string_view key) const noexcept {
   std::string value;
   auto s = pimpl_->db->Get(rocksdb::ReadOptions(), key, &value);
   if (!s.ok()) return std::nullopt;
@@ -93,6 +94,12 @@ bool KVStore::DeletePrefix(const std::string &prefix) {
     if (!pimpl_->db->Delete(rocksdb::WriteOptions(), iter->key()).ok()) return false;
   }
   return true;
+}
+bool KVStore::SyncWal() {
+  if (!pimpl_) {
+    return true;
+  }
+  return pimpl_->db->SyncWAL().ok();
 }
 
 bool KVStore::PutAndDeleteMultiple(const std::map<std::string, std::string> &items,
@@ -128,7 +135,7 @@ KVStore::iterator::iterator(const KVStore *kvstore, const std::string &prefix, b
 
 KVStore::iterator::iterator(KVStore::iterator &&other) { pimpl_ = std::move(other.pimpl_); }
 
-KVStore::iterator::~iterator() {}
+KVStore::iterator::~iterator() = default;
 
 KVStore::iterator &KVStore::iterator::operator=(KVStore::iterator &&other) {
   pimpl_ = std::move(other.pimpl_);

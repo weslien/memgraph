@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,14 +11,9 @@
 
 #pragma once
 
-#include <optional>
-
 #include "storage/v2/edge.hpp"
 #include "storage/v2/edge_ref.hpp"
-
-#include "storage/v2/config.hpp"
 #include "storage/v2/result.hpp"
-#include "storage/v2/transaction.hpp"
 #include "storage/v2/view.hpp"
 
 namespace memgraph::storage {
@@ -28,6 +23,7 @@ class VertexAccessor;
 struct Indices;
 struct Constraints;
 class Storage;
+struct Transaction;
 
 class EdgeAccessor final {
  private:
@@ -43,6 +39,12 @@ class EdgeAccessor final {
         storage_(storage),
         transaction_(transaction),
         for_deleted_(for_deleted) {}
+
+  static std::optional<EdgeAccessor> Create(EdgeRef edge, EdgeTypeId edge_type, Vertex *from_vertex, Vertex *to_vertex,
+                                            Storage *storage, Transaction *transaction, View view,
+                                            bool for_deleted = false);
+
+  bool IsDeleted() const;
 
   /// @return true if the object is visible from the current transaction
   bool IsVisible(View view) const;
@@ -80,9 +82,14 @@ class EdgeAccessor final {
   /// @throw std::bad_alloc
   Result<PropertyValue> GetProperty(PropertyId property, View view) const;
 
+  /// Returns the size of the encoded edge property in bytes.
+  Result<uint64_t> GetPropertySize(PropertyId property, View view) const;
+
   /// @throw std::bad_alloc
   Result<std::map<PropertyId, PropertyValue>> Properties(View view) const;
 
+  auto GidPropertiesOnEdges() const -> Gid { return edge_.ptr->gid; }
+  auto GidNoPropertiesOnEdges() const -> Gid { return edge_.gid; }
   Gid Gid() const noexcept;
 
   bool IsCycle() const { return from_vertex_ == to_vertex_; }
@@ -110,7 +117,7 @@ class EdgeAccessor final {
 
 }  // namespace memgraph::storage
 
-static_assert(std::is_trivially_copyable<memgraph::storage::EdgeAccessor>::value,
+static_assert(std::is_trivially_copyable_v<memgraph::storage::EdgeAccessor>,
               "storage::EdgeAccessor must be trivially copyable!");
 
 namespace std {

@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -38,6 +38,9 @@ class SymbolGenerator : public HierarchicalTreeVisitor {
   using HierarchicalTreeVisitor::Visit;
   using typename HierarchicalTreeVisitor::ReturnType;
 
+  // CypherQuery
+  bool PreVisit(CypherQuery &) override;
+
   // Query
   bool PreVisit(SingleQuery &) override;
 
@@ -68,6 +71,11 @@ class SymbolGenerator : public HierarchicalTreeVisitor {
   bool PostVisit(Foreach &) override;
   bool PreVisit(SetProperty & /*set_property*/) override;
   bool PostVisit(SetProperty & /*set_property*/) override;
+  bool PreVisit(SetLabels &) override;
+  bool PostVisit(SetLabels & /*set_labels*/) override;
+  bool PreVisit(RemoveLabels &) override;
+  bool PostVisit(RemoveLabels & /*remove_labels*/) override;
+  bool PreVisit(Delete & /*delete*/) override;
 
   // Expressions
   ReturnType Visit(Identifier &) override;
@@ -89,6 +97,7 @@ class SymbolGenerator : public HierarchicalTreeVisitor {
   bool PreVisit(Exists & /*exists*/) override;
   bool PostVisit(Exists & /*exists*/) override;
   bool PreVisit(NamedExpression & /*unused*/) override;
+  ReturnType Visit(EnumValueAccess &) override { return true; }
 
   // Pattern and its subparts.
   bool PreVisit(Pattern &) override;
@@ -97,6 +106,8 @@ class SymbolGenerator : public HierarchicalTreeVisitor {
   bool PostVisit(NodeAtom &) override;
   bool PreVisit(EdgeAtom &) override;
   bool PostVisit(EdgeAtom &) override;
+  bool PreVisit(PatternComprehension &) override;
+  bool PostVisit(PatternComprehension &) override;
 
  private:
   // Scope stores the state of where we are when visiting the AST and a map of
@@ -128,6 +139,9 @@ class SymbolGenerator : public HierarchicalTreeVisitor {
     bool in_set_property{false};
     bool in_call_subquery{false};
     bool has_return{false};
+    bool in_set_labels{false};
+    bool in_remove_labels{false};
+    bool in_pattern_comprehension{false};
     // True when visiting a pattern atom (node or edge) identifier, which can be
     // reused or created in the pattern itself.
     bool in_pattern_atom_identifier{false};
@@ -146,6 +160,8 @@ class SymbolGenerator : public HierarchicalTreeVisitor {
     int num_if_operators{0};
     std::unordered_set<std::string> prev_return_names{};
     std::unordered_set<std::string> curr_return_names{};
+    bool has_periodic_commit{false};
+    bool has_delete{false};
   };
 
   static std::optional<Symbol> FindSymbolInScope(const std::string &name, const Scope &scope, Symbol::Type type);
@@ -177,13 +193,14 @@ class SymbolGenerator : public HierarchicalTreeVisitor {
   // is mapped by its name.
   std::unordered_map<std::string, Identifier *> predefined_identifiers_;
   std::vector<Scope> scopes_;
+  Scope global_scope_;
 };
 
 /// Visits the AST and assigns the evaluation mode for all the property lookups
 /// If property lookup for one symbol is visited more times, it is better to fetch all properties
 class PropertyLookupEvaluationModeVisitor : public ExpressionVisitor<void> {
  public:
-  explicit PropertyLookupEvaluationModeVisitor() {}
+  explicit PropertyLookupEvaluationModeVisitor() = default;
 
   using ExpressionVisitor<void>::Visit;
 
@@ -222,10 +239,12 @@ class PropertyLookupEvaluationModeVisitor : public ExpressionVisitor<void> {
   void Visit(MultiplicationOperator &op) override{};
   void Visit(DivisionOperator &op) override{};
   void Visit(ModOperator &op) override{};
+  void Visit(ExponentiationOperator &op) override{};
   void Visit(LessOperator &op) override{};
   void Visit(GreaterOperator &op) override{};
   void Visit(LessEqualOperator &op) override{};
   void Visit(GreaterEqualOperator &op) override{};
+  void Visit(RangeOperator &op) override{};
   void Visit(SubscriptOperator &op) override{};
   void Visit(ListSlicingOperator &op) override{};
   void Visit(IfOperator &op) override{};
@@ -249,6 +268,8 @@ class PropertyLookupEvaluationModeVisitor : public ExpressionVisitor<void> {
   void Visit(ParameterLookup &op) override{};
   void Visit(NamedExpression &op) override { op.expression_->Accept(*this); };
   void Visit(RegexMatch &op) override{};
+  void Visit(PatternComprehension &op) override{};
+  void Visit(EnumValueAccess &op) override{};
 
   void Visit(PropertyLookup & /*property_lookup*/) override;
 
@@ -262,10 +283,7 @@ class PropertyLookupEvaluationModeVisitor : public ExpressionVisitor<void> {
 inline SymbolTable MakeSymbolTable(CypherQuery *query, const std::vector<Identifier *> &predefined_identifiers = {}) {
   SymbolTable symbol_table;
   SymbolGenerator symbol_generator(&symbol_table, predefined_identifiers);
-  query->single_query_->Accept(symbol_generator);
-  for (auto *cypher_union : query->cypher_unions_) {
-    cypher_union->Accept(symbol_generator);
-  }
+  query->Accept(symbol_generator);
   return symbol_table;
 }
 

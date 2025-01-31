@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -43,7 +43,8 @@ std::unordered_map<std::string, Identifier *> GeneratePredefinedIdentifierMap(
 SymbolGenerator::SymbolGenerator(SymbolTable *symbol_table, const std::vector<Identifier *> &predefined_identifiers)
     : symbol_table_(symbol_table),
       predefined_identifiers_{GeneratePredefinedIdentifierMap(predefined_identifiers)},
-      scopes_(1, Scope()) {}
+      scopes_(1, Scope()),
+      global_scope_(Scope()) {}
 
 std::optional<Symbol> SymbolGenerator::FindSymbolInScope(const std::string &name, const Scope &scope,
                                                          Symbol::Type type) {
@@ -80,10 +81,10 @@ auto SymbolGenerator::GetOrCreateSymbol(const std::string &name, bool user_decla
 }
 
 void SymbolGenerator::VisitReturnBody(ReturnBody &body, Where *where) {
-  auto &scope = scopes_.back();
   for (auto &expr : body.named_expressions) {
     expr->Accept(*this);
   }
+  auto &scope = scopes_.back();
 
   SetEvaluationModeOnPropertyLookups(body);
 
@@ -155,6 +156,22 @@ void SymbolGenerator::VisitReturnBody(ReturnBody &body, Where *where) {
     }
   }
   scopes_.back().has_aggregation = false;
+}
+
+// CypherQuery
+
+bool SymbolGenerator::PreVisit(CypherQuery &cypher_query) {
+  bool const has_commit_frequency = !!cypher_query.pre_query_directives_.commit_frequency_;
+
+  if (global_scope_.has_periodic_commit && has_commit_frequency) {
+    throw SemanticException("You can specify periodic commit only once during a query!");
+  }
+
+  if (has_commit_frequency) {
+    global_scope_.has_periodic_commit = true;
+  }
+
+  return true;
 }
 
 // Query
@@ -266,7 +283,10 @@ bool SymbolGenerator::PreVisit(Return &ret) {
   scope.has_return = true;
 
   VisitReturnBody(ret.body_);
-  scope.in_return = false;
+
+  // We should retake scope for current level after visiting other nodes,
+  // because they can add more scopes to the end and reallocate the vector.
+  scopes_.back().in_return = false;
   return false;  // We handled the traversal ourselves.
 }
 
@@ -281,7 +301,10 @@ bool SymbolGenerator::PreVisit(With &with) {
   auto &scope = scopes_.back();
   scope.in_with = true;
   VisitReturnBody(with.body_, with.where_);
-  scope.in_with = false;
+
+  // We should retake scope for current level after visiting other nodes,
+  // because they can add more scopes to the end and reallocate the vector.
+  scopes_.back().in_with = false;
   return false;  // We handled the traversal ourselves.
 }
 
@@ -394,9 +417,16 @@ SymbolGenerator::ReturnType SymbolGenerator::Visit(Identifier &ident) {
     // can reference symbols bound later in the same MATCH. We collect them
     // here, so that they can be checked after visiting Match.
     scope.identifiers_in_match.emplace_back(&ident);
+  } else if (scope.in_call_subquery && !scope.in_with) {
+    if (!scope.symbols.contains(ident.name_) && !ConsumePredefinedIdentifier(ident.name_)) {
+      throw UnboundVariableError(ident.name_);
+    }
+    symbol = GetOrCreateSymbol(ident.name_, ident.user_declared_, Symbol::Type::ANY);
   } else {
     // Everything else references a bound symbol.
-    if (!HasSymbol(ident.name_) && !ConsumePredefinedIdentifier(ident.name_)) throw UnboundVariableError(ident.name_);
+    if (!HasSymbol(ident.name_) && !ConsumePredefinedIdentifier(ident.name_)) {
+      throw UnboundVariableError(ident.name_);
+    }
     symbol = GetOrCreateSymbol(ident.name_, ident.user_declared_, Symbol::Type::ANY);
   }
   ident.MapTo(symbol);
@@ -561,6 +591,49 @@ bool SymbolGenerator::PostVisit(SetProperty & /*set_property*/) {
   return true;
 }
 
+bool SymbolGenerator::PreVisit(SetLabels &set_labels) {
+  auto &scope = scopes_.back();
+  scope.in_set_labels = true;
+  for (auto &label : set_labels.labels_) {
+    if (auto *expression = std::get_if<Expression *>(&label)) {
+      (*expression)->Accept(*this);
+    }
+  }
+
+  return true;
+}
+
+bool SymbolGenerator::PostVisit(SetLabels & /*set_labels*/) {
+  auto &scope = scopes_.back();
+  scope.in_set_labels = false;
+
+  return true;
+}
+
+bool SymbolGenerator::PreVisit(RemoveLabels &remove_labels) {
+  auto &scope = scopes_.back();
+  scope.in_remove_labels = true;
+  for (auto &label : remove_labels.labels_) {
+    if (auto *expression = std::get_if<Expression *>(&label)) {
+      (*expression)->Accept(*this);
+    }
+  }
+
+  return true;
+}
+
+bool SymbolGenerator::PostVisit(RemoveLabels & /*remove_labels*/) {
+  auto &scope = scopes_.back();
+  scope.in_remove_labels = false;
+
+  return true;
+}
+
+bool SymbolGenerator::PreVisit(Delete & /*delete*/) {
+  global_scope_.has_delete = true;
+  return true;
+}
+
 // Pattern and its subparts.
 
 bool SymbolGenerator::PreVisit(Pattern &pattern) {
@@ -595,6 +668,15 @@ bool SymbolGenerator::PreVisit(NodeAtom &node_atom) {
   };
 
   scope.in_node_atom = true;
+
+  if (scope.in_create) {  // you can use expressions with labels only in create
+    for (auto &label : node_atom.labels_) {
+      if (auto *expression = std::get_if<Expression *>(&label)) {
+        (*expression)->Accept(*this);
+      }
+    }
+  }
+
   if (auto *properties = std::get_if<std::unordered_map<PropertyIx, Expression *>>(&node_atom.properties_)) {
     bool props_or_labels = !properties->empty() || !node_atom.labels_.empty();
 
@@ -658,8 +740,16 @@ bool SymbolGenerator::PreVisit(EdgeAtom &edge_atom) {
     scope.in_edge_range = false;
     scope.in_pattern = false;
     if (edge_atom.filter_lambda_.expression) {
-      VisitWithIdentifiers(edge_atom.filter_lambda_.expression,
-                           {edge_atom.filter_lambda_.inner_edge, edge_atom.filter_lambda_.inner_node});
+      std::vector<Identifier *> filter_lambda_identifiers{edge_atom.filter_lambda_.inner_edge,
+                                                          edge_atom.filter_lambda_.inner_node};
+      if (edge_atom.filter_lambda_.accumulated_path) {
+        filter_lambda_identifiers.emplace_back(edge_atom.filter_lambda_.accumulated_path);
+
+        if (edge_atom.filter_lambda_.accumulated_weight) {
+          filter_lambda_identifiers.emplace_back(edge_atom.filter_lambda_.accumulated_weight);
+        }
+      }
+      VisitWithIdentifiers(edge_atom.filter_lambda_.expression, filter_lambda_identifiers);
     } else {
       // Create inner symbols, but don't bind them in scope, since they are to
       // be used in the missing filter expression.
@@ -668,6 +758,17 @@ bool SymbolGenerator::PreVisit(EdgeAtom &edge_atom) {
       auto *inner_node = edge_atom.filter_lambda_.inner_node;
       inner_node->MapTo(
           symbol_table_->CreateSymbol(inner_node->name_, inner_node->user_declared_, Symbol::Type::VERTEX));
+      if (edge_atom.filter_lambda_.accumulated_path) {
+        auto *accumulated_path = edge_atom.filter_lambda_.accumulated_path;
+        accumulated_path->MapTo(
+            symbol_table_->CreateSymbol(accumulated_path->name_, accumulated_path->user_declared_, Symbol::Type::PATH));
+
+        if (edge_atom.filter_lambda_.accumulated_weight) {
+          auto *accumulated_weight = edge_atom.filter_lambda_.accumulated_weight;
+          accumulated_weight->MapTo(symbol_table_->CreateSymbol(
+              accumulated_weight->name_, accumulated_weight->user_declared_, Symbol::Type::NUMBER));
+        }
+      }
     }
     if (edge_atom.weight_lambda_.expression) {
       VisitWithIdentifiers(edge_atom.weight_lambda_.expression,
@@ -692,6 +793,25 @@ bool SymbolGenerator::PostVisit(EdgeAtom &) {
   auto &scope = scopes_.back();
   scope.visiting_edge = nullptr;
   scope.in_create_edge = false;
+  return true;
+}
+
+bool SymbolGenerator::PreVisit(PatternComprehension &pc) {
+  auto &scope = scopes_.back();
+
+  if (!scope.in_with && !scope.in_return) {
+    throw utils::NotYetImplemented("Pattern comprehension can only be used within With and Return clauses!");
+  }
+
+  scopes_.emplace_back(Scope{.in_pattern_comprehension = true});
+
+  const auto &symbol = CreateAnonymousSymbol();
+  pc.MapTo(symbol);
+  return true;
+}
+
+bool SymbolGenerator::PostVisit(PatternComprehension & /*pc*/) {
+  scopes_.pop_back();
   return true;
 }
 

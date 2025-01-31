@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -12,25 +12,28 @@
 #pragma once
 
 #include <atomic>
-#include <limits>
-#include <list>
 #include <memory>
+#include <unordered_map>
 
+#include "storage/v2/id_types.hpp"
+#include "storage/v2/schema_info.hpp"
 #include "utils/memory.hpp"
 #include "utils/skip_list.hpp"
 
+#include "delta_container.hpp"
 #include "storage/v2/constraint_verification_info.hpp"
 #include "storage/v2/delta.hpp"
 #include "storage/v2/edge.hpp"
+#include "storage/v2/indices/point_index.hpp"
+#include "storage/v2/indices/point_index_change_collector.hpp"
 #include "storage/v2/isolation_level.hpp"
 #include "storage/v2/metadata_delta.hpp"
 #include "storage/v2/modified_edge.hpp"
 #include "storage/v2/property_value.hpp"
+#include "storage/v2/schema_info_types.hpp"
 #include "storage/v2/storage_mode.hpp"
 #include "storage/v2/vertex.hpp"
 #include "storage/v2/vertex_info_cache.hpp"
-#include "storage/v2/view.hpp"
-#include "utils/bond.hpp"
 #include "utils/pmr/list.hpp"
 
 #include <rocksdb/utilities/transaction.h>
@@ -39,26 +42,29 @@ namespace memgraph::storage {
 
 const uint64_t kTimestampInitialId = 0;
 const uint64_t kTransactionInitialId = 1ULL << 63U;
-using PmrListDelta = utils::pmr::list<Delta>;
 
 struct Transaction {
   Transaction(uint64_t transaction_id, uint64_t start_timestamp, IsolationLevel isolation_level,
-              StorageMode storage_mode, bool edge_import_mode_active)
+              StorageMode storage_mode, bool edge_import_mode_active, bool has_constraints,
+              PointIndexContext point_index_ctx)
       : transaction_id(transaction_id),
         start_timestamp(start_timestamp),
         command_id(0),
-        deltas(0),
         md_deltas(utils::NewDeleteResource()),
         must_abort(false),
         isolation_level(isolation_level),
         storage_mode(storage_mode),
         edge_import_mode_active(edge_import_mode_active),
+        constraint_verification_info{(has_constraints) ? std::optional<ConstraintVerificationInfo>{std::in_place}
+                                                       : std::nullopt},
         vertices_{(storage_mode == StorageMode::ON_DISK_TRANSACTIONAL)
                       ? std::optional<utils::SkipList<Vertex>>{std::in_place}
                       : std::nullopt},
         edges_{(storage_mode == StorageMode::ON_DISK_TRANSACTIONAL)
                    ? std::optional<utils::SkipList<Edge>>{std::in_place}
-                   : std::nullopt} {}
+                   : std::nullopt},
+        point_index_ctx_{std::move(point_index_ctx)},
+        point_index_change_collector_{point_index_ctx_} {}
 
   Transaction(Transaction &&other) noexcept = default;
 
@@ -82,8 +88,25 @@ struct Transaction {
 
   bool RemoveModifiedEdge(const Gid &gid) { return modified_edges_.erase(gid) > 0U; }
 
+  void UpdateOnChangeLabel(LabelId label, Vertex *vertex) {
+    point_index_change_collector_.UpdateOnChangeLabel(label, vertex);
+    manyDeltasCache.Invalidate(vertex, label);
+  }
+
+  void UpdateOnSetProperty(PropertyId property, const PropertyValue &old_value, const PropertyValue &new_value,
+                           Vertex *vertex) {
+    point_index_change_collector_.UpdateOnSetProperty(property, old_value, new_value, vertex);
+    manyDeltasCache.Invalidate(vertex, property);
+  }
+
+  void UpdateOnVertexDelete(Vertex *vertex) {
+    point_index_change_collector_.UpdateOnVertexDelete(vertex);
+    manyDeltasCache.Invalidate(vertex);
+  }
+
   uint64_t transaction_id{};
   uint64_t start_timestamp{};
+  std::optional<uint64_t> original_start_timestamp{};
   // The `Transaction` object is stack allocated, but the `commit_timestamp`
   // must be heap allocated because `Delta`s have a pointer to it, and that
   // pointer must stay valid after the `Transaction` is moved into
@@ -91,7 +114,7 @@ struct Transaction {
   std::unique_ptr<std::atomic<uint64_t>> commit_timestamp{};
   uint64_t command_id{};
 
-  Bond<PmrListDelta> deltas;
+  delta_container deltas;
   utils::pmr::list<MetadataDelta> md_deltas;
   bool must_abort{};
   IsolationLevel isolation_level{};
@@ -102,7 +125,7 @@ struct Transaction {
   // Used to speedup getting info about a vertex when there is a long delta
   // chain involved in rebuilding that info.
   mutable VertexInfoCache manyDeltasCache{};
-  mutable ConstraintVerificationInfo constraint_verification_info{};
+  mutable std::optional<ConstraintVerificationInfo> constraint_verification_info{};
 
   // Store modified edges GID mapped to changed Delta and serialized edge key
   // Only for disk storage
@@ -114,11 +137,20 @@ struct Transaction {
 
   /// We need them because query context for indexed reading is cleared after the query is done not after the
   /// transaction is done
-  std::vector<std::list<Delta>> index_deltas_storage_{};
+  std::vector<delta_container> index_deltas_storage_{};
   std::optional<utils::SkipList<Edge>> edges_{};
-  std::map<std::string, std::pair<std::string, std::string>> edges_to_delete_{};
-  std::map<std::string, std::string> vertices_to_delete_{};
+  std::map<std::string, std::pair<std::string, std::string>, std::less<>> edges_to_delete_{};
+  std::map<std::string, std::string, std::less<>> vertices_to_delete_{};
   bool scanned_all_vertices_ = false;
+  std::set<LabelId> introduced_new_label_index_;
+  std::set<EdgeTypeId> introduced_new_edge_type_index_;
+  /// Hold point index relevant to this txn+command
+  PointIndexContext point_index_ctx_;
+  /// Tracks changes relevant to point index (used during Commit/AdvanceCommand)
+  PointIndexChangeCollector point_index_change_collector_;
+  /// Tracking schema changes done during the transaction
+  LocalSchemaTracking schema_diff_;
+  std::unordered_set<SchemaInfoPostProcess> post_process_;
 };
 
 inline bool operator==(const Transaction &first, const Transaction &second) {

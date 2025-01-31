@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -48,7 +48,7 @@ class ExpressionPrettyPrinterTest : public ::testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(ExpressionPrettyPrinterTest, StorageTypes);
+TYPED_TEST_SUITE(ExpressionPrettyPrinterTest, StorageTypes);
 
 TYPED_TEST(ExpressionPrettyPrinterTest, Literals) {
   // 1
@@ -67,14 +67,16 @@ TYPED_TEST(ExpressionPrettyPrinterTest, Literals) {
   EXPECT_EQ(ToString(LITERAL(false)), "false");
 
   // [1 null "hello"]
-  std::vector<memgraph::storage::PropertyValue> values{memgraph::storage::PropertyValue(1),
-                                                       memgraph::storage::PropertyValue(),
-                                                       memgraph::storage::PropertyValue("hello")};
+  std::vector<memgraph::storage::PropertyValue> values{
+      memgraph::storage::PropertyValue(1),
+      memgraph::storage::PropertyValue(),
+      memgraph::storage::PropertyValue("hello"),
+  };
   EXPECT_EQ(ToString(LITERAL(memgraph::storage::PropertyValue(values))), "[1, null, \"hello\"]");
 
   // {hello: 1, there: 2}
-  std::map<std::string, memgraph::storage::PropertyValue> map{{"hello", memgraph::storage::PropertyValue(1)},
-                                                              {"there", memgraph::storage::PropertyValue(2)}};
+  memgraph::storage::PropertyValue::map_t map{{"hello", memgraph::storage::PropertyValue(1)},
+                                              {"there", memgraph::storage::PropertyValue(2)}};
   EXPECT_EQ(ToString(LITERAL(memgraph::storage::PropertyValue(map))), "{\"hello\": 1, \"there\": 2}");
 
   std::vector<memgraph::storage::PropertyValue> tt_vec{
@@ -87,6 +89,20 @@ TYPED_TEST(ExpressionPrettyPrinterTest, Literals) {
   EXPECT_EQ(ToString(LITERAL(memgraph::storage::PropertyValue(tt_vec))),
             "[DURATION(\"P0DT0H0M0.000001S\"), DURATION(\"P0DT0H0M-0.000002S\"), LOCALTIME(\"00:00:00.000002\"), "
             "LOCALDATETIME(\"1970-01-01T00:00:00.000003\"), DATE(\"1970-01-01\")]");
+
+  const auto sample_duration = memgraph::utils::AsSysTime(3);
+  const auto sample_duration_plus_1h = std::chrono::sys_time<std::chrono::microseconds>(
+      std::chrono::microseconds{3} + std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::hours{1}));
+  std::vector<memgraph::storage::PropertyValue> ztt_vec{
+      memgraph::storage::PropertyValue(memgraph::storage::ZonedTemporalData(
+          memgraph::storage::ZonedTemporalType::ZonedDateTime, sample_duration, memgraph::utils::Timezone("Etc/UTC"))),
+      memgraph::storage::PropertyValue(memgraph::storage::ZonedTemporalData(
+          memgraph::storage::ZonedTemporalType::ZonedDateTime, sample_duration_plus_1h,
+          memgraph::utils::Timezone(std::chrono::minutes{-60}))),
+  };
+  EXPECT_EQ(ToString(LITERAL(memgraph::storage::PropertyValue(ztt_vec))),
+            "[DATETIME(\"1970-01-01T00:00:00.000003+00:00[Etc/UTC]\"), "
+            "DATETIME(\"1970-01-01T00:00:00.000003-01:00\")]");
 
   // map {literalEntry: 10, variableSelector: a, .map, .*}
   auto elements = std::unordered_map<memgraph::query::PropertyIx, memgraph::query::Expression *>{
@@ -193,4 +209,9 @@ TYPED_TEST(ExpressionPrettyPrinterTest, NamedExpression) {
   // n AS 1
   EXPECT_EQ(ToString(NEXPR("n", LITERAL(1))), "(NamedExpression \"n\" 1)");
 }
+
+TYPED_TEST(ExpressionPrettyPrinterTest, EnumValueAccess) {
+  EXPECT_EQ(ToString(ENUM_VALUE("Name", "Value")), "Name::Value");
+}
+
 }  // namespace

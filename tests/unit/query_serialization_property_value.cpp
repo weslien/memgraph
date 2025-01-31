@@ -1,4 +1,4 @@
-// Copyright 2022 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -14,6 +14,7 @@
 #include "query/serialization/property_value.hpp"
 #include "storage/v2/temporal.hpp"
 #include "utils/logging.hpp"
+#include "utils/temporal.hpp"
 
 namespace {
 void ExpectPropEq(const memgraph::storage::PropertyValue &a, const memgraph::storage::PropertyValue &b) {
@@ -22,9 +23,9 @@ void ExpectPropEq(const memgraph::storage::PropertyValue &a, const memgraph::sto
 }
 
 void CheckJsonConversion(const memgraph::storage::PropertyValue &property_value) {
-  const auto json_string = memgraph::query::serialization::SerializePropertyValue(property_value).dump();
+  const auto json_string = memgraph::query::serialization::SerializePropertyValue(property_value, nullptr).dump();
   const auto json_object = nlohmann::json::parse(json_string);
-  ExpectPropEq(property_value, memgraph::query::serialization::DeserializePropertyValue(json_object));
+  ExpectPropEq(property_value, memgraph::query::serialization::DeserializePropertyValue(json_object, nullptr));
 }
 
 }  // namespace
@@ -61,6 +62,20 @@ TEST(PropertyValueSerializationTest, TemporalData) {
   test_temporal_data_conversion(memgraph::storage::TemporalType::Duration, 10000);
 }
 
+TEST(PropertyValueSerializationTest, ZonedTemporalData) {
+  const auto test_zoned_temporal_data_conversion = [](const auto type, const auto microseconds,
+                                                      const memgraph::utils::Timezone &timezone) {
+    CheckJsonConversion(
+        memgraph::storage::PropertyValue{memgraph::storage::ZonedTemporalData{type, microseconds, timezone}});
+  };
+
+  const auto sample_duration = memgraph::utils::AsSysTime(20);
+  test_zoned_temporal_data_conversion(memgraph::storage::ZonedTemporalType::ZonedDateTime, sample_duration,
+                                      memgraph::utils::Timezone("Europe/Zagreb"));
+  test_zoned_temporal_data_conversion(memgraph::storage::ZonedTemporalType::ZonedDateTime, sample_duration,
+                                      memgraph::utils::Timezone(std::chrono::minutes{60}));
+}
+
 namespace {
 
 std::vector<memgraph::storage::PropertyValue> GetPropertyValueListWithBasicTypes() {
@@ -69,12 +84,22 @@ std::vector<memgraph::storage::PropertyValue> GetPropertyValueListWithBasicTypes
           memgraph::storage::PropertyValue{1.0}};
 }
 
-std::map<std::string, memgraph::storage::PropertyValue> GetPropertyValueMapWithBasicTypes() {
-  return {{"null", memgraph::storage::PropertyValue{}},
-          {"bool", memgraph::storage::PropertyValue{true}},
-          {"int", memgraph::storage::PropertyValue{1}},
-          {"double", memgraph::storage::PropertyValue{1.0}},
-          {"string", memgraph::storage::PropertyValue{"string"}}};
+memgraph::storage::PropertyValue::map_t GetPropertyValueMapWithBasicTypes() {
+  using memgraph::storage::Point2d;
+  using memgraph::storage::Point3d;
+  using memgraph::storage::PropertyValue;
+  using enum memgraph::storage::CoordinateReferenceSystem;
+  return {
+      {"null", PropertyValue{}},
+      {"bool", PropertyValue{true}},
+      {"int", PropertyValue{1}},
+      {"double", PropertyValue{1.0}},
+      {"string", PropertyValue{"string"}},
+      {"point2d_1", PropertyValue{Point2d{WGS84_2d, 1.0, 2.0}}},
+      {"point2d_2", PropertyValue{Point2d{Cartesian_2d, 1.0, 2.0}}},
+      {"point3d_1", PropertyValue{Point3d{WGS84_3d, 1.0, 2.0, 3.0}}},
+      {"point3d_2", PropertyValue{Point3d{Cartesian_3d, 1.0, 2.0, 3.0}}},
+  };
 }
 
 }  // namespace

@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -40,15 +40,21 @@ class Server final {
 
   void Start();
 
-  void Shutdown() { ioc_.stop(); }
+  void Shutdown() {
+    if (ioc_.stopped()) {
+      spdlog::trace("HTTP server is already stopped!");
+      return;
+    }
+    ioc_.stop();
+  }
 
   void AwaitShutdown() {
     if (background_thread_ && background_thread_->joinable()) {
       background_thread_->join();
     }
   }
-  bool IsRunning() const { return background_thread_ && !ioc_.stopped(); }
-  tcp::endpoint GetEndpoint() const;
+  bool IsRunning() const { return !listener_->HasErrorHappened() && background_thread_ && !ioc_.stopped(); }
+  std::optional<tcp::endpoint> GetEndpoint() const;
 
  private:
   boost::asio::io_context ioc_;
@@ -61,17 +67,21 @@ Server<TRequestHandler, TSessionContext>::Server(io::network::Endpoint endpoint,
                                                  ServerContext *context)
     : listener_{Listener<TRequestHandler, TSessionContext>::Create(
           ioc_, session_context, context,
-          tcp::endpoint{boost::asio::ip::make_address(endpoint.address), endpoint.port})} {}
+          tcp::endpoint{boost::asio::ip::make_address(endpoint.GetResolvedIPAddress()), endpoint.GetPort()})} {}
 
 template <class TRequestHandler, typename TSessionContext>
 void Server<TRequestHandler, TSessionContext>::Start() {
   MG_ASSERT(!background_thread_, "The server was already started!");
+  if (listener_->HasErrorHappened()) {
+    spdlog::error("We have error on http listener already! Aborting server start.");
+    return;
+  }
   listener_->Run();
   background_thread_.emplace([this] { ioc_.run(); });
 }
 
 template <class TRequestHandler, typename TSessionContext>
-boost::asio::ip::tcp::endpoint Server<TRequestHandler, TSessionContext>::GetEndpoint() const {
+std::optional<boost::asio::ip::tcp::endpoint> Server<TRequestHandler, TSessionContext>::GetEndpoint() const {
   return listener_->GetEndpoint();
 }
 }  // namespace memgraph::communication::http

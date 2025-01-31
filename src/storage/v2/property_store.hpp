@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,11 +11,21 @@
 
 #pragma once
 
-#include <map>
-#include <set>
-
+#include "storage/v2/constraints/type_constraints_validator.hpp"
 #include "storage/v2/id_types.hpp"
+#include "storage/v2/property_store_types.hpp"
 #include "storage/v2/property_value.hpp"
+#include "utils/compressor.hpp"
+
+#include <gflags/gflags.h>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <set>
+#include <span>
+
+// NOLINTNEXTLINE (cppcoreguidelines-avoid-non-const-global-variables)
+DECLARE_bool(storage_property_store_compression_enabled);
 
 namespace memgraph::storage {
 
@@ -45,6 +55,13 @@ class PropertyStore {
   /// @throw std::bad_alloc
   PropertyValue GetProperty(PropertyId property) const;
 
+  ExtendedPropertyType GetExtendedPropertyType(PropertyId property) const;
+
+  /// Returns the size of the encoded property in bytes.
+  /// Returns 0 if the property does not exist.
+  /// The time complexity of this function is O(n).
+  uint32_t PropertySize(PropertyId property) const;
+
   /// Checks whether the property `property` exists in the store. The time
   /// complexity of this function is O(n).
   bool HasProperty(PropertyId property) const;
@@ -55,7 +72,6 @@ class PropertyStore {
 
   /// Checks whether all property values in the vector `property_values` exist in the store. The time
   /// complexity of this function is O(n^2).
-  /// TODO: andi Not so sure it is quadratic complexity
   bool HasAllPropertyValues(const std::vector<PropertyValue> &property_values) const;
 
   /// Extracts property values for all property ids in the set `properties`. The time
@@ -72,6 +88,14 @@ class PropertyStore {
   /// of this function is O(n).
   /// @throw std::bad_alloc
   std::map<PropertyId, PropertyValue> Properties() const;
+
+  std::vector<PropertyId> PropertiesOfTypes(std::span<PropertyStoreType const> types) const;
+
+  std::optional<PropertyValue> GetPropertyOfTypes(PropertyId property, std::span<PropertyStoreType const> types) const;
+
+  /// Returns types of properties currently stored.
+  /// @throw std::bad_alloc
+  std::map<PropertyId, ExtendedPropertyType> ExtendedPropertyTypes() const;
 
   /// Set a property value and return `true` if insertion took place. `false` is
   /// returned if assignment took place. The time complexity of this function is
@@ -111,11 +135,17 @@ class PropertyStore {
   /// Sets buffer
   void SetBuffer(std::string_view buffer);
 
+  auto PropertiesMatchTypes(TypeConstraintsValidator const &constraint) const
+      -> std::optional<PropertyStoreConstraintViolation>;
+
  private:
   template <typename TContainer>
   bool DoInitProperties(const TContainer &properties);
 
-  uint8_t buffer_[sizeof(uint64_t) + sizeof(uint8_t *)];
+  template <typename Func>
+  auto WithReader(Func &&func) const;
+
+  uint8_t buffer_[sizeof(uint32_t) + sizeof(uint8_t *)];
 };
 
 }  // namespace memgraph::storage

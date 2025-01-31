@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -104,7 +104,7 @@ TEST_F(TestPrivilegeExtractor, AuthQuery) {
   auto label_privileges = std::vector<std::unordered_map<AuthQuery::FineGrainedPrivilege, std::vector<std::string>>>{};
   auto edge_type_privileges =
       std::vector<std::unordered_map<AuthQuery::FineGrainedPrivilege, std::vector<std::string>>>{};
-  auto *query = AUTH_QUERY(AuthQuery::Action::CREATE_ROLE, "", "role", "", nullptr, "",
+  auto *query = AUTH_QUERY(AuthQuery::Action::CREATE_ROLE, "", "role", "", false, nullptr, "",
                            std::vector<AuthQuery::Privilege>{}, label_privileges, edge_type_privileges);
   EXPECT_THAT(GetRequiredPrivileges(query), UnorderedElementsAre(AuthQuery::Privilege::AUTH));
 }
@@ -153,7 +153,7 @@ TEST_F(TestPrivilegeExtractor, DumpDatabase) {
 }
 
 TEST_F(TestPrivilegeExtractor, ReadFile) {
-  auto load_csv = storage.Create<LoadCsv>();
+  auto *load_csv = storage.Create<LoadCsv>();
   load_csv->row_var_ = IDENT("row");
   auto *query = QUERY(SINGLE_QUERY(load_csv));
   EXPECT_THAT(GetRequiredPrivileges(query), UnorderedElementsAre(AuthQuery::Privilege::READ_FILE));
@@ -182,6 +182,21 @@ TEST_F(TestPrivilegeExtractor, SetIsolationLevelQuery) {
 TEST_F(TestPrivilegeExtractor, CreateSnapshotQuery) {
   auto *query = storage.Create<CreateSnapshotQuery>();
   EXPECT_THAT(GetRequiredPrivileges(query), UnorderedElementsAre(AuthQuery::Privilege::DURABILITY));
+}
+
+TEST_F(TestPrivilegeExtractor, RecoverSnapshotQuery) {
+  auto *query = storage.Create<RecoverSnapshotQuery>();
+  EXPECT_THAT(GetRequiredPrivileges(query), UnorderedElementsAre(AuthQuery::Privilege::DURABILITY));
+}
+
+TEST_F(TestPrivilegeExtractor, ShowSnapshotsQuery) {
+  auto *query = storage.Create<ShowSnapshotsQuery>();
+  EXPECT_THAT(GetRequiredPrivileges(query), UnorderedElementsAre(AuthQuery::Privilege::DURABILITY));
+}
+
+TEST_F(TestPrivilegeExtractor, CoordinatorQuery) {
+  auto *query = storage.Create<CoordinatorQuery>();
+  EXPECT_THAT(GetRequiredPrivileges(query), UnorderedElementsAre(AuthQuery::Privilege::COORDINATOR));
 }
 
 TEST_F(TestPrivilegeExtractor, StreamQuery) {

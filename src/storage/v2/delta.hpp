@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -17,6 +17,7 @@
 #include "storage/v2/edge_ref.hpp"
 #include "storage/v2/id_types.hpp"
 #include "storage/v2/property_value.hpp"
+#include "utils/allocator/page_slab_memory_resource.hpp"
 #include "utils/logging.hpp"
 
 namespace memgraph::storage {
@@ -57,9 +58,11 @@ class PreviousPtr {
     explicit Pointer(Edge *edge) : type(Type::EDGE), edge(edge) {}
 
     Type type{Type::NULLPTR};
-    Delta *delta{nullptr};
-    Vertex *vertex{nullptr};
-    Edge *edge{nullptr};
+    union {
+      Delta *delta = nullptr;
+      Vertex *vertex;
+      Edge *edge;
+    };
   };
 
   PreviousPtr() : storage_(0) {}
@@ -119,7 +122,36 @@ inline bool operator==(const PreviousPtr::Pointer &a, const PreviousPtr::Pointer
   }
 }
 
-inline bool operator!=(const PreviousPtr::Pointer &a, const PreviousPtr::Pointer &b) { return !(a == b); }
+struct opt_str {
+  opt_str(std::optional<std::string_view> other, utils::PageSlabMemoryResource *res)
+      : str_{other ? new_cstr(*other, res) : nullptr} {}
+
+  ~opt_str() = default;
+
+  auto as_opt_str() const -> std::optional<std::string_view> {
+    if (!str_) return std::nullopt;
+    return std::optional<std::string_view>{std::in_place, str_};
+  }
+
+ private:
+  static auto new_cstr(std::string_view str, utils::PageSlabMemoryResource *res) -> char const * {
+    auto const n = str.size() + 1;
+    auto alloc = std::pmr::polymorphic_allocator<char>{res};
+    auto *mem = (std::string_view::pointer)alloc.allocate_bytes(n, alignof(char));
+    std::copy(str.cbegin(), str.cend(), mem);
+    mem[n - 1] = '\0';
+    return mem;
+  }
+
+  char const *str_ = nullptr;
+};
+
+static_assert(!std::is_constructible_v<opt_str, std::optional<std::string_view>, std::pmr::memory_resource *>,
+              "Use of PageSlabMemoryResource is deliberate here");
+static_assert(std::is_constructible_v<opt_str, std::optional<std::string_view>, utils::PageSlabMemoryResource *>,
+              "Use of PageSlabMemoryResource is deliberate here");
+static_assert(std::is_trivially_destructible_v<opt_str>,
+              "uses PageSlabMemoryResource, lifetime linked to that, dtr should be trivial");
 
 struct Delta {
   enum class Action : std::uint8_t {
@@ -157,88 +189,72 @@ struct Delta {
   // DELETE_DESERIALIZED_OBJECT is used to load data from disk committed by past txs.
   // Because of this object was created in past txs, we create timestamp by ourselves inside instead of having it from
   // current tx. This timestamp we got from RocksDB timestamp stored in key.
-  Delta(DeleteDeserializedObjectTag /*tag*/, uint64_t ts, const std::optional<std::string> &old_disk_key)
-      : action(Action::DELETE_DESERIALIZED_OBJECT),
-        timestamp(new std::atomic<uint64_t>(ts)),
+  Delta(DeleteDeserializedObjectTag /*tag*/, uint64_t ts, std::optional<std::string_view> old_disk_key,
+        utils::PageSlabMemoryResource *res)
+      : timestamp(std::pmr::polymorphic_allocator<Delta>{res}.new_object<std::atomic<uint64_t>>(ts)),
         command_id(0),
-        old_disk_key(old_disk_key) {}
+        old_disk_key{.value = opt_str{old_disk_key, res}} {}
 
   Delta(DeleteObjectTag /*tag*/, std::atomic<uint64_t> *timestamp, uint64_t command_id)
-      : action(Action::DELETE_OBJECT), timestamp(timestamp), command_id(command_id) {}
+      : timestamp(timestamp), command_id(command_id), action(Action::DELETE_OBJECT) {}
 
   Delta(RecreateObjectTag /*tag*/, std::atomic<uint64_t> *timestamp, uint64_t command_id)
-      : action(Action::RECREATE_OBJECT), timestamp(timestamp), command_id(command_id) {}
+      : timestamp(timestamp), command_id(command_id), action(Action::RECREATE_OBJECT) {}
 
   Delta(AddLabelTag /*tag*/, LabelId label, std::atomic<uint64_t> *timestamp, uint64_t command_id)
-      : action(Action::ADD_LABEL), timestamp(timestamp), command_id(command_id), label(label) {}
+      : timestamp(timestamp), command_id(command_id), label{.action = Action::ADD_LABEL, .value = label} {}
 
   Delta(RemoveLabelTag /*tag*/, LabelId label, std::atomic<uint64_t> *timestamp, uint64_t command_id)
-      : action(Action::REMOVE_LABEL), timestamp(timestamp), command_id(command_id), label(label) {}
+      : timestamp(timestamp), command_id(command_id), label{.action = Action::REMOVE_LABEL, .value = label} {}
 
-  Delta(SetPropertyTag /*tag*/, PropertyId key, const PropertyValue &value, std::atomic<uint64_t> *timestamp,
-        uint64_t command_id)
-      : action(Action::SET_PROPERTY), timestamp(timestamp), command_id(command_id), property({key, value}) {}
+  Delta(SetPropertyTag /*tag*/, PropertyId key, PropertyValue value, std::atomic<uint64_t> *timestamp,
+        uint64_t command_id, utils::PageSlabMemoryResource *res)
+      : timestamp(timestamp),
+        command_id(command_id),
+        property{
+            .action = Action::SET_PROPERTY,
+            .key = key,
+            .value = std::pmr::polymorphic_allocator<Delta>{res}.new_object<pmr::PropertyValue>(std::move(value))} {}
 
-  Delta(SetPropertyTag /*tag*/, PropertyId key, PropertyValue &&value, std::atomic<uint64_t> *timestamp,
-        uint64_t command_id)
-      : action(Action::SET_PROPERTY), timestamp(timestamp), command_id(command_id), property({key, std::move(value)}) {}
+  Delta(SetPropertyTag /*tag*/, Vertex *out_vertex, PropertyId key, PropertyValue value,
+        std::atomic<uint64_t> *timestamp, uint64_t command_id, utils::PageSlabMemoryResource *res)
+      : timestamp(timestamp),
+        command_id(command_id),
+        property{.action = Action::SET_PROPERTY,
+                 .key = key,
+                 .value = std::pmr::polymorphic_allocator<Delta>{res}.new_object<pmr::PropertyValue>(std::move(value)),
+                 .out_vertex = out_vertex} {}
 
   Delta(AddInEdgeTag /*tag*/, EdgeTypeId edge_type, Vertex *vertex, EdgeRef edge, std::atomic<uint64_t> *timestamp,
         uint64_t command_id)
-      : action(Action::ADD_IN_EDGE),
-        timestamp(timestamp),
+      : timestamp(timestamp),
         command_id(command_id),
-        vertex_edge({edge_type, vertex, edge}) {}
+        vertex_edge{.action = Action::ADD_IN_EDGE, .edge_type = edge_type, vertex, edge} {}
 
   Delta(AddOutEdgeTag /*tag*/, EdgeTypeId edge_type, Vertex *vertex, EdgeRef edge, std::atomic<uint64_t> *timestamp,
         uint64_t command_id)
-      : action(Action::ADD_OUT_EDGE),
-        timestamp(timestamp),
+      : timestamp(timestamp),
         command_id(command_id),
-        vertex_edge({edge_type, vertex, edge}) {}
+        vertex_edge{.action = Action::ADD_OUT_EDGE, .edge_type = edge_type, vertex, edge} {}
 
   Delta(RemoveInEdgeTag /*tag*/, EdgeTypeId edge_type, Vertex *vertex, EdgeRef edge, std::atomic<uint64_t> *timestamp,
         uint64_t command_id)
-      : action(Action::REMOVE_IN_EDGE),
-        timestamp(timestamp),
+      : timestamp(timestamp),
         command_id(command_id),
-        vertex_edge({edge_type, vertex, edge}) {}
+        vertex_edge{.action = Action::REMOVE_IN_EDGE, .edge_type = edge_type, vertex, edge} {}
 
   Delta(RemoveOutEdgeTag /*tag*/, EdgeTypeId edge_type, Vertex *vertex, EdgeRef edge, std::atomic<uint64_t> *timestamp,
         uint64_t command_id)
-      : action(Action::REMOVE_OUT_EDGE),
-        timestamp(timestamp),
+      : timestamp(timestamp),
         command_id(command_id),
-        vertex_edge({edge_type, vertex, edge}) {}
+        vertex_edge{.action = Action::REMOVE_OUT_EDGE, .edge_type = edge_type, vertex, edge} {}
 
   Delta(const Delta &) = delete;
   Delta(Delta &&) = delete;
   Delta &operator=(const Delta &) = delete;
   Delta &operator=(Delta &&) = delete;
 
-  ~Delta() {
-    switch (action) {
-      case Action::DELETE_OBJECT:
-      case Action::RECREATE_OBJECT:
-      case Action::ADD_LABEL:
-      case Action::REMOVE_LABEL:
-      case Action::ADD_IN_EDGE:
-      case Action::ADD_OUT_EDGE:
-      case Action::REMOVE_IN_EDGE:
-      case Action::REMOVE_OUT_EDGE:
-        break;
-      case Action::DELETE_DESERIALIZED_OBJECT:
-        old_disk_key.reset();
-        delete timestamp;
-        timestamp = nullptr;
-        break;
-      case Action::SET_PROPERTY:
-        property.value.~PropertyValue();
-        break;
-    }
-  }
-
-  Action action;
+  ~Delta() = default;
 
   // TODO: optimize with in-place copy
   std::atomic<uint64_t> *timestamp;
@@ -247,19 +263,33 @@ struct Delta {
   std::atomic<Delta *> next{nullptr};
 
   union {
-    std::optional<std::string> old_disk_key;
-    LabelId label;
+    Action action;
     struct {
+      Action action = Action::DELETE_DESERIALIZED_OBJECT;
+      opt_str value;
+    } old_disk_key;
+    struct {
+      Action action;
+      LabelId value;
+    } label;
+    struct {
+      Action action;
       PropertyId key;
-      storage::PropertyValue value;
+      storage::pmr::PropertyValue *value = nullptr;
+      Vertex *out_vertex{nullptr};  // Used by edge's delta to easily rebuild the edge
     } property;
     struct {
+      Action action;
       EdgeTypeId edge_type;
       Vertex *vertex;
       EdgeRef edge;
     } vertex_edge;
   };
 };
+
+// This is important, we want fast discard of unlinked deltas,
+static_assert(std::is_trivially_destructible_v<Delta>,
+              "any allocations use PageSlabMemoryResource, lifetime linked to that, dtr should be trivial");
 
 static_assert(alignof(Delta) >= 8, "The Delta should be aligned to at least 8!");
 

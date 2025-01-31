@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -12,8 +12,9 @@
 #include <algorithm>
 #include <functional>
 #include <stack>
-#include <type_traits>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 
 #include "query/exceptions.hpp"
@@ -21,7 +22,12 @@
 #include "query/frontend/ast/ast_visitor.hpp"
 #include "query/frontend/semantic/symbol_table.hpp"
 #include "query/plan/preprocess.hpp"
+#include "query/plan/rewrite/range.hpp"
+#include "utils/bound.hpp"
+#include "utils/logging.hpp"
 #include "utils/typeinfo.hpp"
+
+using namespace std::string_view_literals;
 
 namespace memgraph::query::plan {
 
@@ -73,6 +79,13 @@ std::vector<Expansion> NormalizePatterns(const SymbolTable &symbol_table, const 
           // Remove symbols which are bound by lambda arguments.
           collector.symbols_.erase(symbol_table.at(*edge->filter_lambda_.inner_edge));
           collector.symbols_.erase(symbol_table.at(*edge->filter_lambda_.inner_node));
+          if (edge->filter_lambda_.accumulated_path) {
+            collector.symbols_.erase(symbol_table.at(*edge->filter_lambda_.accumulated_path));
+
+            if (edge->filter_lambda_.accumulated_weight) {
+              collector.symbols_.erase(symbol_table.at(*edge->filter_lambda_.accumulated_weight));
+            }
+          }
           if (edge->type_ == EdgeAtom::Type::WEIGHTED_SHORTEST_PATH ||
               edge->type_ == EdgeAtom::Type::ALL_SHORTEST_PATHS) {
             collector.symbols_.erase(symbol_table.at(*edge->weight_lambda_.inner_edge));
@@ -165,41 +178,37 @@ void AddExpansionsToMatching(std::vector<Expansion> &expansions, Matching &match
     // Matching may already have some expansions, so offset our index.
     const size_t expansion_ix = matching.expansions.size();
     const auto &node1_sym = symbol_table.at(*expansion.node1->identifier_);
-    matching.node_symbol_to_expansions[node1_sym].insert(expansion_ix);
+    matching.atom_symbol_to_expansions[node1_sym].insert(expansion_ix);
 
     if (expansion.edge) {
       const auto &node2_sym = symbol_table.at(*expansion.node2->identifier_);
-      matching.node_symbol_to_expansions[node2_sym].insert(expansion_ix);
+      matching.atom_symbol_to_expansions[node2_sym].insert(expansion_ix);
+      const auto &edge_sym = symbol_table.at(*expansion.edge->identifier_);
+      matching.atom_symbol_to_expansions[edge_sym].insert(expansion_ix);
     }
 
     matching.expansions.push_back(expansion);
   }
 }
 
-auto SplitExpressionOnAnd(Expression *expression) {
-  // TODO: Think about converting all filtering expression into CNF to improve
-  // the granularity of filters which can be stand alone.
-  std::vector<Expression *> expressions;
-  std::stack<Expression *> pending_expressions;
-  pending_expressions.push(expression);
-  while (!pending_expressions.empty()) {
-    auto *current_expression = pending_expressions.top();
-    pending_expressions.pop();
-    if (auto *and_op = utils::Downcast<AndOperator>(current_expression)) {
-      pending_expressions.push(and_op->expression1_);
-      pending_expressions.push(and_op->expression2_);
-    } else {
-      expressions.push_back(current_expression);
-    }
-  }
-  return expressions;
-}
+auto MatchesIdentifier(Identifier *identifier) {
+  return [identifier](FilterInfo const &existing) {
+    auto *existing_label_test = dynamic_cast<LabelsTest *>(existing.expression);
+    if (!existing_label_test) return false;
+
+    auto *exisiting_identifier = dynamic_cast<Identifier *>(existing_label_test->expression_);
+    if (!exisiting_identifier) return false;
+
+    // If are the same symbol position then they must be referring to the same identifer
+    return identifier->symbol_pos_ == exisiting_identifier->symbol_pos_;
+  };
+};
 
 }  // namespace
 
 PropertyFilter::PropertyFilter(const SymbolTable &symbol_table, const Symbol &symbol, PropertyIx property,
                                Expression *value, Type type)
-    : symbol_(symbol), property_(property), type_(type), value_(value) {
+    : symbol_(symbol), property_(std::move(property)), type_(type), value_(value) {
   MG_ASSERT(type != Type::RANGE);
   UsedSymbolsCollector collector(symbol_table);
   value->Accept(collector);
@@ -209,7 +218,11 @@ PropertyFilter::PropertyFilter(const SymbolTable &symbol_table, const Symbol &sy
 PropertyFilter::PropertyFilter(const SymbolTable &symbol_table, const Symbol &symbol, PropertyIx property,
                                const std::optional<PropertyFilter::Bound> &lower_bound,
                                const std::optional<PropertyFilter::Bound> &upper_bound)
-    : symbol_(symbol), property_(property), type_(Type::RANGE), lower_bound_(lower_bound), upper_bound_(upper_bound) {
+    : symbol_(symbol),
+      property_(std::move(property)),
+      type_(Type::RANGE),
+      lower_bound_(lower_bound),
+      upper_bound_(upper_bound) {
   UsedSymbolsCollector collector(symbol_table);
   if (lower_bound) {
     lower_bound->value()->Accept(collector);
@@ -220,8 +233,8 @@ PropertyFilter::PropertyFilter(const SymbolTable &symbol_table, const Symbol &sy
   is_symbol_in_value_ = utils::Contains(collector.symbols_, symbol);
 }
 
-PropertyFilter::PropertyFilter(const Symbol &symbol, PropertyIx property, Type type)
-    : symbol_(symbol), property_(property), type_(type) {
+PropertyFilter::PropertyFilter(Symbol symbol, PropertyIx property, Type type)
+    : symbol_(std::move(symbol)), property_(std::move(property)), type_(type) {
   // As this constructor is used for property filters where
   // we don't have to evaluate the filter expression, we set
   // the is_symbol_in_value_ to false, although the filter
@@ -245,7 +258,9 @@ void Filters::EraseFilter(const FilterInfo &filter) {
                      all_filters_.end());
 }
 
-void Filters::EraseLabelFilter(const Symbol &symbol, LabelIx label, std::vector<Expression *> *removed_filters) {
+// Tries to erase the filter which contains a label of a symbol
+// Filtered label can refer to a node and its label, or an edge and its edge type
+void Filters::EraseLabelFilter(const Symbol &symbol, const LabelIx &label, std::vector<Expression *> *removed_filters) {
   for (auto filter_it = all_filters_.begin(); filter_it != all_filters_.end();) {
     if (filter_it->type != FilterInfo::Type::Label) {
       ++filter_it;
@@ -290,11 +305,18 @@ void Filters::CollectPatternFilters(Pattern &pattern, SymbolTable &symbol_table,
           prop_pair.second->Accept(collector);
           collector.symbols_.emplace(symbol_table.at(*atom->filter_lambda_.inner_node));
           collector.symbols_.emplace(symbol_table.at(*atom->filter_lambda_.inner_edge));
+          if (atom->filter_lambda_.accumulated_path) {
+            collector.symbols_.emplace(symbol_table.at(*atom->filter_lambda_.accumulated_path));
+
+            if (atom->filter_lambda_.accumulated_weight) {
+              collector.symbols_.emplace(symbol_table.at(*atom->filter_lambda_.accumulated_weight));
+            }
+          }
           // First handle the inline property filter.
           auto *property_lookup = storage.Create<PropertyLookup>(atom->filter_lambda_.inner_edge, prop_pair.first);
           auto *prop_equal = storage.Create<EqualOperator>(property_lookup, prop_pair.second);
           // Currently, variable expand has no gains if we set PropertyFilter.
-          all_filters_.emplace_back(FilterInfo{FilterInfo::Type::Generic, prop_equal, collector.symbols_});
+          all_filters_.emplace_back(FilterInfo::Type::Generic, prop_equal, collector.symbols_);
         }
         {
           collector.symbols_.clear();
@@ -309,9 +331,9 @@ void Filters::CollectPatternFilters(Pattern &pattern, SymbolTable &symbol_table,
           auto *prop_equal = storage.Create<EqualOperator>(property_lookup, prop_pair.second);
           // Currently, variable expand has no gains if we set PropertyFilter.
           all_filters_.emplace_back(
-              FilterInfo{FilterInfo::Type::Generic,
-                         storage.Create<All>(identifier, atom->identifier_, storage.Create<Where>(prop_equal)),
-                         collector.symbols_});
+              FilterInfo::Type::Generic,
+              storage.Create<All>(identifier, atom->identifier_, storage.Create<Where>(prop_equal)),
+              collector.symbols_);
         }
       }
       return;
@@ -339,12 +361,34 @@ void Filters::CollectPatternFilters(Pattern &pattern, SymbolTable &symbol_table,
   };
   auto add_node_filter = [&](NodeAtom *node) {
     const auto &node_symbol = symbol_table.at(*node->identifier_);
-    if (!node->labels_.empty()) {
-      // Create a LabelsTest and store it.
-      auto *labels_test = storage.Create<LabelsTest>(node->identifier_, node->labels_);
-      auto label_filter = FilterInfo{FilterInfo::Type::Label, labels_test, std::unordered_set<Symbol>{node_symbol}};
-      label_filter.labels = node->labels_;
-      all_filters_.emplace_back(label_filter);
+    std::vector<LabelIx> labels;
+    for (auto label : node->labels_) {
+      if (const auto *label_node = std::get_if<Expression *>(&label)) {
+        throw SemanticException("Property lookup not supported in MATCH/MERGE clause!");
+      }
+      labels.push_back(std::get<LabelIx>(label));
+    }
+    if (!labels.empty()) {
+      // find existing LabelsTest that matched identifier
+      auto it = std::find_if(all_filters_.begin(), all_filters_.end(), MatchesIdentifier(node->identifier_));
+      if (it == all_filters_.end()) {
+        // No existing LabelTest for this identifier
+        auto *labels_test = storage.Create<LabelsTest>(node->identifier_, labels);
+        auto label_filter = FilterInfo{FilterInfo::Type::Label, labels_test, std::unordered_set<Symbol>{node_symbol}};
+        label_filter.labels = labels;
+        all_filters_.emplace_back(label_filter);
+      } else {
+        // Add these labels to existing LabelsTest
+        auto *existing_labels_test = dynamic_cast<LabelsTest *>(it->expression);
+        auto &existing_labels = existing_labels_test->labels_;
+        auto as_set = std::unordered_set(existing_labels.begin(), existing_labels.end());
+        auto before_count = as_set.size();
+        as_set.insert(labels.begin(), labels.end());
+        if (as_set.size() != before_count) {
+          existing_labels = std::vector(as_set.begin(), as_set.end());
+          it->labels = existing_labels;
+        }
+      }
     }
     add_properties(node);
   };
@@ -411,12 +455,129 @@ void Filters::AnalyzeAndStoreFilter(Expression *expr, const SymbolTable &symbol_
     }
     return false;
   };
+
+  // Helper
+  auto commutative_apply = [](auto &&func, auto &&arg1, auto &&arg2) {
+    if (func(arg1, arg2)) return true;
+    if (func(arg2, arg1)) return true;
+    return false;
+  };
+
+  auto is_independant = [&symbol_table](Symbol const &sym, Expression *expression) {
+    UsedSymbolsCollector collector{symbol_table};
+    expression->Accept(collector);
+    return !collector.symbols_.contains(sym);
+  };
+
+  auto get_point_distance_function = [&](Expression *expr, PropertyLookup *&propertyLookup, Identifier *&ident,
+                                         Expression *&other) -> bool {
+    auto *func = utils::Downcast<Function>(expr);
+    auto isPointDistance = func && utils::ToUpperCase(func->function_name_) == "POINT.DISTANCE"sv;
+    if (!isPointDistance) return false;
+    if (func->arguments_.size() != 2) {
+      throw SemanticException("point.distance function requires 2 arguments");
+    }
+
+    auto extract_prop_lookup_and_identifers = [&](Expression *lhs, Expression *rhs) -> bool {
+      if (get_property_lookup(lhs, propertyLookup, ident)) {
+        auto const &sym = symbol_table.at(*ident);
+        if (!is_independant(sym, rhs)) return false;
+        other = rhs;
+        return true;
+      }
+      return false;
+    };
+
+    return commutative_apply(extract_prop_lookup_and_identifers, func->arguments_[0], func->arguments_[1]);
+  };
+
+  auto add_point_distance_filter = [&](auto *expr1, auto *expr2, PointDistanceCondition kind) {
+    PropertyLookup *prop_lookup = nullptr;
+    Identifier *ident = nullptr;
+    Expression *other = nullptr;
+    if (get_point_distance_function(expr1, prop_lookup, ident, other)) {
+      // point.distance(n.prop, other) > expr2
+      auto const &sym = symbol_table.at(*ident);
+      // if expr2 is also dependant on the same symbol then not possible to subsitute with a point index
+      if (!is_independant(sym, expr2)) return false;
+      auto filter = make_filter(FilterInfo::Type::Point);
+      filter.point_filter.emplace(sym, prop_lookup->property_, other, kind, expr2);
+      all_filters_.emplace_back(filter);
+      return true;
+    }
+    return false;
+  };
+
+  auto get_point_withinbbox_function = [&](Expression *expr, PropertyLookup *&propertyLookup, Identifier *&ident,
+                                           Expression *&bottom_left, Expression *&top_right) -> bool {
+    auto *func = utils::Downcast<Function>(expr);
+    auto isPointWithinbbox = func && utils::ToUpperCase(func->function_name_) == "POINT.WITHINBBOX"sv;
+    if (!isPointWithinbbox) return false;
+    if (func->arguments_.size() != 3) {
+      throw SemanticException("point.withinbbox function requires 3 arguments");
+    }
+
+    auto extract_prop_lookup_and_identifers = [&](Expression *point, Expression *bottom_left_expr,
+                                                  Expression *top_right_expr) -> bool {
+      if (get_property_lookup(point, propertyLookup, ident)) {
+        auto const &scan_symbol = symbol_table.at(*ident);
+        if (!is_independant(scan_symbol, bottom_left_expr)) return false;
+        if (!is_independant(scan_symbol, top_right_expr)) return false;
+        bottom_left = bottom_left_expr;
+        top_right = top_right_expr;
+        return true;
+      }
+      return false;
+    };
+
+    return extract_prop_lookup_and_identifers(func->arguments_[0], func->arguments_[1], func->arguments_[2]);
+  };
+
+  auto add_point_withinbbox_filter_binary = [&](auto *expr1, auto *expr2) {
+    PropertyLookup *prop_lookup = nullptr;
+    Identifier *ident = nullptr;
+    Expression *bottom_left = nullptr;
+    Expression *top_right = nullptr;
+    if (get_point_withinbbox_function(expr1, prop_lookup, ident, bottom_left, top_right)) {
+      // point.withinbbox(n.prop, bottom_left, top_right) = expr (true/false)
+      auto const &sym = symbol_table.at(*ident);
+      // if expr2 is also dependant on the same symbol then not possible to subsitute with a point index
+      // theoretically possible but in practice never
+      auto filter = make_filter(FilterInfo::Type::Point);
+      if (!is_independant(sym, expr2)) return false;
+      // have to figure out WithinbboxCondition from expr2
+      filter.point_filter.emplace(sym, prop_lookup->property_, bottom_left, top_right, expr2);
+      all_filters_.emplace_back(filter);
+      return true;
+    }
+    return false;
+  };
+
+  auto add_point_withinbbox_filter_unary = [&](auto *expr1, WithinBBoxCondition condition) {
+    PropertyLookup *prop_lookup = nullptr;
+    Identifier *ident = nullptr;
+    Expression *bottom_left = nullptr;
+    Expression *top_right = nullptr;
+    if (get_point_withinbbox_function(expr1, prop_lookup, ident, bottom_left, top_right)) {
+      // point.withinbbox(n.prop, bottom_left, top_right)
+      auto filter = make_filter(FilterInfo::Type::Point);
+      filter.point_filter.emplace(symbol_table.at(*ident), prop_lookup->property_, bottom_left, top_right, condition);
+      all_filters_.emplace_back(filter);
+      return true;
+    }
+    return false;
+  };
+
   // Checks if either the expr1 and expr2 are property lookups, adds them as
   // PropertyFilter and returns true. Otherwise, returns false.
   auto add_prop_greater = [&](auto *expr1, auto *expr2, auto bound_type) -> bool {
     PropertyLookup *prop_lookup = nullptr;
     Identifier *ident = nullptr;
     bool is_prop_filter = false;
+
+    // We need to get both possible lookups `n.prop > thing` and `thing > n.prop`
+    // Only one can be used in the rewrite, so even when we add both into all_filters_ only one can be used
+    // example where two can be inserted `n0.propA > n1.propB`, the rewritten scan could be for n0 or n1
     if (get_property_lookup(expr1, prop_lookup, ident)) {
       // n.prop > value
       auto filter = make_filter(FilterInfo::Type::Property);
@@ -434,6 +595,11 @@ void Filters::AnalyzeAndStoreFilter(Expression *expr, const SymbolTable &symbol_
       is_prop_filter = true;
     }
     return is_prop_filter;
+  };
+  auto add_prop_range = [&](RangeOperator *range) {
+    auto filter = RangeOpToFilter(range, symbol_table);
+    all_filters_.emplace_back(filter);
+    return;
   };
   // Check if maybe_id_fun is ID invocation on an indentifier and add it as
   // IdFilter.
@@ -498,10 +664,25 @@ void Filters::AnalyzeAndStoreFilter(Expression *expr, const SymbolTable &symbol_
   if (auto *labels_test = utils::Downcast<LabelsTest>(expr)) {
     // Since LabelsTest may contain any expression, we can only use the
     // simplest test on an identifier.
-    if (utils::Downcast<Identifier>(labels_test->expression_)) {
-      auto filter = make_filter(FilterInfo::Type::Label);
-      filter.labels = labels_test->labels_;
-      all_filters_.emplace_back(filter);
+    if (auto *identifier = utils::Downcast<Identifier>(labels_test->expression_)) {
+      auto it = std::find_if(all_filters_.begin(), all_filters_.end(), MatchesIdentifier(identifier));
+      if (it == all_filters_.end()) {
+        // No existing LabelTest for this identifier
+        auto filter = make_filter(FilterInfo::Type::Label);
+        filter.labels = labels_test->labels_;
+        all_filters_.emplace_back(filter);
+      } else {
+        // Add these labels to existing LabelsTest
+        auto *existing_labels_test = dynamic_cast<LabelsTest *>(it->expression);
+        auto &existing_labels = existing_labels_test->labels_;
+        auto as_set = std::unordered_set(existing_labels.begin(), existing_labels.end());
+        auto before_count = as_set.size();
+        as_set.insert(labels_test->labels_.begin(), labels_test->labels_.end());
+        if (as_set.size() != before_count) {
+          existing_labels = std::vector(as_set.begin(), as_set.end());
+          it->labels = existing_labels;
+        }
+      }
     } else {
       all_filters_.emplace_back(make_filter(FilterInfo::Type::Generic));
     }
@@ -523,6 +704,12 @@ void Filters::AnalyzeAndStoreFilter(Expression *expr, const SymbolTable &symbol_
     // Try to get ID equality filter.
     bool is_id_filter = add_id_equal(eq->expression1_, eq->expression2_);
     is_id_filter |= add_id_equal(eq->expression2_, eq->expression1_);
+
+    // WHERE point.withinbbox() = true/
+    if (commutative_apply(add_point_withinbbox_filter_binary, eq->expression1_, eq->expression2_)) {
+      return;
+    }
+
     if (!is_prop_filter && !is_id_filter) {
       // No special filter was added, so just store a generic filter.
       all_filters_.emplace_back(make_filter(FilterInfo::Type::Generic));
@@ -531,22 +718,49 @@ void Filters::AnalyzeAndStoreFilter(Expression *expr, const SymbolTable &symbol_
     if (!add_prop_regex_match(regex_match->string_expr_, regex_match->regex_)) {
       all_filters_.emplace_back(make_filter(FilterInfo::Type::Generic));
     }
+  } else if (auto *range = utils::Downcast<RangeOperator>(expr)) {
+    // We only support property type ranges for now
+    add_prop_range(range);
   } else if (auto *gt = utils::Downcast<GreaterOperator>(expr)) {
-    if (!add_prop_greater(gt->expression1_, gt->expression2_, Bound::Type::EXCLUSIVE)) {
+    if (
+        // look for point.distance(n.prop, other) > expr2
+        !add_point_distance_filter(gt->expression1_, gt->expression2_, PointDistanceCondition::OUTSIDE) &&
+        // look for expr2 > point.distance(n.prop, other)
+        !add_point_distance_filter(gt->expression2_, gt->expression1_, PointDistanceCondition::INSIDE) &&
+        !add_prop_greater(gt->expression1_, gt->expression2_, Bound::Type::EXCLUSIVE)) {
+      // fallback generic
       all_filters_.emplace_back(make_filter(FilterInfo::Type::Generic));
     }
   } else if (auto *ge = utils::Downcast<GreaterEqualOperator>(expr)) {
-    if (!add_prop_greater(ge->expression1_, ge->expression2_, Bound::Type::INCLUSIVE)) {
+    if (
+        // look for point.distance(n.prop, other) >= expr2
+        !add_point_distance_filter(ge->expression1_, ge->expression2_, PointDistanceCondition::OUTSIDE_AND_BOUNDARY) &&
+        // look for expr2 >= point.distance(n.prop, other)
+        !add_point_distance_filter(ge->expression2_, ge->expression1_, PointDistanceCondition::INSIDE_AND_BOUNDARY) &&
+        !add_prop_greater(ge->expression1_, ge->expression2_, Bound::Type::INCLUSIVE)) {
+      // fallback generic
       all_filters_.emplace_back(make_filter(FilterInfo::Type::Generic));
     }
   } else if (auto *lt = utils::Downcast<LessOperator>(expr)) {
-    // Like greater, but in reverse.
-    if (!add_prop_greater(lt->expression2_, lt->expression1_, Bound::Type::EXCLUSIVE)) {
+    if (
+        // look for point.distance(n.prop, other) < expr2
+        !add_point_distance_filter(lt->expression1_, lt->expression2_, PointDistanceCondition::INSIDE) &&
+        // look for expr2 < point.distance(n.prop, other)
+        !add_point_distance_filter(lt->expression2_, lt->expression1_, PointDistanceCondition::OUTSIDE) &&
+        // Like greater, but in reverse.
+        !add_prop_greater(lt->expression2_, lt->expression1_, Bound::Type::EXCLUSIVE)) {
+      // fallback generic
       all_filters_.emplace_back(make_filter(FilterInfo::Type::Generic));
     }
   } else if (auto *le = utils::Downcast<LessEqualOperator>(expr)) {
-    // Like greater equal, but in reverse.
-    if (!add_prop_greater(le->expression2_, le->expression1_, Bound::Type::INCLUSIVE)) {
+    if (
+        // look for point.distance(n.prop, other) <= expr2
+        !add_point_distance_filter(le->expression1_, le->expression2_, PointDistanceCondition::INSIDE_AND_BOUNDARY) &&
+        // look for expr2 <= point.distance(n.prop, other)
+        !add_point_distance_filter(le->expression2_, le->expression1_, PointDistanceCondition::OUTSIDE_AND_BOUNDARY) &&
+        // Like greater equal, but in reverse.
+        !add_prop_greater(le->expression2_, le->expression1_, Bound::Type::INCLUSIVE)) {
+      // fallback generic
       all_filters_.emplace_back(make_filter(FilterInfo::Type::Generic));
     }
   } else if (auto *in = utils::Downcast<InListOperator>(expr)) {
@@ -557,12 +771,19 @@ void Filters::AnalyzeAndStoreFilter(Expression *expr, const SymbolTable &symbol_
     if (!add_prop_in_list(in->expression1_, in->expression2_)) {
       all_filters_.emplace_back(make_filter(FilterInfo::Type::Generic));
     }
-  } else if (auto *is_not_null = utils::Downcast<NotOperator>(expr)) {
-    if (!add_prop_is_not_null_check(is_not_null)) {
+  } else if (auto *is_not = utils::Downcast<NotOperator>(expr)) {
+    // WHERE NOT point.withinbbox()
+    if (!add_point_withinbbox_filter_unary(is_not->expression_, WithinBBoxCondition::OUTSIDE) &&
+        !add_prop_is_not_null_check(is_not)) {
       all_filters_.emplace_back(make_filter(FilterInfo::Type::Generic));
     }
   } else if (auto *exists = utils::Downcast<Exists>(expr)) {
     all_filters_.emplace_back(make_filter(FilterInfo::Type::Pattern));
+  } else if (auto *function = utils::Downcast<Function>(expr)) {
+    // WHERE point.withinbbox()
+    if (!add_point_withinbbox_filter_unary(expr, WithinBBoxCondition::INSIDE)) {
+      all_filters_.emplace_back(make_filter(FilterInfo::Type::Generic));
+    }
   } else {
     all_filters_.emplace_back(make_filter(FilterInfo::Type::Generic));
   }
@@ -613,14 +834,20 @@ void AddMatching(const Match &match, SymbolTable &symbol_table, AstStorage &stor
 
   // If there are any pattern filters, we add those as well
   for (auto &filter : matching.filters) {
-    PatternFilterVisitor visitor(symbol_table, storage);
+    PatternVisitor visitor(symbol_table, storage);
 
     filter.expression->Accept(visitor);
-    filter.matchings = visitor.getMatchings();
+    filter.matchings = visitor.getFilterMatchings();
   }
 }
 
-void PatternFilterVisitor::Visit(Exists &op) {
+PatternVisitor::PatternVisitor(SymbolTable &symbol_table, AstStorage &storage)
+    : symbol_table_(symbol_table), storage_(storage) {}
+PatternVisitor::PatternVisitor(const PatternVisitor &) = default;
+PatternVisitor::PatternVisitor(PatternVisitor &&) noexcept = default;
+PatternVisitor::~PatternVisitor() = default;
+
+void PatternVisitor::Visit(Exists &op) {
   std::vector<Pattern *> patterns;
   patterns.push_back(op.pattern_);
 
@@ -630,7 +857,13 @@ void PatternFilterVisitor::Visit(Exists &op) {
   filter_matching.type = PatternFilterType::EXISTS;
   filter_matching.symbol = std::make_optional<Symbol>(symbol_table_.at(op));
 
-  matchings_.push_back(std::move(filter_matching));
+  filter_matchings_.push_back(std::move(filter_matching));
+}
+
+std::vector<FilterMatching> PatternVisitor::getFilterMatchings() { return filter_matchings_; }
+
+std::vector<PatternComprehensionMatching> PatternVisitor::getPatternComprehensionMatchings() {
+  return pattern_comprehension_matchings_;
 }
 
 static void ParseForeach(query::Foreach &foreach, SingleQueryPart &query_part, AstStorage &storage,
@@ -645,6 +878,30 @@ static void ParseForeach(query::Foreach &foreach, SingleQueryPart &query_part, A
   }
 }
 
+static void ParseReturnBody(query::ReturnBody &retBody, AstStorage &storage, SymbolTable &symbol_table,
+                            std::unordered_map<std::string, PatternComprehensionMatching> &matchings) {
+  for (auto *expr : retBody.named_expressions) {
+    PatternVisitor visitor(symbol_table, storage);
+    expr->Accept(visitor);
+    auto pattern_comprehension_matchings = visitor.getPatternComprehensionMatchings();
+    for (auto &matching : pattern_comprehension_matchings) {
+      matchings.emplace(expr->name_, matching);
+    }
+  }
+}
+
+void PatternVisitor::Visit(NamedExpression &op) { op.expression_->Accept(*this); }
+
+void PatternVisitor::Visit(PatternComprehension &op) {
+  PatternComprehensionMatching matching;
+  AddMatching({op.pattern_}, op.filter_, symbol_table_, storage_, matching);
+  matching.result_expr = storage_.Create<NamedExpression>(symbol_table_.at(op).name(), op.resultExpr_);
+  matching.result_expr->MapTo(symbol_table_.at(op));
+  matching.result_symbol = symbol_table_.at(op);
+
+  pattern_comprehension_matchings_.push_back(std::move(matching));
+}
+
 // Converts a Query to multiple QueryParts. In the process new Ast nodes may be
 // created, e.g. filter expressions.
 std::vector<SingleQueryPart> CollectSingleQueryParts(SymbolTable &symbol_table, AstStorage &storage,
@@ -653,6 +910,12 @@ std::vector<SingleQueryPart> CollectSingleQueryParts(SymbolTable &symbol_table, 
   auto *query_part = &query_parts.back();
   for (auto &clause : single_query->clauses_) {
     if (auto *match = utils::Downcast<Match>(clause)) {
+      if (!query_part->remaining_clauses.empty()) {
+        // New match started
+        // This query part is done, continue with a new one.
+        query_parts.emplace_back(SingleQueryPart{});
+        query_part = &query_parts.back();
+      }
       if (match->optional_) {
         query_part->optional_matching.emplace_back(Matching{});
         AddMatching(*match, symbol_table, storage, query_part->optional_matching.back());
@@ -667,16 +930,21 @@ std::vector<SingleQueryPart> CollectSingleQueryParts(SymbolTable &symbol_table, 
         AddMatching({merge->pattern_}, nullptr, symbol_table, storage, query_part->merge_matching.back());
       } else if (auto *call_subquery = utils::Downcast<query::CallSubquery>(clause)) {
         query_part->subqueries.emplace_back(
-            std::make_shared<QueryParts>(CollectQueryParts(symbol_table, storage, call_subquery->cypher_query_)));
+            std::make_shared<QueryParts>(CollectQueryParts(symbol_table, storage, call_subquery->cypher_query_, true)));
       } else if (auto *foreach = utils::Downcast<query::Foreach>(clause)) {
         ParseForeach(*foreach, *query_part, storage, symbol_table);
-      } else if (utils::IsSubtype(*clause, With::kType) || utils::IsSubtype(*clause, query::Unwind::kType) ||
+      } else if (auto *with = utils::Downcast<With>(clause)) {
+        ParseReturnBody(with->body_, storage, symbol_table, query_part->pattern_comprehension_matchings);
+        query_parts.emplace_back(SingleQueryPart{});
+        query_part = &query_parts.back();
+      } else if (utils::IsSubtype(*clause, query::Unwind::kType) ||
                  utils::IsSubtype(*clause, query::CallProcedure::kType) ||
                  utils::IsSubtype(*clause, query::LoadCsv::kType)) {
         // This query part is done, continue with a new one.
         query_parts.emplace_back(SingleQueryPart{});
         query_part = &query_parts.back();
-      } else if (utils::IsSubtype(*clause, Return::kType)) {
+      } else if (auto *ret = utils::Downcast<Return>(clause)) {
+        ParseReturnBody(ret->body_, storage, symbol_table, query_part->pattern_comprehension_matchings);
         return query_parts;
       }
     }
@@ -684,7 +952,7 @@ std::vector<SingleQueryPart> CollectSingleQueryParts(SymbolTable &symbol_table, 
   return query_parts;
 }
 
-QueryParts CollectQueryParts(SymbolTable &symbol_table, AstStorage &storage, CypherQuery *query) {
+QueryParts CollectQueryParts(SymbolTable &symbol_table, AstStorage &storage, CypherQuery *query, bool is_subquery) {
   std::vector<QueryPart> query_parts;
 
   auto *single_query = query->single_query_;
@@ -701,7 +969,66 @@ QueryParts CollectQueryParts(SymbolTable &symbol_table, AstStorage &storage, Cyp
     MG_ASSERT(single_query, "Expected UNION to have a query");
     query_parts.push_back(QueryPart{CollectSingleQueryParts(symbol_table, storage, single_query), cypher_union});
   }
-  return QueryParts{query_parts, distinct};
+
+  return QueryParts{query_parts, distinct, query->pre_query_directives_.commit_frequency_, is_subquery};
 }
+
+std::vector<Expression *> SplitExpressionOnAnd(Expression *expression) {
+  // TODO: Think about converting all filtering expression into CNF to improve
+  // the granularity of filters which can be stand alone.
+  std::vector<Expression *> expressions;
+  std::stack<Expression *> pending_expressions;
+  pending_expressions.push(expression);
+  while (!pending_expressions.empty()) {
+    auto *current_expression = pending_expressions.top();
+    pending_expressions.pop();
+    if (auto *and_op = utils::Downcast<AndOperator>(current_expression)) {
+      pending_expressions.push(and_op->expression1_);
+      pending_expressions.push(and_op->expression2_);
+    } else {
+      expressions.push_back(current_expression);
+    }
+  }
+  return expressions;
+}
+
+Expression *SubstituteExpression(Expression *expression, Expression *old, Expression *in) {
+  if (expression == old) return in;
+
+  std::stack<Expression *> pending_expressions;
+  pending_expressions.push(expression);
+
+  while (!pending_expressions.empty()) {
+    auto *current_expression = pending_expressions.top();
+    pending_expressions.pop();
+    if (auto *and_op = utils::Downcast<AndOperator>(current_expression)) {
+      if (and_op->expression1_ == old) {
+        and_op->expression1_ = in;
+        break;
+      }
+      if (and_op->expression2_ == old) {
+        and_op->expression2_ = in;
+        break;
+      }
+      pending_expressions.push(and_op->expression1_);
+      pending_expressions.push(and_op->expression2_);
+    }
+  }
+  return expression;
+}
+
+FilterInfo::FilterInfo(Type type, Expression *expression, std::unordered_set<Symbol> used_symbols,
+                       std::optional<PropertyFilter> property_filter, std::optional<IdFilter> id_filter)
+    : type(type),
+      expression(expression),
+      used_symbols(std::move(used_symbols)),
+      property_filter(std::move(property_filter)),
+      id_filter(std::move(id_filter)),
+      matchings({}) {}
+FilterInfo::FilterInfo(const FilterInfo &) = default;
+FilterInfo &FilterInfo::operator=(const FilterInfo &) = default;
+FilterInfo::FilterInfo(FilterInfo &&) noexcept = default;
+FilterInfo &FilterInfo::operator=(FilterInfo &&) noexcept = default;
+FilterInfo::~FilterInfo() = default;
 
 }  // namespace memgraph::query::plan

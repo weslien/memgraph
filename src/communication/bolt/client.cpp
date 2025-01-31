@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -14,6 +14,9 @@
 #include "communication/bolt/v1/codes.hpp"
 #include "communication/bolt/v1/value.hpp"
 #include "utils/logging.hpp"
+
+#include "communication/bolt/v1/fmt.hpp"
+#include "io/network/fmt.hpp"
 
 namespace {
 constexpr uint8_t kBoltV43Version[4] = {0x00, 0x00, 0x03, 0x04};
@@ -80,7 +83,7 @@ void Client::Connect(const io::network::Endpoint &endpoint, const std::string &u
   spdlog::debug("Metadata of init message response: {}", metadata);
 }
 
-QueryData Client::Execute(const std::string &query, const std::map<std::string, Value> &parameters) {
+QueryData Client::Execute(const std::string &query, const map_t &parameters) {
   if (!client_.IsConnected()) {
     throw ClientFatalException("You must first connect to the server before using the client!");
   }
@@ -198,9 +201,8 @@ void Client::Reset() {
   }
 }
 
-std::optional<std::map<std::string, Value>> Client::Route(const std::map<std::string, Value> &routing,
-                                                          const std::vector<Value> &bookmarks,
-                                                          const std::optional<std::string> &db) {
+std::optional<map_t> Client::Route(const map_t &routing, const std::vector<Value> &bookmarks,
+                                   const std::optional<std::string> &db) {
   if (!client_.IsConnected()) {
     throw ClientFatalException("You must first connect to the server before using the client!");
   }

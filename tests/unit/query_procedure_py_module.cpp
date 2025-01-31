@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -21,6 +21,8 @@
 #include "storage/v2/inmemory/storage.hpp"
 #include "test_utils.hpp"
 
+using memgraph::replication_coordination_glue::ReplicationRole;
+
 template <typename StorageType>
 class PyModule : public testing::Test {
  public:
@@ -36,7 +38,7 @@ class PyModule : public testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(PyModule, StorageTypes);
+TYPED_TEST_SUITE(PyModule, StorageTypes);
 
 TYPED_TEST(PyModule, MgpValueToPyObject) {
   mgp_memory memory{memgraph::utils::NewDeleteResource()};
@@ -132,7 +134,7 @@ TYPED_TEST(PyModule, PyVertex) {
   auto storage_dba = this->db->Access();
   memgraph::query::DbAccessor dba(storage_dba.get());
   mgp_memory memory{memgraph::utils::NewDeleteResource()};
-  mgp_graph graph{&dba, memgraph::storage::View::OLD, nullptr};
+  mgp_graph graph{&dba, memgraph::storage::View::OLD, nullptr, dba.GetStorageMode()};
   auto *vertex = EXPECT_MGP_NO_ERROR(mgp_vertex *, mgp_graph_get_vertex_by_id, &graph, mgp_vertex_id{0}, &memory);
   ASSERT_TRUE(vertex);
   auto *vertex_value = EXPECT_MGP_NO_ERROR(mgp_value *, mgp_value_make_vertex,
@@ -182,7 +184,7 @@ TYPED_TEST(PyModule, PyEdge) {
   auto storage_dba = this->db->Access();
   memgraph::query::DbAccessor dba(storage_dba.get());
   mgp_memory memory{memgraph::utils::NewDeleteResource()};
-  mgp_graph graph{&dba, memgraph::storage::View::OLD, nullptr};
+  mgp_graph graph{&dba, memgraph::storage::View::OLD, nullptr, dba.GetStorageMode()};
   auto *start_v = EXPECT_MGP_NO_ERROR(mgp_vertex *, mgp_graph_get_vertex_by_id, &graph, mgp_vertex_id{0}, &memory);
   ASSERT_TRUE(start_v);
   auto *edges_it = EXPECT_MGP_NO_ERROR(mgp_edges_iterator *, mgp_vertex_iter_out_edges, start_v, &memory);
@@ -228,7 +230,7 @@ TYPED_TEST(PyModule, PyPath) {
   auto storage_dba = this->db->Access();
   memgraph::query::DbAccessor dba(storage_dba.get());
   mgp_memory memory{memgraph::utils::NewDeleteResource()};
-  mgp_graph graph{&dba, memgraph::storage::View::OLD, nullptr};
+  mgp_graph graph{&dba, memgraph::storage::View::OLD, nullptr, dba.GetStorageMode()};
   auto *start_v = EXPECT_MGP_NO_ERROR(mgp_vertex *, mgp_graph_get_vertex_by_id, &graph, mgp_vertex_id{0}, &memory);
   ASSERT_TRUE(start_v);
   auto *path = EXPECT_MGP_NO_ERROR(mgp_path *, mgp_path_make_with_start, start_v, &memory);

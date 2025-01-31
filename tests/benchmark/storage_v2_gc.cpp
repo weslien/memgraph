@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -16,6 +16,8 @@
 #include "storage/v2/inmemory/storage.hpp"
 #include "storage/v2/storage.hpp"
 #include "utils/timer.hpp"
+
+using memgraph::replication_coordination_glue::ReplicationRole;
 
 // This benchmark should be run for a fixed amount of time that is
 // large compared to GC interval to make the output relevant.

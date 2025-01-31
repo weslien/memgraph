@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -16,16 +16,34 @@
 #include <variant>
 #include <vector>
 
+#include "query/exceptions.hpp"
 #include "query/frontend/ast/ast_visitor.hpp"
 #include "query/frontend/semantic/symbol.hpp"
 #include "query/interpret/awesome_memgraph_functions.hpp"
+#include "query/procedure/module_fwd.hpp"
 #include "query/typed_value.hpp"
+#include "storage/v2/constraints/type_constraints.hpp"
 #include "storage/v2/property_value.hpp"
+#include "utils/exceptions.hpp"
+#include "utils/string.hpp"
 #include "utils/typeinfo.hpp"
+#include "utils/variant_helpers.hpp"
 
-namespace memgraph {
+namespace memgraph::query {
 
-namespace query {
+inline constexpr std::string_view kBoltServer = "bolt_server";
+inline constexpr std::string_view kReplicationServer = "replication_server";
+inline constexpr std::string_view kCoordinatorServer = "coordinator_server";
+inline constexpr std::string_view kManagementServer = "management_server";
+
+inline constexpr std::string_view kLabel = "label";
+inline constexpr std::string_view kProperty = "property";
+inline constexpr std::string_view kMetric = "metric";
+inline constexpr std::string_view kDimension = "dimension";
+inline constexpr std::string_view kCapacity = "capacity";
+inline constexpr std::string_view kResizeCoefficient = "resize_coefficient";
+inline constexpr std::uint16_t kDefaultResizeCoefficient = 2;
+inline constexpr std::string_view kDefaultMetric = "l2sq";
 
 struct LabelIx {
   static const utils::TypeInfo kType;
@@ -62,8 +80,8 @@ inline bool operator!=(const PropertyIx &a, const PropertyIx &b) { return !(a ==
 inline bool operator==(const EdgeTypeIx &a, const EdgeTypeIx &b) { return a.ix == b.ix && a.name == b.name; }
 
 inline bool operator!=(const EdgeTypeIx &a, const EdgeTypeIx &b) { return !(a == b); }
-}  // namespace query
-}  // namespace memgraph
+}  // namespace memgraph::query
+
 namespace std {
 
 template <>
@@ -83,9 +101,7 @@ struct hash<memgraph::query::EdgeTypeIx> {
 
 }  // namespace std
 
-namespace memgraph {
-
-namespace query {
+namespace memgraph::query {
 
 class Tree;
 
@@ -139,7 +155,7 @@ class Tree {
   virtual const utils::TypeInfo &GetTypeInfo() const { return kType; }
 
   Tree() = default;
-  virtual ~Tree() {}
+  virtual ~Tree() = default;
 
   virtual Tree *Clone(AstStorage *storage) const = 0;
 
@@ -470,6 +486,35 @@ class ModOperator : public memgraph::query::BinaryOperator {
   friend class AstStorage;
 };
 
+class ExponentiationOperator : public memgraph::query::BinaryOperator {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  DEFVISITABLE(ExpressionVisitor<TypedValue>);
+  DEFVISITABLE(ExpressionVisitor<TypedValue *>);
+  DEFVISITABLE(ExpressionVisitor<void>);
+  bool Accept(HierarchicalTreeVisitor &visitor) override {
+    if (visitor.PreVisit(*this)) {
+      expression1_->Accept(visitor) && expression2_->Accept(visitor);
+    }
+    return visitor.PostVisit(*this);
+  }
+
+  ExponentiationOperator *Clone(AstStorage *storage) const override {
+    ExponentiationOperator *object = storage->Create<ExponentiationOperator>();
+    object->expression1_ = expression1_ ? expression1_->Clone(storage) : nullptr;
+    object->expression2_ = expression2_ ? expression2_->Clone(storage) : nullptr;
+    return object;
+  }
+
+ protected:
+  using BinaryOperator::BinaryOperator;
+
+ private:
+  friend class AstStorage;
+};
+
 class NotEqualOperator : public memgraph::query::BinaryOperator {
  public:
   static const utils::TypeInfo kType;
@@ -639,6 +684,35 @@ class GreaterEqualOperator : public memgraph::query::BinaryOperator {
 
  protected:
   using BinaryOperator::BinaryOperator;
+
+ private:
+  friend class AstStorage;
+};
+
+class RangeOperator : public memgraph::query::Expression {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  Expression *expr1_{};
+  Expression *expr2_{};
+
+  DEFVISITABLE(ExpressionVisitor<TypedValue>);
+  DEFVISITABLE(ExpressionVisitor<TypedValue *>);
+  DEFVISITABLE(ExpressionVisitor<void>);
+  bool Accept(HierarchicalTreeVisitor &visitor) override {
+    if (visitor.PreVisit(*this)) {
+      expr1_->Accept(visitor) && expr2_->Accept(visitor);
+    }
+    return visitor.PostVisit(*this);
+  }
+
+  RangeOperator *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<RangeOperator>();
+    object->expr1_ = expr1_ ? expr1_->Clone(storage) : nullptr;
+    object->expr2_ = expr2_ ? expr2_->Clone(storage) : nullptr;
+    return object;
+  }
 
  private:
   friend class AstStorage;
@@ -1213,7 +1287,8 @@ class PropertyLookup : public memgraph::query::Expression {
   }
 
  protected:
-  PropertyLookup(Expression *expression, PropertyIx property) : expression_(expression), property_(property) {}
+  PropertyLookup(Expression *expression, PropertyIx property)
+      : expression_(expression), property_(std::move(property)) {}
 
  private:
   friend class AstStorage;
@@ -1251,6 +1326,8 @@ class AllPropertiesLookup : public memgraph::query::Expression {
   friend class AstStorage;
 };
 
+using QueryLabelType = std::variant<LabelIx, Expression *>;
+
 class LabelsTest : public memgraph::query::Expression {
  public:
   static const utils::TypeInfo kType;
@@ -1283,6 +1360,16 @@ class LabelsTest : public memgraph::query::Expression {
 
  protected:
   LabelsTest(Expression *expression, const std::vector<LabelIx> &labels) : expression_(expression), labels_(labels) {}
+  LabelsTest(Expression *expression, const std::vector<QueryLabelType> &labels) : expression_(expression) {
+    labels_.reserve(labels.size());
+    for (const auto &label : labels) {
+      if (const auto *label_ix = std::get_if<LabelIx>(&label)) {
+        labels_.push_back(*label_ix);
+      } else {
+        throw SemanticException("You can't use labels in filter expressions.");
+      }
+    }
+  }
 
  private:
   friend class AstStorage;
@@ -1310,6 +1397,8 @@ class Function : public memgraph::query::Expression {
   std::vector<memgraph::query::Expression *> arguments_;
   std::string function_name_;
   std::function<TypedValue(const TypedValue *, int64_t, const FunctionContext &)> function_;
+  // This is needed to acquire the shared lock on the module so it doesn't get reloaded while the query is running
+  std::shared_ptr<procedure::Module> module_;
 
   Function *Clone(AstStorage *storage) const override {
     Function *object = storage->Create<Function>();
@@ -1319,15 +1408,30 @@ class Function : public memgraph::query::Expression {
     }
     object->function_name_ = function_name_;
     object->function_ = function_;
+    object->module_ = module_;
     return object;
   }
 
+  bool IsBuiltin() const { return not bool(module_); }
+
+  bool IsUserDefined() const { return bool(module_); }
+
  protected:
   Function(const std::string &function_name, const std::vector<Expression *> &arguments)
-      : arguments_(arguments), function_name_(function_name), function_(NameToFunction(function_name_)) {
-    if (!function_) {
-      throw SemanticException("Function '{}' doesn't exist.", function_name);
-    }
+      : arguments_(arguments), function_name_(function_name) {
+    auto func_result = NameToFunction(function_name_);
+
+    std::visit(utils::Overloaded{
+                   [this](func_impl function) {
+                     function_ = function;
+                     module_.reset();
+                   },
+                   [this](std::pair<func_impl, std::shared_ptr<procedure::Module>> &function) {
+                     function_ = function.first;
+                     module_ = std::move(function.second);
+                   },
+                   [&](std::monostate) { throw SemanticException("Function '{}' doesn't exist.", function_name); }},
+               func_result);
   }
 
  private:
@@ -1773,7 +1877,7 @@ class NodeAtom : public memgraph::query::PatternAtom {
     return visitor.PostVisit(*this);
   }
 
-  std::vector<memgraph::query::LabelIx> labels_;
+  std::vector<QueryLabelType> labels_;
   std::variant<std::unordered_map<memgraph::query::PropertyIx, memgraph::query::Expression *>,
                memgraph::query::ParameterLookup *>
       properties_;
@@ -1783,7 +1887,11 @@ class NodeAtom : public memgraph::query::PatternAtom {
     object->identifier_ = identifier_ ? identifier_->Clone(storage) : nullptr;
     object->labels_.resize(labels_.size());
     for (auto i = 0; i < object->labels_.size(); ++i) {
-      object->labels_[i] = storage->GetLabelIx(labels_[i].name);
+      if (const auto *label = std::get_if<LabelIx>(&labels_[i])) {
+        object->labels_[i] = storage->GetLabelIx(label->name);
+      } else {
+        object->labels_[i] = std::get<Expression *>(labels_[i])->Clone(storage);
+      }
     }
     if (const auto *properties = std::get_if<std::unordered_map<PropertyIx, Expression *>>(&properties_)) {
       auto &new_obj_properties = std::get<std::unordered_map<PropertyIx, Expression *>>(object->properties_);
@@ -1809,9 +1917,9 @@ class EdgeAtom : public memgraph::query::PatternAtom {
   static const utils::TypeInfo kType;
   const utils::TypeInfo &GetTypeInfo() const override { return kType; }
 
-  enum class Type { SINGLE, DEPTH_FIRST, BREADTH_FIRST, WEIGHTED_SHORTEST_PATH, ALL_SHORTEST_PATHS };
+  enum class Type : uint8_t { SINGLE, DEPTH_FIRST, BREADTH_FIRST, WEIGHTED_SHORTEST_PATH, ALL_SHORTEST_PATHS };
 
-  enum class Direction { IN, OUT, BOTH };
+  enum class Direction : uint8_t { IN, OUT, BOTH };
 
   /// Lambda for use in filtering or weight calculation during variable expand.
   struct Lambda {
@@ -1822,6 +1930,10 @@ class EdgeAtom : public memgraph::query::PatternAtom {
     memgraph::query::Identifier *inner_edge{nullptr};
     /// Argument identifier for the destination node of the edge.
     memgraph::query::Identifier *inner_node{nullptr};
+    /// Argument identifier for the currently-accumulated path.
+    memgraph::query::Identifier *accumulated_path{nullptr};
+    /// Argument identifier for the weight of the currently-accumulated path.
+    memgraph::query::Identifier *accumulated_weight{nullptr};
     /// Evaluates the result of the lambda.
     memgraph::query::Expression *expression{nullptr};
 
@@ -1829,6 +1941,8 @@ class EdgeAtom : public memgraph::query::PatternAtom {
       Lambda object;
       object.inner_edge = inner_edge ? inner_edge->Clone(storage) : nullptr;
       object.inner_node = inner_node ? inner_node->Clone(storage) : nullptr;
+      object.accumulated_path = accumulated_path ? accumulated_path->Clone(storage) : nullptr;
+      object.accumulated_weight = accumulated_weight ? accumulated_weight->Clone(storage) : nullptr;
       object.expression = expression ? expression->Clone(storage) : nullptr;
       return object;
     }
@@ -2001,6 +2115,7 @@ class SingleQuery : public memgraph::query::Tree, public utils::Visitable<Hierar
   }
 
   std::vector<memgraph::query::Clause *> clauses_;
+  bool has_update{};
 
   SingleQuery *Clone(AstStorage *storage) const override {
     SingleQuery *object = storage->Create<SingleQuery>();
@@ -2008,6 +2123,7 @@ class SingleQuery : public memgraph::query::Tree, public utils::Visitable<Hierar
     for (auto i4 = 0; i4 < clauses_.size(); ++i4) {
       object->clauses_[i4] = clauses_[i4] ? clauses_[i4]->Clone(storage) : nullptr;
     }
+    object->has_update = has_update;
     return object;
   }
 
@@ -2073,7 +2189,7 @@ struct IndexHint {
   static const utils::TypeInfo kType;
   const utils::TypeInfo &GetTypeInfo() const { return kType; }
 
-  enum class IndexType { LABEL, LABEL_PROPERTY };
+  enum class IndexType { LABEL, LABEL_PROPERTY, POINT };
 
   memgraph::query::IndexHint::IndexType index_type_;
   memgraph::query::LabelIx label_;
@@ -2086,6 +2202,29 @@ struct IndexHint {
     if (property_) {
       object.property_ = storage->GetPropertyIx(property_->name);
     }
+    return object;
+  }
+};
+
+struct PreQueryDirectives {
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const { return kType; }
+
+  /// Index hints
+  std::vector<memgraph::query::IndexHint> index_hints_;
+  /// Hops limit
+  memgraph::query::Expression *hops_limit_{nullptr};
+  /// Commit frequency
+  memgraph::query::Expression *commit_frequency_{nullptr};
+
+  PreQueryDirectives Clone(AstStorage *storage) const {
+    PreQueryDirectives object;
+    object.index_hints_.resize(index_hints_.size());
+    for (auto i = 0; i < index_hints_.size(); ++i) {
+      object.index_hints_[i] = index_hints_[i].Clone(storage);
+    }
+    object.hops_limit_ = hops_limit_ ? hops_limit_->Clone(storage) : nullptr;
+    object.commit_frequency_ = commit_frequency_ ? commit_frequency_->Clone(storage) : nullptr;
     return object;
   }
 };
@@ -2114,13 +2253,11 @@ class CypherQuery : public memgraph::query::Query, public utils::Visitable<Hiera
   memgraph::query::SingleQuery *single_query_{nullptr};
   /// Contains remaining queries that should form and union with `single_query_`.
   std::vector<memgraph::query::CypherUnion *> cypher_unions_;
-  /// Index hint
-  /// Suggestion: If we’re going to have multiple pre-query directives (not only index_hints_), they need to be
-  /// contained within a dedicated class/struct
-  std::vector<memgraph::query::IndexHint> index_hints_;
   /// Memory limit
   memgraph::query::Expression *memory_limit_{nullptr};
   size_t memory_scale_{1024U};
+  /// Using statement
+  memgraph::query::PreQueryDirectives pre_query_directives_;
 
   CypherQuery *Clone(AstStorage *storage) const override {
     CypherQuery *object = storage->Create<CypherQuery>();
@@ -2129,12 +2266,9 @@ class CypherQuery : public memgraph::query::Query, public utils::Visitable<Hiera
     for (auto i5 = 0; i5 < cypher_unions_.size(); ++i5) {
       object->cypher_unions_[i5] = cypher_unions_[i5] ? cypher_unions_[i5]->Clone(storage) : nullptr;
     }
-    object->index_hints_.resize(index_hints_.size());
-    for (auto i6 = 0; i6 < index_hints_.size(); ++i6) {
-      object->index_hints_[i6] = index_hints_[i6].Clone(storage);
-    }
     object->memory_limit_ = memory_limit_ ? memory_limit_->Clone(storage) : nullptr;
     object->memory_scale_ = memory_scale_;
+    object->pre_query_directives_ = pre_query_directives_.Clone(storage);
     return object;
   }
 
@@ -2214,7 +2348,145 @@ class IndexQuery : public memgraph::query::Query {
 
  protected:
   IndexQuery(Action action, LabelIx label, std::vector<PropertyIx> properties)
-      : action_(action), label_(label), properties_(properties) {}
+      : action_(action), label_(std::move(label)), properties_(std::move(properties)) {}
+
+ private:
+  friend class AstStorage;
+};
+
+class EdgeIndexQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  enum class Action { CREATE, DROP };
+
+  EdgeIndexQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  memgraph::query::EdgeIndexQuery::Action action_;
+  memgraph::query::EdgeTypeIx edge_type_;
+  std::vector<memgraph::query::PropertyIx> properties_;
+
+  EdgeIndexQuery *Clone(AstStorage *storage) const override {
+    EdgeIndexQuery *object = storage->Create<EdgeIndexQuery>();
+    object->action_ = action_;
+    object->edge_type_ = storage->GetEdgeTypeIx(edge_type_.name);
+    object->properties_.resize(properties_.size());
+    for (auto i = 0; i < object->properties_.size(); ++i) {
+      object->properties_[i] = storage->GetPropertyIx(properties_[i].name);
+    }
+    return object;
+  }
+
+ protected:
+  EdgeIndexQuery(Action action, EdgeTypeIx edge_type, std::vector<PropertyIx> properties)
+      : action_(action), edge_type_(edge_type), properties_(std::move(properties)) {}
+
+ private:
+  friend class AstStorage;
+};
+
+class PointIndexQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  enum class Action { CREATE, DROP };
+
+  PointIndexQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  memgraph::query::PointIndexQuery::Action action_;
+  memgraph::query::LabelIx label_;
+  memgraph::query::PropertyIx property_;
+
+  PointIndexQuery *Clone(AstStorage *storage) const override {
+    PointIndexQuery *object = storage->Create<PointIndexQuery>();
+    object->action_ = action_;
+    object->label_ = storage->GetLabelIx(label_.name);
+    object->property_ = storage->GetPropertyIx(property_.name);
+    return object;
+  }
+
+ protected:
+  PointIndexQuery(Action action, LabelIx label, PropertyIx property)
+      : action_(action), label_(std::move(label)), property_(std::move(property)) {}
+
+ private:
+  friend class AstStorage;
+};
+
+class TextIndexQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  enum class Action { CREATE, DROP };
+
+  TextIndexQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  memgraph::query::TextIndexQuery::Action action_;
+  memgraph::query::LabelIx label_;
+  std::string index_name_;
+
+  TextIndexQuery *Clone(AstStorage *storage) const override {
+    TextIndexQuery *object = storage->Create<TextIndexQuery>();
+    object->action_ = action_;
+    object->label_ = storage->GetLabelIx(label_.name);
+    object->index_name_ = index_name_;
+    return object;
+  }
+
+ protected:
+  TextIndexQuery(Action action, LabelIx label, std::string index_name)
+      : action_(action), label_(std::move(label)), index_name_(index_name) {}
+
+ private:
+  friend class AstStorage;
+};
+
+class VectorIndexQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  enum class Action { CREATE, DROP };
+
+  VectorIndexQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  memgraph::query::VectorIndexQuery::Action action_;
+  std::string index_name_;
+  memgraph::query::LabelIx label_;
+  memgraph::query::PropertyIx property_;
+  std::unordered_map<memgraph::query::Expression *, memgraph::query::Expression *> configs_;
+
+  VectorIndexQuery *Clone(AstStorage *storage) const override {
+    VectorIndexQuery *object = storage->Create<VectorIndexQuery>();
+    object->action_ = action_;
+    object->index_name_ = index_name_;
+    object->label_ = storage->GetLabelIx(label_.name);
+    object->property_ = storage->GetPropertyIx(property_.name);
+    for (const auto &[key, value] : configs_) {
+      object->configs_[key->Clone(storage)] = value->Clone(storage);
+    }
+    return object;
+  }
+
+ protected:
+  VectorIndexQuery(Action action, std::string index_name, LabelIx label, PropertyIx property,
+                   std::unordered_map<Expression *, Expression *> configs)
+      : action_(action),
+        index_name_(std::move(index_name)),
+        label_(std::move(label)),
+        property_(std::move(property)),
+        configs_(std::move(configs)) {}
 
  private:
   friend class AstStorage;
@@ -2625,20 +2897,25 @@ class SetLabels : public memgraph::query::Clause {
   }
 
   memgraph::query::Identifier *identifier_{nullptr};
-  std::vector<memgraph::query::LabelIx> labels_;
+  std::vector<QueryLabelType> labels_;
 
   SetLabels *Clone(AstStorage *storage) const override {
     SetLabels *object = storage->Create<SetLabels>();
     object->identifier_ = identifier_ ? identifier_->Clone(storage) : nullptr;
     object->labels_.resize(labels_.size());
     for (auto i = 0; i < object->labels_.size(); ++i) {
-      object->labels_[i] = storage->GetLabelIx(labels_[i].name);
+      if (const auto *label = std::get_if<LabelIx>(&labels_[i])) {
+        object->labels_[i] = storage->GetLabelIx(label->name);
+      } else {
+        object->labels_[i] = std::get<Expression *>(labels_[i])->Clone(storage);
+      }
     }
     return object;
   }
 
  protected:
-  SetLabels(Identifier *identifier, const std::vector<LabelIx> &labels) : identifier_(identifier), labels_(labels) {}
+  SetLabels(Identifier *identifier, std::vector<QueryLabelType> labels)
+      : identifier_(identifier), labels_(std::move(labels)) {}
 
  private:
   friend class AstStorage;
@@ -2688,20 +2965,25 @@ class RemoveLabels : public memgraph::query::Clause {
   }
 
   memgraph::query::Identifier *identifier_{nullptr};
-  std::vector<memgraph::query::LabelIx> labels_;
+  std::vector<QueryLabelType> labels_;
 
   RemoveLabels *Clone(AstStorage *storage) const override {
     RemoveLabels *object = storage->Create<RemoveLabels>();
     object->identifier_ = identifier_ ? identifier_->Clone(storage) : nullptr;
     object->labels_.resize(labels_.size());
     for (auto i = 0; i < object->labels_.size(); ++i) {
-      object->labels_[i] = storage->GetLabelIx(labels_[i].name);
+      if (const auto *label = std::get_if<LabelIx>(&labels_[i])) {
+        object->labels_[i] = storage->GetLabelIx(label->name);
+      } else {
+        object->labels_[i] = std::get<Expression *>(labels_[i])->Clone(storage);
+      }
     }
     return object;
   }
 
  protected:
-  RemoveLabels(Identifier *identifier, const std::vector<LabelIx> &labels) : identifier_(identifier), labels_(labels) {}
+  RemoveLabels(Identifier *identifier, std::vector<QueryLabelType> labels)
+      : identifier_(identifier), labels_(std::move(labels)) {}
 
  private:
   friend class AstStorage;
@@ -2805,7 +3087,9 @@ class AuthQuery : public memgraph::query::Query {
     SHOW_ROLES,
     CREATE_USER,
     SET_PASSWORD,
+    CHANGE_PASSWORD,
     DROP_USER,
+    SHOW_CURRENT_USER,
     SHOW_USERS,
     SET_ROLE,
     CLEAR_ROLE,
@@ -2816,6 +3100,7 @@ class AuthQuery : public memgraph::query::Query {
     SHOW_ROLE_FOR_USER,
     SHOW_USERS_FOR_ROLE,
     GRANT_DATABASE_TO_USER,
+    DENY_DATABASE_FROM_USER,
     REVOKE_DATABASE_FROM_USER,
     SHOW_DATABASE_PRIVILEGES,
     SET_MAIN_DATABASE,
@@ -2847,6 +3132,7 @@ class AuthQuery : public memgraph::query::Query {
     TRANSACTION_MANAGEMENT,
     MULTI_DATABASE_EDIT,
     MULTI_DATABASE_USE,
+    COORDINATOR
   };
 
   enum class FineGrainedPrivilege { NOTHING, READ, UPDATE, CREATE_DELETE };
@@ -2859,6 +3145,9 @@ class AuthQuery : public memgraph::query::Query {
   std::string user_;
   std::string role_;
   std::string user_or_role_;
+  memgraph::query::Expression *old_password_{nullptr};
+  memgraph::query::Expression *new_password_{nullptr};
+  bool if_not_exists_;
   memgraph::query::Expression *password_{nullptr};
   std::string database_;
   std::vector<memgraph::query::AuthQuery::Privilege> privileges_;
@@ -2873,6 +3162,9 @@ class AuthQuery : public memgraph::query::Query {
     object->user_ = user_;
     object->role_ = role_;
     object->user_or_role_ = user_or_role_;
+    object->old_password_ = old_password_;
+    object->new_password_ = new_password_;
+    object->if_not_exists_ = if_not_exists_;
     object->password_ = password_ ? password_->Clone(storage) : nullptr;
     object->database_ = database_;
     object->privileges_ = privileges_;
@@ -2882,14 +3174,15 @@ class AuthQuery : public memgraph::query::Query {
   }
 
  protected:
-  AuthQuery(Action action, std::string user, std::string role, std::string user_or_role, Expression *password,
-            std::string database, std::vector<Privilege> privileges,
+  AuthQuery(Action action, std::string user, std::string role, std::string user_or_role, bool if_not_exists,
+            Expression *password, std::string database, std::vector<Privilege> privileges,
             std::vector<std::unordered_map<FineGrainedPrivilege, std::vector<std::string>>> label_privileges,
             std::vector<std::unordered_map<FineGrainedPrivilege, std::vector<std::string>>> edge_type_privileges)
       : action_(action),
         user_(user),
         role_(role),
         user_or_role_(user_or_role),
+        if_not_exists_(if_not_exists),
         password_(password),
         database_(database),
         privileges_(privileges),
@@ -2925,14 +3218,15 @@ const std::vector<AuthQuery::Privilege> kPrivilegesAll = {AuthQuery::Privilege::
                                                           AuthQuery::Privilege::TRANSACTION_MANAGEMENT,
                                                           AuthQuery::Privilege::STORAGE_MODE,
                                                           AuthQuery::Privilege::MULTI_DATABASE_EDIT,
-                                                          AuthQuery::Privilege::MULTI_DATABASE_USE};
+                                                          AuthQuery::Privilege::MULTI_DATABASE_USE,
+                                                          AuthQuery::Privilege::COORDINATOR};
 
 class DatabaseInfoQuery : public memgraph::query::Query {
  public:
   static const utils::TypeInfo kType;
   const utils::TypeInfo &GetTypeInfo() const override { return kType; }
 
-  enum class InfoType { INDEX, CONSTRAINT };
+  enum class InfoType { INDEX, CONSTRAINT, EDGE_TYPES, NODE_LABELS, METRICS };
 
   DEFVISITABLE(QueryVisitor<void>);
 
@@ -2950,7 +3244,7 @@ class SystemInfoQuery : public memgraph::query::Query {
   static const utils::TypeInfo kType;
   const utils::TypeInfo &GetTypeInfo() const override { return kType; }
 
-  enum class InfoType { STORAGE, BUILD };
+  enum class InfoType { STORAGE, BUILD, ACTIVE_USERS, LICENSE };
 
   DEFVISITABLE(QueryVisitor<void>);
 
@@ -2967,15 +3261,17 @@ struct Constraint {
   static const utils::TypeInfo kType;
   const utils::TypeInfo &GetTypeInfo() const { return kType; }
 
-  enum class Type { EXISTS, UNIQUE, NODE_KEY };
+  enum class Type { EXISTS, UNIQUE, NODE_KEY, TYPE };
 
   memgraph::query::Constraint::Type type;
+  std::optional<storage::TypeConstraintKind> type_constraint;
   memgraph::query::LabelIx label;
   std::vector<memgraph::query::PropertyIx> properties;
 
   Constraint Clone(AstStorage *storage) const {
     Constraint object;
     object.type = type;
+    object.type_constraint = type_constraint;
     object.label = storage->GetLabelIx(label.name);
     object.properties.resize(properties.size());
     for (auto i = 0; i < object.properties.size(); ++i) {
@@ -3029,16 +3325,15 @@ class ReplicationQuery : public memgraph::query::Query {
 
   enum class SyncMode { SYNC, ASYNC };
 
-  enum class ReplicaState { READY, REPLICATING, RECOVERY, INVALID };
-
   ReplicationQuery() = default;
 
   DEFVISITABLE(QueryVisitor<void>);
 
   memgraph::query::ReplicationQuery::Action action_;
   memgraph::query::ReplicationQuery::ReplicationRole role_;
-  std::string replica_name_;
+  std::string instance_name_;
   memgraph::query::Expression *socket_address_{nullptr};
+  memgraph::query::Expression *coordinator_socket_address_{nullptr};
   memgraph::query::Expression *port_{nullptr};
   memgraph::query::ReplicationQuery::SyncMode sync_mode_;
 
@@ -3046,10 +3341,78 @@ class ReplicationQuery : public memgraph::query::Query {
     ReplicationQuery *object = storage->Create<ReplicationQuery>();
     object->action_ = action_;
     object->role_ = role_;
-    object->replica_name_ = replica_name_;
+    object->instance_name_ = instance_name_;
     object->socket_address_ = socket_address_ ? socket_address_->Clone(storage) : nullptr;
     object->port_ = port_ ? port_->Clone(storage) : nullptr;
     object->sync_mode_ = sync_mode_;
+    object->coordinator_socket_address_ =
+        coordinator_socket_address_ ? coordinator_socket_address_->Clone(storage) : nullptr;
+
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+class CoordinatorQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  enum class Action {
+    REGISTER_INSTANCE,
+    UNREGISTER_INSTANCE,
+    SET_INSTANCE_TO_MAIN,
+    SHOW_INSTANCE,
+    SHOW_INSTANCES,
+    ADD_COORDINATOR_INSTANCE,
+    REMOVE_COORDINATOR_INSTANCE,
+    DEMOTE_INSTANCE,
+    FORCE_RESET_CLUSTER_STATE
+  };
+
+  enum class SyncMode { SYNC, ASYNC };
+
+  CoordinatorQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  memgraph::query::CoordinatorQuery::Action action_;
+  std::string instance_name_{};
+  std::unordered_map<memgraph::query::Expression *, memgraph::query::Expression *> configs_;
+  memgraph::query::Expression *coordinator_id_{nullptr};
+  memgraph::query::CoordinatorQuery::SyncMode sync_mode_;
+
+  CoordinatorQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<CoordinatorQuery>();
+
+    object->action_ = action_;
+    object->instance_name_ = instance_name_;
+    object->coordinator_id_ = coordinator_id_ ? coordinator_id_->Clone(storage) : nullptr;
+    object->sync_mode_ = sync_mode_;
+    for (const auto &[key, value] : configs_) {
+      object->configs_[key->Clone(storage)] = value->Clone(storage);
+    }
+
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+class DropGraphQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  DropGraphQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  DropGraphQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<DropGraphQuery>();
     return object;
   }
 
@@ -3270,6 +3633,37 @@ class CreateSnapshotQuery : public memgraph::query::Query {
 
   CreateSnapshotQuery *Clone(AstStorage *storage) const override {
     CreateSnapshotQuery *object = storage->Create<CreateSnapshotQuery>();
+    return object;
+  }
+};
+
+class RecoverSnapshotQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  RecoverSnapshotQuery *Clone(AstStorage *storage) const override {
+    RecoverSnapshotQuery *object = storage->Create<RecoverSnapshotQuery>();
+    object->snapshot_ = snapshot_ ? snapshot_->Clone(storage) : nullptr;
+    object->force_ = force_;
+    return object;
+  }
+
+  Expression *snapshot_;
+  bool force_;
+};
+
+class ShowSnapshotsQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  ShowSnapshotsQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<ShowSnapshotsQuery>();
     return object;
   }
 };
@@ -3518,6 +3912,67 @@ class Exists : public memgraph::query::Expression {
   friend class AstStorage;
 };
 
+class PatternComprehension : public memgraph::query::Expression {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  PatternComprehension() = default;
+
+  DEFVISITABLE(ExpressionVisitor<TypedValue>);
+  DEFVISITABLE(ExpressionVisitor<TypedValue *>);
+  DEFVISITABLE(ExpressionVisitor<void>);
+
+  bool Accept(HierarchicalTreeVisitor &visitor) override {
+    if (visitor.PreVisit(*this)) {
+      if (variable_) {
+        throw utils::NotYetImplemented("Variable in pattern comprehension.");
+      }
+      pattern_->Accept(visitor);
+      if (filter_) {
+        filter_->Accept(visitor);
+      }
+      resultExpr_->Accept(visitor);
+    }
+    return visitor.PostVisit(*this);
+  }
+
+  PatternComprehension *MapTo(const Symbol &symbol) {
+    symbol_pos_ = symbol.position();
+    return this;
+  }
+
+  // The variable name.
+  Identifier *variable_{nullptr};
+  // The pattern to match.
+  Pattern *pattern_{nullptr};
+  // Optional WHERE clause for filtering.
+  Where *filter_{nullptr};
+  // The projection expression.
+  Expression *resultExpr_{nullptr};
+
+  /// Symbol table position of the symbol this Aggregation is mapped to.
+  int32_t symbol_pos_{-1};
+
+  PatternComprehension *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<PatternComprehension>();
+    object->variable_ = variable_ ? variable_->Clone(storage) : nullptr;
+    object->pattern_ = pattern_ ? pattern_->Clone(storage) : nullptr;
+    object->filter_ = filter_ ? filter_->Clone(storage) : nullptr;
+    object->resultExpr_ = resultExpr_ ? resultExpr_->Clone(storage) : nullptr;
+
+    object->symbol_pos_ = symbol_pos_;
+    return object;
+  }
+
+ protected:
+  PatternComprehension(Identifier *variable, Pattern *pattern, Where *filter, Expression *resultExpr)
+      : variable_(variable), pattern_(pattern), filter_(filter), resultExpr_(resultExpr) {}
+
+ private:
+  friend class AstStorage;
+};
+
 class CallSubquery : public memgraph::query::Clause {
  public:
   static const utils::TypeInfo kType;
@@ -3551,7 +4006,7 @@ class MultiDatabaseQuery : public memgraph::query::Query {
 
   DEFVISITABLE(QueryVisitor<void>);
 
-  enum class Action { CREATE, USE, DROP };
+  enum class Action { CREATE, USE, DROP, SHOW };
 
   memgraph::query::MultiDatabaseQuery::Action action_;
   std::string db_name_;
@@ -3577,5 +4032,231 @@ class ShowDatabasesQuery : public memgraph::query::Query {
   }
 };
 
-}  // namespace query
-}  // namespace memgraph
+class CreateEnumQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  CreateEnumQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  std::string enum_name_;
+  std::vector<std::string> enum_values_;
+
+  CreateEnumQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<CreateEnumQuery>();
+    object->enum_name_ = enum_name_;
+    object->enum_values_ = enum_values_;
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+class ShowEnumsQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  ShowEnumsQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  ShowEnumsQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<ShowEnumsQuery>();
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+class EnumValueAccess : public memgraph::query::Expression {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  EnumValueAccess() = default;
+
+  EnumValueAccess(std::string enum_name, std::string enum_value)
+      : enum_name_(std::move(enum_name)), enum_value_(std::move(enum_value)) {}
+
+  DEFVISITABLE(ExpressionVisitor<TypedValue>);
+  DEFVISITABLE(ExpressionVisitor<TypedValue *>);
+  DEFVISITABLE(ExpressionVisitor<void>);
+  DEFVISITABLE(HierarchicalTreeVisitor);
+
+  std::string enum_name_;
+  std::string enum_value_;
+  int32_t symbol_pos_{-1};
+
+  EnumValueAccess *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<EnumValueAccess>();
+    object->enum_name_ = enum_name_;
+    object->enum_value_ = enum_value_;
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+class AlterEnumAddValueQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  AlterEnumAddValueQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  std::string enum_name_;
+  std::string enum_value_;
+
+  AlterEnumAddValueQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<AlterEnumAddValueQuery>();
+    object->enum_name_ = enum_name_;
+    object->enum_value_ = enum_value_;
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+class AlterEnumUpdateValueQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  AlterEnumUpdateValueQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  std::string enum_name_;
+  std::string old_enum_value_;
+  std::string new_enum_value_;
+
+  AlterEnumUpdateValueQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<AlterEnumUpdateValueQuery>();
+    object->enum_name_ = enum_name_;
+    object->old_enum_value_ = old_enum_value_;
+    object->new_enum_value_ = new_enum_value_;
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+class AlterEnumRemoveValueQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  AlterEnumRemoveValueQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  std::string enum_name_;
+  std::string removed_value_;
+
+  AlterEnumRemoveValueQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<AlterEnumRemoveValueQuery>();
+    object->enum_name_ = enum_name_;
+    object->removed_value_ = removed_value_;
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+class DropEnumQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  DropEnumQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  std::string enum_name_;
+
+  DropEnumQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<DropEnumQuery>();
+    object->enum_name_ = enum_name_;
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+class ShowSchemaInfoQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  ShowSchemaInfoQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  ShowSchemaInfoQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<ShowSchemaInfoQuery>();
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+class TtlQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  TtlQuery() = default;
+
+  enum class Type { UNKNOWN = 0, ENABLE, DISABLE, STOP } type_;
+  Expression *period_{};
+  Expression *specific_time_{};
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  TtlQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<TtlQuery>();
+    object->type_ = type_;
+    object->period_ = period_ ? period_->Clone(storage) : nullptr;
+    object->specific_time_ = specific_time_ ? specific_time_->Clone(storage) : nullptr;
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+class SessionTraceQuery : public memgraph::query::Query {
+ public:
+  static const utils::TypeInfo kType;
+  const utils::TypeInfo &GetTypeInfo() const override { return kType; }
+
+  SessionTraceQuery() = default;
+
+  DEFVISITABLE(QueryVisitor<void>);
+
+  bool enabled_{false};
+
+  SessionTraceQuery *Clone(AstStorage *storage) const override {
+    auto *object = storage->Create<SessionTraceQuery>();
+    object->enabled_ = enabled_;
+    return object;
+  }
+
+ private:
+  friend class AstStorage;
+};
+
+}  // namespace memgraph::query

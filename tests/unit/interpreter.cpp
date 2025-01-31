@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -64,7 +64,7 @@ class InterpreterTest : public ::testing::Test {
   const std::string testSuiteCsv = "interpreter_csv";
   std::filesystem::path data_directory = std::filesystem::temp_directory_path() / "MG_tests_unit_interpreter";
 
-  InterpreterTest() {}
+  InterpreterTest() = default;
 
   memgraph::storage::Config config{
       [&]() {
@@ -94,18 +94,29 @@ class InterpreterTest : public ::testing::Test {
       }()  // iile
   };
 
-  memgraph::query::InterpreterContext interpreter_context{{}, kNoHandler, &repl_state};
+  memgraph::system::System system_state;
+  memgraph::query::InterpreterContext interpreter_context{{},
+                                                          kNoHandler,
+                                                          &repl_state,
+                                                          system_state
+#ifdef MG_ENTERPRISE
+                                                          ,
+                                                          std::nullopt
+#endif
+  };
 
   void TearDown() override {
     if (std::is_same<StorageType, memgraph::storage::DiskStorage>::value) {
       disk_test_utils::RemoveRocksDbDirs(testSuite);
       disk_test_utils::RemoveRocksDbDirs(testSuiteCsv);
     }
+
+    std::filesystem::remove_all(data_directory);
   }
 
   InterpreterFaker default_interpreter{&interpreter_context, db};
 
-  auto Prepare(const std::string &query, const std::map<std::string, memgraph::storage::PropertyValue> &params = {}) {
+  auto Prepare(const std::string &query, const memgraph::storage::PropertyValue::map_t &params = {}) {
     return default_interpreter.Prepare(query, params);
   }
 
@@ -113,13 +124,13 @@ class InterpreterTest : public ::testing::Test {
     default_interpreter.Pull(stream, n, qid);
   }
 
-  auto Interpret(const std::string &query, const std::map<std::string, memgraph::storage::PropertyValue> &params = {}) {
+  auto Interpret(const std::string &query, const memgraph::storage::PropertyValue::map_t &params = {}) {
     return default_interpreter.Interpret(query, params);
   }
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(InterpreterTest, StorageTypes);
+TYPED_TEST_SUITE(InterpreterTest, StorageTypes);
 
 TYPED_TEST(InterpreterTest, MultiplePulls) {
   {
@@ -241,7 +252,8 @@ TYPED_TEST(InterpreterTest, Parameters) {
                                              memgraph::storage::PropertyValue(3)})}});
     ASSERT_EQ(stream.GetResults().size(), 1U);
     ASSERT_EQ(stream.GetResults()[0].size(), 1U);
-    auto result = memgraph::query::test_common::ToIntList(memgraph::glue::ToTypedValue(stream.GetResults()[0][0]));
+    auto result =
+        memgraph::query::test_common::ToIntList(memgraph::glue::ToTypedValue(stream.GetResults()[0][0], nullptr));
     ASSERT_THAT(result, testing::ElementsAre(5, 2, 3));
   }
   {
@@ -255,7 +267,7 @@ TYPED_TEST(InterpreterTest, Parameters) {
 // Run CREATE/MATCH/MERGE queries with property map
 TYPED_TEST(InterpreterTest, ParametersAsPropertyMap) {
   {
-    std::map<std::string, memgraph::storage::PropertyValue> property_map{};
+    memgraph::storage::PropertyValue::map_t property_map{};
     property_map["name"] = memgraph::storage::PropertyValue("name1");
     property_map["age"] = memgraph::storage::PropertyValue(25);
     auto stream =
@@ -271,7 +283,7 @@ TYPED_TEST(InterpreterTest, ParametersAsPropertyMap) {
     EXPECT_EQ(result.properties["age"].ValueInt(), 25);
   }
   {
-    std::map<std::string, memgraph::storage::PropertyValue> property_map{};
+    memgraph::storage::PropertyValue::map_t property_map{};
     property_map["name"] = memgraph::storage::PropertyValue("name1");
     property_map["age"] = memgraph::storage::PropertyValue(25);
     this->Interpret("CREATE (:Person)");
@@ -288,7 +300,7 @@ TYPED_TEST(InterpreterTest, ParametersAsPropertyMap) {
     EXPECT_EQ(result.properties["age"].ValueInt(), 25);
   }
   {
-    std::map<std::string, memgraph::storage::PropertyValue> property_map{};
+    memgraph::storage::PropertyValue::map_t property_map{};
     property_map["name"] = memgraph::storage::PropertyValue("name1");
     property_map["weight"] = memgraph::storage::PropertyValue(121);
     auto stream = this->Interpret("CREATE ()-[r:TO $prop]->() RETURN r",
@@ -304,7 +316,7 @@ TYPED_TEST(InterpreterTest, ParametersAsPropertyMap) {
     EXPECT_EQ(result.properties["weight"].ValueInt(), 121);
   }
   {
-    std::map<std::string, memgraph::storage::PropertyValue> property_map{};
+    memgraph::storage::PropertyValue::map_t property_map{};
     property_map["name"] = memgraph::storage::PropertyValue("name1");
     property_map["age"] = memgraph::storage::PropertyValue(15);
     ASSERT_THROW(this->Interpret("MATCH (n $prop) RETURN n",
@@ -314,7 +326,7 @@ TYPED_TEST(InterpreterTest, ParametersAsPropertyMap) {
                  memgraph::query::SemanticException);
   }
   {
-    std::map<std::string, memgraph::storage::PropertyValue> property_map{};
+    memgraph::storage::PropertyValue::map_t property_map{};
     property_map["name"] = memgraph::storage::PropertyValue("name1");
     property_map["age"] = memgraph::storage::PropertyValue(15);
     ASSERT_THROW(this->Interpret("MERGE (n $prop) RETURN n",
@@ -334,7 +346,7 @@ TYPED_TEST(InterpreterTest, Bfs) {
   auto kNumUnreachableNodes = 1000;
   auto kNumUnreachableEdges = 100000;
   auto kResCoeff = 5;
-  const auto kReachable = "reachable";
+  const auto *const kReachable = "reachable";
   const auto kId = "id";
 
   if (std::is_same<TypeParam, memgraph::storage::DiskStorage>::value) {
@@ -641,20 +653,22 @@ TYPED_TEST(InterpreterTest, UniqueConstraintTest) {
   // Show constraint info.
   {
     auto stream = this->Interpret("SHOW CONSTRAINT INFO");
-    ASSERT_EQ(stream.GetHeader().size(), 3U);
+    ASSERT_EQ(stream.GetHeader().size(), 4U);
     const auto &header = stream.GetHeader();
     ASSERT_EQ(header[0], "constraint type");
     ASSERT_EQ(header[1], "label");
     ASSERT_EQ(header[2], "properties");
+    ASSERT_EQ(header[3], "data_type");
     ASSERT_EQ(stream.GetResults().size(), 1U);
     const auto &result = stream.GetResults().front();
-    ASSERT_EQ(result.size(), 3U);
+    ASSERT_EQ(result.size(), 4U);
     ASSERT_EQ(result[0].ValueString(), "unique");
     ASSERT_EQ(result[1].ValueString(), "A");
     const auto &properties = result[2].ValueList();
     ASSERT_EQ(properties.size(), 2U);
     ASSERT_EQ(properties[0].ValueString(), "a");
     ASSERT_EQ(properties[1].ValueString(), "b");
+    ASSERT_EQ(result[3].ValueString(), "");
   }
 
   // Drop constraint.
@@ -1148,8 +1162,16 @@ TYPED_TEST(InterpreterTest, AllowLoadCsvConfig) {
         << "Wrong storage mode!";
 
     memgraph::replication::ReplicationState repl_state{std::nullopt};
-    memgraph::query::InterpreterContext csv_interpreter_context{
-        {.query = {.allow_load_csv = allow_load_csv}}, nullptr, &repl_state};
+    memgraph::system::System system_state;
+    memgraph::query::InterpreterContext csv_interpreter_context{{.query = {.allow_load_csv = allow_load_csv}},
+                                                                nullptr,
+                                                                &repl_state,
+                                                                system_state
+#ifdef MG_ENTERPRISE
+                                                                ,
+                                                                std::nullopt
+#endif
+    };
     InterpreterFaker interpreter_faker{&csv_interpreter_context, db_acc};
     for (const auto &query : queries) {
       if (allow_load_csv) {
@@ -1168,7 +1190,7 @@ TYPED_TEST(InterpreterTest, AllowLoadCsvConfig) {
   check_load_csv_queries(false);
 }
 
-void AssertAllValuesAreZero(const std::map<std::string, memgraph::communication::bolt::Value> &map,
+void AssertAllValuesAreZero(const memgraph::communication::bolt::map_t &map,
                             const std::vector<std::string> &exceptions) {
   for (const auto &[key, value] : map) {
     if (const auto it = std::find(exceptions.begin(), exceptions.end(), key); it != exceptions.end()) continue;

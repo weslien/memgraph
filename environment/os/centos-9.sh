@@ -1,7 +1,5 @@
 #!/bin/bash
-
 set -Eeuo pipefail
-
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 source "$DIR/../util.sh"
 
@@ -9,8 +7,10 @@ check_operating_system "centos-9"
 check_architecture "x86_64"
 
 TOOLCHAIN_BUILD_DEPS=(
-    coreutils-common gcc gcc-c++ make # generic build tools
     wget # used for archive download
+    coreutils-common gcc gcc-c++ make # generic build tools
+    # NOTE: Pure libcurl conflicts with libcurl-minimal
+    libcurl-devel # cmake build requires it
     gnupg2 # used for archive signature verification
     tar gzip bzip2 xz unzip # used for archive unpacking
     zlib-devel # zlib library used for all builds
@@ -25,6 +25,10 @@ TOOLCHAIN_BUILD_DEPS=(
     diffutils
     libipt libipt-devel # intel
     patch
+    custom-rust # for mgcxx
+    libtool # for protobuf
+    openssl-devel pkgconf-pkg-config # for pulsar
+    cyrus-sasl-devel # for librdkafka
 )
 
 TOOLCHAIN_RUN_DEPS=(
@@ -62,7 +66,10 @@ MEMGRAPH_BUILD_DEPS=(
     autoconf # for jemalloc code generation
     libtool  # for protobuf code generation
     cyrus-sasl-devel
+    ninja-build
 )
+
+MEMGRAPH_TEST_DEPS="${MEMGRAPH_BUILD_DEPS[*]}"
 
 MEMGRAPH_RUN_DEPS=(
     logrotate openssl python3 libseccomp
@@ -81,13 +88,19 @@ check() {
     for pkg in $1; do
         if [ "$pkg" == custom-maven3.9.3 ]; then
             if [ ! -f "/opt/apache-maven-3.9.3/bin/mvn" ]; then
-              missing="$pkg $missing"
+                missing="$pkg $missing"
             fi
             continue
         fi
         if [ "$pkg" == custom-golang1.18.9 ]; then
             if [ ! -f "/opt/go1.18.9/go/bin/go" ]; then
-              missing="$pkg $missing"
+                missing="$pkg $missing"
+            fi
+            continue
+        fi
+        if [ "$pkg" == custom-rust ]; then
+            if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+                missing="$pkg $missing"
             fi
             continue
         fi
@@ -123,8 +136,11 @@ install() {
     else
         echo "NOTE: export LANG=en_US.utf8"
     fi
-    yum update -y
-    yum install -y wget git python3 python3-pip
+    # --nobest is used because of libipt because we install custom versions
+    # because libipt-devel is not available on CentOS 9 Stream
+    dnf update -y --nobest
+    dnf install -y wget git python3 python3-pip
+    dnf config-manager --set-enabled crb
 
     for pkg in $1; do
         if [ "$pkg" == custom-maven3.9.3 ]; then
@@ -133,6 +149,14 @@ install() {
         fi
         if [ "$pkg" == custom-golang1.18.9 ]; then
             install_custom_golang "1.18.9"
+            continue
+        fi
+        if [ "$pkg" == custom-rust ]; then
+            install_rust "1.80"
+            continue
+        fi
+        if [ "$pkg" == custom-node ]; then
+            install_node "20"
             continue
         fi
         # Since there is no support for libipt-devel for CentOS 9 we install
@@ -159,13 +183,13 @@ install() {
         fi
         if [ "$pkg" == sbcl ]; then
             if ! dnf list installed cl-asdf >/dev/null 2>/dev/null; then
-                dnf install -y 	https://pkgs.dyn.su/el8/base/x86_64/cl-asdf-20101028-18.el8.noarch.rpm
+                dnf install -y http://www.nosuchhost.net/~cheese/fedora/packages/epel-9/x86_64/cl-asdf-20101028-27.el9.noarch.rpm
             fi
             if ! dnf list installed common-lisp-controller >/dev/null 2>/dev/null; then
-                dnf install -y https://pkgs.dyn.su/el8/base/x86_64/common-lisp-controller-7.4-20.el8.noarch.rpm
+                dnf install -y http://www.nosuchhost.net/~cheese/fedora/packages/epel-9/x86_64/common-lisp-controller-7.4-29.el9.noarch.rpm
             fi
             if ! dnf list installed sbcl >/dev/null 2>/dev/null; then
-                dnf install -y https://pkgs.dyn.su/el8/base/x86_64/sbcl-2.0.1-4.el8.x86_64.rpm
+                dnf install -y http://www.nosuchhost.net/~cheese/fedora/packages/epel-9/x86_64/sbcl-2.3.11-3.el9~bootstrap.x86_64.rpm
             fi
             continue
         fi

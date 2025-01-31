@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -17,14 +17,33 @@
 #include <variant>
 
 #include "flags/run_time_configurable.hpp"
+#include "query/database_access.hpp"
 #include "query/frontend/ast/ast.hpp"
 #include "query/frontend/ast/ast_visitor.hpp"
 #include "query/plan/operator.hpp"
 #include "query/plan/preprocess.hpp"
+#include "query/plan/rewrite/general.hpp"
+#include "query/plan/rewrite/range.hpp"
+#include "utils/exceptions.hpp"
 #include "utils/logging.hpp"
 #include "utils/typeinfo.hpp"
 
 namespace memgraph::query::plan {
+
+struct PatternComprehensionData {
+  PatternComprehensionData() = default;
+
+  PatternComprehensionData(std::shared_ptr<LogicalOperator> lop, Symbol res_symbol)
+      : op(std::move(lop)), result_symbol(res_symbol) {}
+
+  PatternComprehensionData(PatternComprehension *pc, Symbol res_symbol)
+      : pattern_comprehension(pc), result_symbol(res_symbol) {}
+
+  PatternComprehension *pattern_comprehension = nullptr;
+  std::shared_ptr<LogicalOperator> op;
+  Symbol result_symbol;
+};
+using PatternComprehensionDataMap = std::unordered_map<std::string, PatternComprehensionData>;
 
 /// @brief Context which contains variables commonly used during planning.
 template <class TDbAccessor>
@@ -88,7 +107,8 @@ bool HasBoundFilterSymbols(const std::unordered_set<Symbol> &bound_symbols, cons
 // Returns the set of symbols for the subquery that are actually referenced from the outer scope and
 // used in the subquery.
 std::unordered_set<Symbol> GetSubqueryBoundSymbols(const std::vector<SingleQueryPart> &single_query_parts,
-                                                   SymbolTable &symbol_table, AstStorage &storage);
+                                                   SymbolTable &symbol_table, AstStorage &storage,
+                                                   PatternComprehensionDataMap &pc_ops);
 
 Symbol GetSymbol(NodeAtom *atom, const SymbolTable &symbol_table);
 Symbol GetSymbol(EdgeAtom *atom, const SymbolTable &symbol_table);
@@ -142,11 +162,13 @@ std::unique_ptr<LogicalOperator> GenNamedPaths(std::unique_ptr<LogicalOperator> 
 
 std::unique_ptr<LogicalOperator> GenReturn(Return &ret, std::unique_ptr<LogicalOperator> input_op,
                                            SymbolTable &symbol_table, bool is_write,
-                                           const std::unordered_set<Symbol> &bound_symbols, AstStorage &storage);
+                                           const std::unordered_set<Symbol> &bound_symbols, AstStorage &storage,
+                                           PatternComprehensionDataMap &pc_ops, Expression *commit_frequency);
 
 std::unique_ptr<LogicalOperator> GenWith(With &with, std::unique_ptr<LogicalOperator> input_op,
                                          SymbolTable &symbol_table, bool is_write,
-                                         std::unordered_set<Symbol> &bound_symbols, AstStorage &storage);
+                                         std::unordered_set<Symbol> &bound_symbols, AstStorage &storage,
+                                         PatternComprehensionDataMap &pc_ops, Expression *commit_frequency);
 
 std::unique_ptr<LogicalOperator> GenUnion(const CypherUnion &cypher_union, std::shared_ptr<LogicalOperator> left_op,
                                           std::shared_ptr<LogicalOperator> right_op, SymbolTable &symbol_table);
@@ -176,7 +198,12 @@ class RuleBasedPlanner {
   PlanResult Plan(const QueryParts &query_parts) {
     auto &context = *context_;
     std::unique_ptr<LogicalOperator> final_plan;
-
+    // procedures need to start from 1
+    // due to swapping mechanism of procedure
+    // tracking
+    uint64_t procedure_id = 1;
+    bool const has_periodic_commit = query_parts.commit_frequency != nullptr;
+    bool const is_root_query = !query_parts.is_subquery;
     for (const auto &query_part : query_parts.query_parts) {
       std::unique_ptr<LogicalOperator> input_op;
 
@@ -186,16 +213,24 @@ class RuleBasedPlanner {
 
         uint64_t merge_id = 0;
         uint64_t subquery_id = 0;
-        // procedures need to start from 1
-        // due to swapping mechanism of procedure
-        // tracking
-        uint64_t procedure_id = 1;
+
+        PatternComprehensionDataMap pattern_comprehension_ops;
+
+        for (const auto &matching : single_query_part.pattern_comprehension_matchings) {
+          std::unique_ptr<LogicalOperator> new_input;
+          MatchContext match_ctx{matching.second, *context.symbol_table, context.bound_symbols};
+          new_input = PlanMatching(match_ctx, std::move(new_input));
+          new_input = std::make_unique<Produce>(std::move(new_input), std::vector{matching.second.result_expr});
+          pattern_comprehension_ops.emplace(
+              matching.first, PatternComprehensionData(std::move(new_input), matching.second.result_symbol));
+        }
 
         for (const auto &clause : single_query_part.remaining_clauses) {
           MG_ASSERT(!utils::IsSubtype(*clause, Match::kType), "Unexpected Match in remaining clauses");
           if (auto *ret = utils::Downcast<Return>(clause)) {
             input_op = impl::GenReturn(*ret, std::move(input_op), *context.symbol_table, context.is_write_query,
-                                       context.bound_symbols, *context.ast_storage);
+                                       context.bound_symbols, *context.ast_storage, pattern_comprehension_ops,
+                                       query_parts.commit_frequency);
           } else if (auto *merge = utils::Downcast<query::Merge>(clause)) {
             input_op = GenMerge(*merge, std::move(input_op), single_query_part.merge_matching[merge_id++]);
             // Treat MERGE clause as write, because we do not know if it will
@@ -203,7 +238,7 @@ class RuleBasedPlanner {
             context.is_write_query = true;
           } else if (auto *with = utils::Downcast<query::With>(clause)) {
             input_op = impl::GenWith(*with, std::move(input_op), *context.symbol_table, context.is_write_query,
-                                     context.bound_symbols, *context.ast_storage);
+                                     context.bound_symbols, *context.ast_storage, pattern_comprehension_ops, nullptr);
             // WITH clause advances the command, so reset the flag.
             context.is_write_query = false;
           } else if (auto op = HandleWriteClause(clause, input_op, *context.symbol_table, context.bound_symbols)) {
@@ -233,7 +268,6 @@ class RuleBasedPlanner {
           } else if (auto *load_csv = utils::Downcast<query::LoadCsv>(clause)) {
             const auto &row_sym = context.symbol_table->at(*load_csv->row_var_);
             context.bound_symbols.insert(row_sym);
-
             input_op = std::make_unique<plan::LoadCsv>(std::move(input_op), load_csv->file_, load_csv->with_header_,
                                                        load_csv->ignore_bad_, load_csv->delimiter_, load_csv->quote_,
                                                        load_csv->nullif_, row_sym);
@@ -243,7 +277,12 @@ class RuleBasedPlanner {
                                            single_query_part, merge_id);
           } else if (auto *call_sub = utils::Downcast<query::CallSubquery>(clause)) {
             input_op = HandleSubquery(std::move(input_op), single_query_part.subqueries[subquery_id++],
-                                      *context.symbol_table, *context_->ast_storage);
+                                      *context.symbol_table, *context_->ast_storage, pattern_comprehension_ops,
+                                      call_sub->cypher_query_->pre_query_directives_.commit_frequency_);
+            if (context.is_write_query && !has_periodic_commit) {
+              input_op = std::make_unique<Accumulate>(std::move(input_op),
+                                                      input_op->ModifiedSymbols(*context.symbol_table), true);
+            }
           } else {
             throw utils::NotYetImplemented("clause '{}' conversion to operator(s)", clause->GetTypeInfo().name);
           }
@@ -252,6 +291,10 @@ class RuleBasedPlanner {
 
       // Is this the only situation that should be covered
       if (input_op->OutputSymbols(*context.symbol_table).empty()) {
+        if (has_periodic_commit && is_root_query) {
+          // this periodic commit is from USING PERIODIC COMMIT
+          input_op = std::make_unique<PeriodicCommit>(std::move(input_op), query_parts.commit_frequency);
+        }
         input_op = std::make_unique<EmptyResult>(std::move(input_op));
       }
 
@@ -272,11 +315,34 @@ class RuleBasedPlanner {
  private:
   TPlanningContext *context_;
 
-  storage::LabelId GetLabel(LabelIx label) { return context_->db->NameToLabel(label.name); }
+  storage::LabelId GetLabel(const LabelIx &label) { return context_->db->NameToLabel(label.name); }
 
-  storage::PropertyId GetProperty(PropertyIx prop) { return context_->db->NameToProperty(prop.name); }
+  storage::PropertyId GetProperty(const PropertyIx &prop) { return context_->db->NameToProperty(prop.name); }
 
   storage::EdgeTypeId GetEdgeType(EdgeTypeIx edge_type) { return context_->db->NameToEdgeType(edge_type.name); }
+
+  std::vector<storage::EdgeTypeId> GetEdgeTypes(std::vector<EdgeTypeIx> edge_types) {
+    std::vector<storage::EdgeTypeId> transformed_edge_types;
+    transformed_edge_types.reserve(edge_types.size());
+    for (const auto &type : edge_types) {
+      transformed_edge_types.push_back(GetEdgeType(type));
+    }
+
+    return transformed_edge_types;
+  }
+
+  std::vector<StorageLabelType> GetLabelIds(const std::vector<QueryLabelType> &labels) {
+    std::vector<StorageLabelType> label_ids;
+    label_ids.reserve(labels.size());
+    for (const auto &label : labels) {
+      if (const auto *label_atom = std::get_if<LabelIx>(&label)) {
+        label_ids.emplace_back(GetLabel(*label_atom));
+      } else {
+        label_ids.emplace_back(std::get<Expression *>(label));
+      }
+    }
+    return label_ids;
+  }
 
   std::unique_ptr<LogicalOperator> HandleMatching(std::unique_ptr<LogicalOperator> last_op,
                                                   const SingleQueryPart &single_query_part, SymbolTable &symbol_table,
@@ -313,11 +379,6 @@ class RuleBasedPlanner {
                                                        std::unordered_set<Symbol> &bound_symbols) {
     auto node_to_creation_info = [&](const NodeAtom &node) {
       const auto &node_symbol = symbol_table.at(*node.identifier_);
-      std::vector<storage::LabelId> labels;
-      labels.reserve(node.labels_.size());
-      for (const auto &label : node.labels_) {
-        labels.push_back(GetLabel(label));
-      }
 
       auto properties = std::invoke([&]() -> std::variant<PropertiesMapList, ParameterLookup *> {
         if (const auto *node_properties =
@@ -331,7 +392,7 @@ class RuleBasedPlanner {
         }
         return std::get<ParameterLookup *>(node.properties_);
       });
-      return NodeCreationInfo{node_symbol, labels, properties};
+      return NodeCreationInfo{node_symbol, GetLabelIds(node.labels_), properties};
     };
 
     auto base = [&](NodeAtom *node) -> std::unique_ptr<LogicalOperator> {
@@ -381,6 +442,7 @@ class RuleBasedPlanner {
     if (pattern.identifier_->user_declared_) {
       std::vector<Symbol> path_elements;
       for (const PatternAtom *atom : pattern.atoms_) path_elements.emplace_back(symbol_table.at(*atom->identifier_));
+      bound_symbols.insert(symbol_table.at(*pattern.identifier_));
       last_op = std::make_unique<ConstructNamedPath>(std::move(last_op), symbol_table.at(*pattern.identifier_),
                                                      path_elements);
     }
@@ -407,23 +469,13 @@ class RuleBasedPlanner {
       return std::make_unique<plan::SetProperties>(std::move(input_op), input_symbol, set->expression_, op);
     } else if (auto *set = utils::Downcast<query::SetLabels>(clause)) {
       const auto &input_symbol = symbol_table.at(*set->identifier_);
-      std::vector<storage::LabelId> labels;
-      labels.reserve(set->labels_.size());
-      for (const auto &label : set->labels_) {
-        labels.push_back(GetLabel(label));
-      }
-      return std::make_unique<plan::SetLabels>(std::move(input_op), input_symbol, labels);
+      return std::make_unique<plan::SetLabels>(std::move(input_op), input_symbol, GetLabelIds(set->labels_));
     } else if (auto *rem = utils::Downcast<query::RemoveProperty>(clause)) {
       return std::make_unique<plan::RemoveProperty>(std::move(input_op), GetProperty(rem->property_lookup_->property_),
                                                     rem->property_lookup_);
     } else if (auto *rem = utils::Downcast<query::RemoveLabels>(clause)) {
       const auto &input_symbol = symbol_table.at(*rem->identifier_);
-      std::vector<storage::LabelId> labels;
-      labels.reserve(rem->labels_.size());
-      for (const auto &label : rem->labels_) {
-        labels.push_back(GetLabel(label));
-      }
-      return std::make_unique<plan::RemoveLabels>(std::move(input_op), input_symbol, labels);
+      return std::make_unique<plan::RemoveLabels>(std::move(input_op), input_symbol, GetLabelIds(rem->labels_));
     }
     return nullptr;
   }
@@ -452,7 +504,9 @@ class RuleBasedPlanner {
       MG_ASSERT(utils::Contains(bound_symbols, named_path.first), "Expected generated named path to have bound symbol");
       match_context.new_symbols.emplace_back(named_path.first);
     }
-    MG_ASSERT(filters.empty(), "Expected to generate all filters");
+    if (!filters.empty()) {
+      throw QueryException("Expected to generate all filters");
+    }
     return last_op;
   }
 
@@ -512,10 +566,6 @@ class RuleBasedPlanner {
 
     std::set<ExpansionGroupId> visited_expansion_groups;
 
-    last_op =
-        GenerateExpansionOnAlreadySeenSymbols(std::move(last_op), matching, visited_expansion_groups, symbol_table,
-                                              storage, bound_symbols, new_symbols, named_paths, filters, view);
-
     // We want to create separate branches of scan operators for each expansion group group of patterns
     // Whenever there are 2 scan branches, they will be joined with a Cartesian operator
 
@@ -525,6 +575,14 @@ class RuleBasedPlanner {
     std::vector<Symbol> cross_branch_new_symbols;
     bool initial_expansion_done = false;
     for (const auto &expansion : matching.expansions) {
+      if (visited_expansion_groups.contains(expansion.expansion_group_id)) {
+        continue;
+      }
+
+      last_op =
+          GenerateExpansionOnAlreadySeenSymbols(std::move(last_op), matching, visited_expansion_groups, symbol_table,
+                                                storage, bound_symbols, new_symbols, named_paths, filters, view);
+
       if (visited_expansion_groups.contains(expansion.expansion_group_id)) {
         continue;
       }
@@ -657,7 +715,33 @@ class RuleBasedPlanner {
       std::vector<Symbol> &new_symbols, std::unordered_map<Symbol, std::vector<Symbol>> &named_paths, Filters &filters,
       storage::View view) {
     const auto &node1_symbol = symbol_table.at(*expansion.node1->identifier_);
-    if (bound_symbols.insert(node1_symbol).second) {
+    const bool is_unseen_node = bound_symbols.insert(node1_symbol).second;
+
+    // we can just perform scanning from an edge if it's a simple edge
+    // we don't take into consideration path expansion as part of edge scanning
+    if (is_unseen_node && expansion.expand_from_edge && expansion.edge->type_ == EdgeAtom::Type::SINGLE) {
+      const auto &node2_symbol = symbol_table.at(*expansion.node2->identifier_);
+      const auto &edge_symbol = symbol_table.at(*expansion.edge->identifier_);
+      auto edge_types = GetEdgeTypes(expansion.edge->edge_types_);
+
+      last_op = std::make_unique<ScanAllByEdge>(std::move(last_op), edge_symbol, node1_symbol, node2_symbol,
+                                                expansion.direction, edge_types, view);
+
+      new_symbols.emplace_back(node1_symbol);
+      new_symbols.emplace_back(edge_symbol);
+      new_symbols.emplace_back(node2_symbol);
+
+      bound_symbols.insert(edge_symbol);
+      bound_symbols.insert(node2_symbol);
+
+      last_op = GenFilters(std::move(last_op), bound_symbols, filters, storage, symbol_table);
+      last_op = impl::GenNamedPaths(std::move(last_op), bound_symbols, named_paths);
+      last_op = GenFilters(std::move(last_op), bound_symbols, filters, storage, symbol_table);
+
+      return last_op;
+    }
+
+    if (is_unseen_node) {
       // We have just bound this symbol, so generate ScanAll which fills it.
       last_op = std::make_unique<ScanAll>(std::move(last_op), node1_symbol, view);
       new_symbols.emplace_back(node1_symbol);
@@ -696,19 +780,16 @@ class RuleBasedPlanner {
     auto existing_node = utils::Contains(bound_symbols, node_symbol);
     const auto &edge_symbol = symbol_table.at(*edge->identifier_);
     MG_ASSERT(!utils::Contains(bound_symbols, edge_symbol), "Existing edges are not supported");
-    std::vector<storage::EdgeTypeId> edge_types;
-    edge_types.reserve(edge->edge_types_.size());
-    for (const auto &type : edge->edge_types_) {
-      edge_types.push_back(GetEdgeType(type));
-    }
+
+    auto edge_types = GetEdgeTypes(edge->edge_types_);
     if (edge->IsVariable()) {
       std::optional<ExpansionLambda> weight_lambda;
       std::optional<Symbol> total_weight;
 
       if (edge->type_ == EdgeAtom::Type::WEIGHTED_SHORTEST_PATH || edge->type_ == EdgeAtom::Type::ALL_SHORTEST_PATHS) {
-        weight_lambda.emplace(ExpansionLambda{symbol_table.at(*edge->weight_lambda_.inner_edge),
-                                              symbol_table.at(*edge->weight_lambda_.inner_node),
-                                              edge->weight_lambda_.expression});
+        weight_lambda.emplace(ExpansionLambda{.inner_edge_symbol = symbol_table.at(*edge->weight_lambda_.inner_edge),
+                                              .inner_node_symbol = symbol_table.at(*edge->weight_lambda_.inner_node),
+                                              .expression = edge->weight_lambda_.expression});
 
         total_weight.emplace(symbol_table.at(*edge->total_weight_));
       }
@@ -716,12 +797,28 @@ class RuleBasedPlanner {
       ExpansionLambda filter_lambda;
       filter_lambda.inner_edge_symbol = symbol_table.at(*edge->filter_lambda_.inner_edge);
       filter_lambda.inner_node_symbol = symbol_table.at(*edge->filter_lambda_.inner_node);
+      if (edge->filter_lambda_.accumulated_path) {
+        filter_lambda.accumulated_path_symbol = symbol_table.at(*edge->filter_lambda_.accumulated_path);
+
+        if (edge->filter_lambda_.accumulated_weight) {
+          filter_lambda.accumulated_weight_symbol = symbol_table.at(*edge->filter_lambda_.accumulated_weight);
+        }
+      }
       {
         // Bind the inner edge and node symbols so they're available for
         // inline filtering in ExpandVariable.
         bool inner_edge_bound = bound_symbols.insert(filter_lambda.inner_edge_symbol).second;
         bool inner_node_bound = bound_symbols.insert(filter_lambda.inner_node_symbol).second;
         MG_ASSERT(inner_edge_bound && inner_node_bound, "An inner edge and node can't be bound from before");
+        if (filter_lambda.accumulated_path_symbol) {
+          bool accumulated_path_bound = bound_symbols.insert(*filter_lambda.accumulated_path_symbol).second;
+          MG_ASSERT(accumulated_path_bound, "The accumulated path can't be bound from before");
+
+          if (filter_lambda.accumulated_weight_symbol) {
+            bool accumulated_weight_bound = bound_symbols.insert(*filter_lambda.accumulated_weight_symbol).second;
+            MG_ASSERT(accumulated_weight_bound, "The accumulated weight can't be bound from before");
+          }
+        }
       }
       // Join regular filters with lambda filter expression, so that they
       // are done inline together. Semantic analysis should guarantee that
@@ -732,15 +829,34 @@ class RuleBasedPlanner {
       // filtering (they use the inner symbols. If they were not collected,
       // we have to remove them manually because no other filter-extraction
       // will ever bind them again.
-      filters.erase(
-          std::remove_if(filters.begin(), filters.end(),
-                         [e = filter_lambda.inner_edge_symbol, n = filter_lambda.inner_node_symbol](FilterInfo &fi) {
-                           return utils::Contains(fi.used_symbols, e) || utils::Contains(fi.used_symbols, n);
-                         }),
-          filters.end());
+      std::vector<Symbol> inner_symbols = {filter_lambda.inner_edge_symbol, filter_lambda.inner_node_symbol};
+      if (filter_lambda.accumulated_path_symbol) {
+        inner_symbols.emplace_back(*filter_lambda.accumulated_path_symbol);
+
+        if (filter_lambda.accumulated_weight_symbol) {
+          inner_symbols.emplace_back(*filter_lambda.accumulated_weight_symbol);
+        }
+      }
+
+      filters.erase(std::remove_if(filters.begin(), filters.end(),
+                                   [&inner_symbols](FilterInfo &fi) {
+                                     for (const auto &symbol : inner_symbols) {
+                                       if (utils::Contains(fi.used_symbols, symbol)) return true;
+                                     }
+                                     return false;
+                                   }),
+                    filters.end());
+
       // Unbind the temporarily bound inner symbols for filtering.
       bound_symbols.erase(filter_lambda.inner_edge_symbol);
       bound_symbols.erase(filter_lambda.inner_node_symbol);
+      if (filter_lambda.accumulated_path_symbol) {
+        bound_symbols.erase(*filter_lambda.accumulated_path_symbol);
+
+        if (filter_lambda.accumulated_weight_symbol) {
+          bound_symbols.erase(*filter_lambda.accumulated_weight_symbol);
+        }
+      }
 
       if (total_weight) {
         bound_symbols.insert(*total_weight);
@@ -824,13 +940,14 @@ class RuleBasedPlanner {
 
   std::unique_ptr<LogicalOperator> HandleSubquery(std::unique_ptr<LogicalOperator> last_op,
                                                   std::shared_ptr<QueryParts> subquery, SymbolTable &symbol_table,
-                                                  AstStorage &storage) {
+                                                  AstStorage &storage, PatternComprehensionDataMap &pc_ops,
+                                                  Expression *commit_frequency) {
     std::unordered_set<Symbol> outer_scope_bound_symbols;
     outer_scope_bound_symbols.insert(std::make_move_iterator(context_->bound_symbols.begin()),
                                      std::make_move_iterator(context_->bound_symbols.end()));
 
     context_->bound_symbols =
-        impl::GetSubqueryBoundSymbols(subquery->query_parts[0].single_query_parts, symbol_table, storage);
+        impl::GetSubqueryBoundSymbols(subquery->query_parts[0].single_query_parts, symbol_table, storage, pc_ops);
 
     auto subquery_op = Plan(*subquery);
 
@@ -843,10 +960,13 @@ class RuleBasedPlanner {
       subquery_has_return = false;
     }
 
-    last_op = std::make_unique<Apply>(std::move(last_op), std::move(subquery_op), subquery_has_return);
-
-    if (context_->is_write_query) {
-      last_op = std::make_unique<Accumulate>(std::move(last_op), last_op->ModifiedSymbols(symbol_table), true);
+    bool has_periodic_commit = commit_frequency != nullptr;
+    if (!has_periodic_commit) {
+      last_op = std::make_unique<Apply>(std::move(last_op), std::move(subquery_op), subquery_has_return);
+    } else {
+      // this periodic commit is from CALL IN TRANSACTIONS OF x ROWS
+      last_op = std::make_unique<PeriodicSubquery>(std::move(last_op), std::move(subquery_op), commit_frequency,
+                                                   subquery_has_return);
     }
 
     return last_op;
@@ -863,13 +983,16 @@ class RuleBasedPlanner {
   std::unique_ptr<LogicalOperator> GenFilters(std::unique_ptr<LogicalOperator> last_op,
                                               const std::unordered_set<Symbol> &bound_symbols, Filters &filters,
                                               AstStorage &storage, const SymbolTable &symbol_table) {
-    auto all_filters = filters;
     auto pattern_filters = ExtractPatternFilters(filters, symbol_table, storage, bound_symbols);
     auto *filter_expr = impl::ExtractFilters(bound_symbols, filters, storage);
 
     if (filter_expr) {
-      last_op =
-          std::make_unique<Filter>(std::move(last_op), std::move(pattern_filters), filter_expr, std::move(all_filters));
+      filter_expr = CompactFilters(filter_expr, storage);  // Can only compact; not delete the whole expression
+                                                           // Could do in the future when we have parse-time constants
+      Filters operator_filters;
+      operator_filters.CollectFilterExpression(filter_expr, symbol_table);
+      last_op = std::make_unique<Filter>(std::move(last_op), std::move(pattern_filters), filter_expr,
+                                         std::move(operator_filters));
     }
     return last_op;
   }

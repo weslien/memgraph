@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -9,7 +9,6 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -19,6 +18,7 @@
 #include <gtest/gtest.h>
 
 #include <utils/file_locker.hpp>
+#include "utils/on_scope_exit.hpp"
 
 using namespace std::chrono_literals;
 
@@ -99,6 +99,53 @@ TEST_P(FileLockerParameterizedTest, DeleteWhileInLocker) {
 
   ASSERT_FALSE(std::filesystem::exists(file));
   std::filesystem::current_path(save_path);
+}
+
+TEST_P(FileLockerParameterizedTest, RenameFile) {
+  CreateFiles(1);
+  memgraph::utils::FileRetainer file_retainer;
+  const auto save_path = std::filesystem::current_path();
+  auto clean_up = memgraph::utils::OnScopeExit{[&] { std::filesystem::current_path(save_path); }};
+  std::filesystem::current_path(testing_directory);
+  const auto file = std::filesystem::path("1");
+  const auto file2 = std::filesystem::path("2");
+  const auto file_absolute = std::filesystem::absolute(file);
+  const auto file2_absolute = std::filesystem::absolute(file2);
+  const auto [lock_absolute, rename_absolute] = GetParam();
+
+  // Clean rename
+  file_retainer.RenameFile(rename_absolute ? file_absolute : file, rename_absolute ? file2_absolute : file2);
+  ASSERT_TRUE(std::filesystem::exists(file2));
+  ASSERT_FALSE(std::filesystem::exists(file));
+
+  // With locker
+  {
+    auto locker = file_retainer.AddLocker();
+    {
+      auto acc = locker.Access();
+      file_retainer.RenameFile(rename_absolute ? file2_absolute : file2, rename_absolute ? file_absolute : file);
+      ASSERT_TRUE(std::filesystem::exists(file2));
+      ASSERT_TRUE(std::filesystem::exists(file));
+    }
+  }
+  ASSERT_TRUE(std::filesystem::exists(file));
+  ASSERT_FALSE(std::filesystem::exists(file2));
+
+  // While locked
+  {
+    auto locker = file_retainer.AddLocker();
+    {
+      auto acc = locker.Access();
+      const auto lock_success = acc.AddPath(lock_absolute ? file_absolute : file);
+      ASSERT_FALSE(lock_success.HasError());
+    }
+
+    file_retainer.RenameFile(rename_absolute ? file_absolute : file, rename_absolute ? file2_absolute : file2);
+    ASSERT_TRUE(std::filesystem::exists(file2));
+    ASSERT_TRUE(std::filesystem::exists(file));
+  }
+  ASSERT_TRUE(std::filesystem::exists(file2));
+  ASSERT_FALSE(std::filesystem::exists(file));
 }
 
 TEST_P(FileLockerParameterizedTest, DirectoryLock) {
@@ -194,9 +241,9 @@ TEST_P(FileLockerParameterizedTest, RemovePath) {
   std::filesystem::current_path(save_path);
 }
 
-INSTANTIATE_TEST_CASE_P(FileLockerPathVariantTests, FileLockerParameterizedTest,
-                        ::testing::Values(std::make_tuple(false, false), std::make_tuple(false, true),
-                                          std::make_tuple(true, false), std::make_tuple(true, true)));
+INSTANTIATE_TEST_SUITE_P(FileLockerPathVariantTests, FileLockerParameterizedTest,
+                         ::testing::Values(std::make_tuple(false, false), std::make_tuple(false, true),
+                                           std::make_tuple(true, false), std::make_tuple(true, true)));
 
 TEST_F(FileLockerTest, MultipleLockers) {
   CreateFiles(3);

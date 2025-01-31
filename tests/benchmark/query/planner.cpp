@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -13,11 +13,15 @@
 #include <string>
 #include <variant>
 
+#include "query/db_accessor.hpp"
 #include "query/frontend/semantic/symbol_generator.hpp"
 #include "query/plan/cost_estimator.hpp"
 #include "query/plan/planner.hpp"
+#include "query/plan/rewrite/index_lookup.hpp"
 #include "query/plan/vertex_count_cache.hpp"
 #include "storage/v2/inmemory/storage.hpp"
+
+using memgraph::replication_coordination_glue::ReplicationRole;
 
 // Add chained MATCH (node1) -- (node2), MATCH (node2) -- (node3) ... clauses.
 static memgraph::query::CypherQuery *AddChainedMatches(int num_matches, memgraph::query::AstStorage &storage) {
@@ -54,7 +58,7 @@ static void BM_PlanChainedMatches(benchmark::State &state) {
     auto symbol_table = memgraph::query::MakeSymbolTable(query);
     auto ctx = memgraph::query::plan::MakePlanningContext(&storage, &symbol_table, query, &dba);
     state.ResumeTiming();
-    auto query_parts = memgraph::query::plan::CollectQueryParts(symbol_table, storage, query);
+    auto query_parts = memgraph::query::plan::CollectQueryParts(symbol_table, storage, query, false);
     if (query_parts.query_parts.size() == 0) {
       std::exit(EXIT_FAILURE);
     }
@@ -127,14 +131,15 @@ static void BM_PlanAndEstimateIndexedMatching(benchmark::State &state) {
     auto symbol_table = memgraph::query::MakeSymbolTable(query);
     state.ResumeTiming();
     auto ctx = memgraph::query::plan::MakePlanningContext(&storage, &symbol_table, query, &dba);
-    auto query_parts = memgraph::query::plan::CollectQueryParts(symbol_table, storage, query);
+    auto query_parts = memgraph::query::plan::CollectQueryParts(symbol_table, storage, query, false);
     if (query_parts.query_parts.size() == 0) {
       std::exit(EXIT_FAILURE);
     }
     auto plans = memgraph::query::plan::MakeLogicalPlanForSingleQuery<memgraph::query::plan::VariableStartPlanner>(
         query_parts, &ctx);
     for (auto plan : plans) {
-      memgraph::query::plan::EstimatePlanCost(&dba, symbol_table, parameters, *plan);
+      memgraph::query::plan::EstimatePlanCost(&dba, symbol_table, parameters, *plan,
+                                              memgraph::query::plan::IndexHints());
     }
   }
 }
@@ -148,7 +153,7 @@ static void BM_PlanAndEstimateIndexedMatchingWithCachedCounts(benchmark::State &
   std::tie(label, prop) = CreateIndexedVertices(index_count, vertex_count, db.get());
   auto storage_dba = db->Access();
   memgraph::query::DbAccessor dba(storage_dba.get());
-  auto vertex_counts = memgraph::query::plan::MakeVertexCountCache(&dba);
+  auto vertex_counts = memgraph::query::plan::VertexCountCache(&dba);
   memgraph::query::Parameters parameters;
   while (state.KeepRunning()) {
     state.PauseTiming();
@@ -157,14 +162,15 @@ static void BM_PlanAndEstimateIndexedMatchingWithCachedCounts(benchmark::State &
     auto symbol_table = memgraph::query::MakeSymbolTable(query);
     state.ResumeTiming();
     auto ctx = memgraph::query::plan::MakePlanningContext(&storage, &symbol_table, query, &vertex_counts);
-    auto query_parts = memgraph::query::plan::CollectQueryParts(symbol_table, storage, query);
+    auto query_parts = memgraph::query::plan::CollectQueryParts(symbol_table, storage, query, false);
     if (query_parts.query_parts.size() == 0) {
       std::exit(EXIT_FAILURE);
     }
     auto plans = memgraph::query::plan::MakeLogicalPlanForSingleQuery<memgraph::query::plan::VariableStartPlanner>(
         query_parts, &ctx);
     for (auto plan : plans) {
-      memgraph::query::plan::EstimatePlanCost(&vertex_counts, symbol_table, parameters, *plan);
+      memgraph::query::plan::EstimatePlanCost(&vertex_counts, symbol_table, parameters, *plan,
+                                              memgraph::query::plan::IndexHints());
     }
   }
 }

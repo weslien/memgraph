@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -24,6 +24,8 @@
 #include "query_plan_common.hpp"
 #include "storage/v2/disk/storage.hpp"
 #include "storage/v2/inmemory/storage.hpp"
+
+using memgraph::replication_coordination_glue::ReplicationRole;
 
 using namespace memgraph::query;
 using namespace memgraph::query::plan;
@@ -82,7 +84,7 @@ class QueryPlanTest : public testing::Test {
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
 
-TYPED_TEST_CASE(QueryPlanTest, StorageTypes);
+TYPED_TEST_SUITE(QueryPlanTest, StorageTypes);
 
 TYPED_TEST(QueryPlanTest, Accumulate) {
   // simulate the following two query execution on an empty db
@@ -210,7 +212,7 @@ class QueryPlanAggregateOps : public QueryPlanTest<StorageType> {
   }
 };
 
-TYPED_TEST_CASE(QueryPlanAggregateOps, StorageTypes);
+TYPED_TEST_SUITE(QueryPlanAggregateOps, StorageTypes);
 
 TYPED_TEST(QueryPlanAggregateOps, WithData) {
   this->AddData();
@@ -250,30 +252,23 @@ TYPED_TEST(QueryPlanAggregateOps, WithData) {
 TYPED_TEST(QueryPlanAggregateOps, WithoutDataWithGroupBy) {
   {
     auto results = this->AggregationResults(true, false, {Aggregation::Op::COUNT});
-    EXPECT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0][0].type(), TypedValue::Type::Int);
-    EXPECT_EQ(results[0][0].ValueInt(), 0);
+    EXPECT_EQ(results.size(), 0);
   }
   {
     auto results = this->AggregationResults(true, false, {Aggregation::Op::SUM});
-    EXPECT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0][0].type(), TypedValue::Type::Int);
-    EXPECT_EQ(results[0][0].ValueInt(), 0);
+    EXPECT_EQ(results.size(), 0);
   }
   {
     auto results = this->AggregationResults(true, false, {Aggregation::Op::AVG});
-    EXPECT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0][0].type(), TypedValue::Type::Null);
+    EXPECT_EQ(results.size(), 0);
   }
   {
     auto results = this->AggregationResults(true, false, {Aggregation::Op::MIN});
-    EXPECT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0][0].type(), TypedValue::Type::Null);
+    EXPECT_EQ(results.size(), 0);
   }
   {
     auto results = this->AggregationResults(true, false, {Aggregation::Op::MAX});
-    EXPECT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0][0].type(), TypedValue::Type::Null);
+    EXPECT_EQ(results.size(), 0);
   }
   {
     auto results = this->AggregationResults(true, false, {Aggregation::Op::COLLECT_LIST});
@@ -666,30 +661,23 @@ TYPED_TEST(QueryPlanAggregateOps, WithDataDistinct) {
 TYPED_TEST(QueryPlanAggregateOps, WithoutDataWithDistinctAndWithGroupBy) {
   {
     auto results = this->AggregationResults(true, true, {Aggregation::Op::COUNT});
-    EXPECT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0][0].type(), TypedValue::Type::Int);
-    EXPECT_EQ(results[0][0].ValueInt(), 0);
+    EXPECT_EQ(results.size(), 0);
   }
   {
     auto results = this->AggregationResults(true, true, {Aggregation::Op::SUM});
-    EXPECT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0][0].type(), TypedValue::Type::Int);
-    EXPECT_EQ(results[0][0].ValueInt(), 0);
+    EXPECT_EQ(results.size(), 0);
   }
   {
     auto results = this->AggregationResults(true, true, {Aggregation::Op::AVG});
-    EXPECT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0][0].type(), TypedValue::Type::Null);
+    EXPECT_EQ(results.size(), 0);
   }
   {
     auto results = this->AggregationResults(true, true, {Aggregation::Op::MIN});
-    EXPECT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0][0].type(), TypedValue::Type::Null);
+    EXPECT_EQ(results.size(), 0);
   }
   {
     auto results = this->AggregationResults(true, true, {Aggregation::Op::MAX});
-    EXPECT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0][0].type(), TypedValue::Type::Null);
+    EXPECT_EQ(results.size(), 0);
   }
   {
     auto results = this->AggregationResults(true, true, {Aggregation::Op::COLLECT_LIST});

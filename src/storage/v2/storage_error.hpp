@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -23,6 +23,7 @@ struct PersistenceError {};  // TODO: Generalize and add to InMemory durability 
                              // asserts and terminated if failed)
 
 struct IndexDefinitionError {};
+struct IndexDefinitionConfigError {};
 
 struct ConstraintsPersistenceError {};
 
@@ -32,7 +33,7 @@ inline bool operator==(const SerializationError & /*err1*/, const SerializationE
 using StorageManipulationError =
     std::variant<ConstraintViolation, ReplicationError, SerializationError, PersistenceError>;
 
-using StorageIndexDefinitionError = IndexDefinitionError;
+using StorageIndexDefinitionError = std::variant<IndexDefinitionError, IndexDefinitionConfigError>;
 
 struct ConstraintDefinitionError {};
 
@@ -41,5 +42,9 @@ using StorageExistenceConstraintDefinitionError = std::variant<ConstraintViolati
 using StorageExistenceConstraintDroppingError = ConstraintDefinitionError;
 
 using StorageUniqueConstraintDefinitionError = std::variant<ConstraintViolation, ConstraintDefinitionError>;
+
+using StorageTypeConstraintDefinitionError = std::variant<ConstraintViolation, ConstraintDefinitionError>;
+
+using StorageTypeConstraintDroppingError = ConstraintDefinitionError;
 
 }  // namespace memgraph::storage

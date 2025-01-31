@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -10,7 +10,6 @@
 // licenses/APL.txt.
 
 #include "query/frontend/ast/ast.hpp"
-#include "query/frontend/ast/ast_visitor.hpp"
 #include "utils/typeinfo.hpp"
 
 namespace memgraph {
@@ -57,6 +56,9 @@ constexpr utils::TypeInfo query::DivisionOperator::kType{utils::TypeId::AST_DIVI
 constexpr utils::TypeInfo query::ModOperator::kType{utils::TypeId::AST_MOD_OPERATOR, "ModOperator",
                                                     &query::BinaryOperator::kType};
 
+constexpr utils::TypeInfo query::ExponentiationOperator::kType{utils::TypeId::AST_EXPONENTIATION_OPERATOR,
+                                                               "ExponentiationOperator", &query::BinaryOperator::kType};
+
 constexpr utils::TypeInfo query::NotEqualOperator::kType{utils::TypeId::AST_NOT_EQUAL_OPERATOR, "NotEqualOperator",
                                                          &query::BinaryOperator::kType};
 
@@ -74,6 +76,9 @@ constexpr utils::TypeInfo query::LessEqualOperator::kType{utils::TypeId::AST_LES
 
 constexpr utils::TypeInfo query::GreaterEqualOperator::kType{utils::TypeId::AST_GREATER_EQUAL_OPERATOR,
                                                              "GreaterEqualOperator", &query::BinaryOperator::kType};
+
+constexpr utils::TypeInfo query::RangeOperator::kType{utils::TypeId::AST_RANGE_OPERATOR, "RangeOperator",
+                                                      &query::Expression::kType};
 
 constexpr utils::TypeInfo query::InListOperator::kType{utils::TypeId::AST_IN_LIST_OPERATOR, "InListOperator",
                                                        &query::BinaryOperator::kType};
@@ -175,6 +180,11 @@ constexpr utils::TypeInfo query::CypherUnion::kType{utils::TypeId::AST_CYPHER_UN
 
 constexpr utils::TypeInfo query::Query::kType{utils::TypeId::AST_QUERY, "Query", &query::Tree::kType};
 
+constexpr utils::TypeInfo query::IndexHint::kType{utils::TypeId::AST_INDEX_HINT, "IndexHint", &query::Tree::kType};
+
+constexpr utils::TypeInfo query::PreQueryDirectives::kType{utils::TypeId::AST_PRE_QUERY_DIRECTIVES,
+                                                           "PreQueryDirectives", &query::Tree::kType};
+
 constexpr utils::TypeInfo query::CypherQuery::kType{utils::TypeId::AST_CYPHER_QUERY, "CypherQuery",
                                                     &query::Query::kType};
 
@@ -185,6 +195,18 @@ constexpr utils::TypeInfo query::ProfileQuery::kType{utils::TypeId::AST_PROFILE_
                                                      &query::Query::kType};
 
 constexpr utils::TypeInfo query::IndexQuery::kType{utils::TypeId::AST_INDEX_QUERY, "IndexQuery", &query::Query::kType};
+
+constexpr utils::TypeInfo query::EdgeIndexQuery::kType{utils::TypeId::AST_EDGE_INDEX_QUERY, "EdgeIndexQuery",
+                                                       &query::Query::kType};
+
+constexpr utils::TypeInfo query::PointIndexQuery::kType{utils::TypeId::AST_POINT_INDEX_QUERY, "PointIndexQuery",
+                                                        &query::Query::kType};
+
+constexpr utils::TypeInfo query::TextIndexQuery::kType{utils::TypeId::AST_TEXT_INDEX_QUERY, "TextIndexQuery",
+                                                       &query::Query::kType};
+
+constexpr utils::TypeInfo query::VectorIndexQuery::kType{utils::TypeId::AST_VECTOR_INDEX_QUERY, "VectorIndexQuery",
+                                                         &query::Query::kType};
 
 constexpr utils::TypeInfo query::Create::kType{utils::TypeId::AST_CREATE, "Create", &query::Clause::kType};
 
@@ -239,6 +261,12 @@ constexpr utils::TypeInfo query::DumpQuery::kType{utils::TypeId::AST_DUMP_QUERY,
 constexpr utils::TypeInfo query::ReplicationQuery::kType{utils::TypeId::AST_REPLICATION_QUERY, "ReplicationQuery",
                                                          &query::Query::kType};
 
+constexpr utils::TypeInfo query::CoordinatorQuery::kType{utils::TypeId::AST_COORDINATOR_QUERY, "CoordinatorQuery",
+                                                         &query::Query::kType};
+
+constexpr utils::TypeInfo query::DropGraphQuery::kType{utils::TypeId::AST_DROP_GRAPH_QUERY, "DropGraphQuery",
+                                                       &query::Query::kType};
+
 constexpr utils::TypeInfo query::LockPathQuery::kType{utils::TypeId::AST_LOCK_PATH_QUERY, "LockPathQuery",
                                                       &query::Query::kType};
 
@@ -258,6 +286,12 @@ constexpr utils::TypeInfo query::StorageModeQuery::kType{utils::TypeId::AST_STOR
 
 constexpr utils::TypeInfo query::CreateSnapshotQuery::kType{utils::TypeId::AST_CREATE_SNAPSHOT_QUERY,
                                                             "CreateSnapshotQuery", &query::Query::kType};
+
+constexpr utils::TypeInfo query::RecoverSnapshotQuery::kType{utils::TypeId::AST_RECOVER_SNAPSHOT_QUERY,
+                                                             "RecoverSnapshotQuery", &query::Query::kType};
+
+constexpr utils::TypeInfo query::ShowSnapshotsQuery::kType{utils::TypeId::AST_SHOW_SNAPSHOTS_QUERY,
+                                                           "ShowSnapshotsQuery", &query::Query::kType};
 
 constexpr utils::TypeInfo query::StreamQuery::kType{utils::TypeId::AST_STREAM_QUERY, "StreamQuery",
                                                     &query::Query::kType};
@@ -292,5 +326,37 @@ constexpr utils::TypeInfo query::ShowDatabasesQuery::kType{utils::TypeId::AST_SH
 
 constexpr utils::TypeInfo query::EdgeImportModeQuery::kType{utils::TypeId::AST_EDGE_IMPORT_MODE_QUERY,
                                                             "EdgeImportModeQuery", &query::Query::kType};
+
+constexpr utils::TypeInfo query::PatternComprehension::kType{utils::TypeId::AST_PATTERN_COMPREHENSION,
+                                                             "PatternComprehension", &query::Expression::kType};
+
+constexpr utils::TypeInfo query::CreateEnumQuery::kType{utils::TypeId::AST_CREATE_ENUM_QUERY, "CreateEnumQuery",
+                                                        &query::Query::kType};
+
+constexpr utils::TypeInfo query::ShowEnumsQuery::kType{utils::TypeId::AST_SHOW_ENUMS_QUERY, "ShowEnumsQuery",
+                                                       &query::Query::kType};
+
+constexpr utils::TypeInfo query::EnumValueAccess::kType{utils::TypeId::AST_ENUM_VALUE_ACCESS, "EnumValueAccess",
+                                                        &query::Expression::kType};
+
+constexpr utils::TypeInfo query::AlterEnumAddValueQuery::kType{utils::TypeId::AST_ALTER_ENUM_ADD_VALUE_QUERY,
+                                                               "AlterEnumAddValueQuery", &query::Query::kType};
+
+constexpr utils::TypeInfo query::AlterEnumUpdateValueQuery::kType{utils::TypeId::AST_ALTER_ENUM_UPDATE_VALUE_QUERY,
+                                                                  "AlterEnumUpdateValueQuery", &query::Query::kType};
+
+constexpr utils::TypeInfo query::AlterEnumRemoveValueQuery::kType{utils::TypeId::AST_ALTER_ENUM_REMOVE_VALUE_QUERY,
+                                                                  "AlterEnumRemoveValueQuery", &query::Query::kType};
+
+constexpr utils::TypeInfo query::DropEnumQuery::kType{utils::TypeId::AST_DROP_ENUM_QUERY, "DropEnumQuery",
+                                                      &query::Query::kType};
+
+constexpr utils::TypeInfo query::ShowSchemaInfoQuery::kType{utils::TypeId::AST_SHOW_SCHEMA_INFO_QUERY,
+                                                            "ShowSchemaInfoQuery", &query::Query::kType};
+
+constexpr utils::TypeInfo query::TtlQuery::kType{utils::TypeId::AST_TTL_QUERY, "TtlQuery", &query::Query::kType};
+
+constexpr utils::TypeInfo query::SessionTraceQuery::kType{utils::TypeId::AST_SESSION_TRACE_QUERY, "SessionTraceQuery",
+                                                          &query::Query::kType};
 
 }  // namespace memgraph

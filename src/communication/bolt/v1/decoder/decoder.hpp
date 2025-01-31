@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -17,6 +17,7 @@
 
 #include "communication/bolt/v1/codes.hpp"
 #include "communication/bolt/v1/value.hpp"
+#include "storage/v2/point.hpp"
 #include "utils/cast.hpp"
 #include "utils/endian.hpp"
 #include "utils/logging.hpp"
@@ -131,6 +132,21 @@ class Decoder {
             return ReadUnboundedEdge(data);
           case Signature::Path:
             return ReadPath(data);
+          case Signature::DateTime:
+            return ReadDateTime(data);
+          case Signature::DateTimeZoneId:
+            return ReadDateTimeZoneId(data);
+          case Signature::LegacyDateTime: {
+            if (major_v_ > 4) return false;
+            return ReadLegacyDateTime(data);
+          }
+          case Signature::LegacyDateTimeZoneId: {
+            if (major_v_ > 4) return false;
+            return ReadLegacyDateTimeZoneId(data);
+          }
+          case Signature::Point2d: {
+            return ReadPoint2d(data);
+          }
           default:
             return false;
         }
@@ -143,6 +159,9 @@ class Decoder {
         switch (static_cast<Signature>(signature)) {
           case Signature::Duration:
             return ReadDuration(data);
+          case Signature::Point3d: {
+            return ReadPoint3d(data);
+          }
           default:
             return false;
         }
@@ -370,7 +389,7 @@ class Decoder {
 
     Value dv_key, dv_val;
 
-    *data = Value(std::map<std::string, Value>());
+    *data = Value(map_t{});
     auto &ret = data->ValueMap();
     for (int64_t i = 0; i < size; ++i) {
       if (!ReadValue(&dv_key, Value::Type::String)) {
@@ -401,11 +420,11 @@ class Decoder {
     }
     auto &labels = dv.ValueList();
     vertex.labels.reserve(labels.size());
-    for (size_t i = 0; i < labels.size(); ++i) {
-      if (labels[i].type() != Value::Type::String) {
+    for (auto &label : labels) {
+      if (label.type() != Value::Type::String) {
         return false;
       }
-      vertex.labels.emplace_back(std::move(labels[i].ValueString()));
+      vertex.labels.emplace_back(std::move(label.ValueString()));
     }
 
     // read properties
@@ -628,6 +647,135 @@ class Decoder {
     const auto nanos = chrono::nanoseconds(values[3]);
     const auto micros = months + days + secs + chrono::duration_cast<chrono::microseconds>(nanos);
     *data = Value(utils::Duration(micros.count()));
+    return true;
+  }
+
+  bool ReadPoint2d(Value *data) {
+    Value dv;
+    if (!ReadValue(&dv, Value::Type::Int)) return false;
+
+    auto crs = storage::SridToCrs(storage::Srid{dv.ValueInt()});
+    if (!crs) return false;
+    if (!storage::valid2d(*crs)) return false;
+
+    if (!ReadValue(&dv, Value::Type::Double)) return false;
+    double x = dv.ValueDouble();
+
+    if (!ReadValue(&dv, Value::Type::Double)) return false;
+    double y = dv.ValueDouble();
+
+    *data = Value(storage::Point2d(*crs, x, y));
+    return true;
+  }
+
+  bool ReadPoint3d(Value *data) {
+    Value dv;
+    if (!ReadValue(&dv, Value::Type::Int)) return false;
+
+    auto crs = storage::SridToCrs(storage::Srid{dv.ValueInt()});
+    if (!crs) return false;
+    if (!storage::valid3d(*crs)) return false;
+
+    if (!ReadValue(&dv, Value::Type::Double)) return false;
+    double x = dv.ValueDouble();
+
+    if (!ReadValue(&dv, Value::Type::Double)) return false;
+    double y = dv.ValueDouble();
+
+    if (!ReadValue(&dv, Value::Type::Double)) return false;
+    double z = dv.ValueDouble();
+
+    *data = Value(storage::Point3d(*crs, x, y, z));
+    return true;
+  }
+
+  bool ComputeTimeSinceEpoch(int64_t *time_since_epoch) {
+    Value secs;
+    if (!ReadValue(&secs, Value::Type::Int)) {
+      return false;
+    }
+
+    Value nanos;
+    if (!ReadValue(&nanos, Value::Type::Int)) {
+      return false;
+    }
+
+    const auto sys_seconds = std::chrono::sys_seconds(std::chrono::seconds(secs.ValueInt()));
+    // The highest precision Memgraph supports for temporal values is microsecond
+    const auto leftover_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::nanoseconds(nanos.ValueInt()));
+
+    *time_since_epoch = (sys_seconds + leftover_us).time_since_epoch().count();
+    return true;
+  }
+
+  bool ReadDateTime(Value *data) {
+    int64_t time_since_epoch;
+    if (!ComputeTimeSinceEpoch(&time_since_epoch)) {
+      return false;
+    }
+
+    Value tz_offset_secs;
+    if (!ReadValue(&tz_offset_secs, Value::Type::Int)) {
+      return false;
+    }
+
+    // The highest precision Cypher supports for timezone offsets is minutes
+    const auto tz_offset =
+        std::chrono::duration_cast<std::chrono::minutes>(std::chrono::seconds(tz_offset_secs.ValueInt()));
+
+    *data = utils::ZonedDateTime(utils::AsSysTime(time_since_epoch), utils::Timezone(tz_offset));
+
+    return true;
+  }
+
+  bool ReadDateTimeZoneId(Value *data) {
+    int64_t time_since_epoch;
+    if (!ComputeTimeSinceEpoch(&time_since_epoch)) {
+      return false;
+    }
+
+    Value tz_id;
+    if (!ReadValue(&tz_id, Value::Type::String)) {
+      return false;
+    }
+
+    *data = utils::ZonedDateTime(utils::AsSysTime(time_since_epoch), utils::Timezone(tz_id.ValueString()));
+    return true;
+  }
+
+  bool ReadLegacyDateTime(Value *data) {
+    int64_t time_since_epoch;
+    if (!ComputeTimeSinceEpoch(&time_since_epoch)) {
+      return false;
+    }
+
+    Value tz_offset_secs;
+    if (!ReadValue(&tz_offset_secs, Value::Type::Int)) {
+      return false;
+    }
+
+    // The highest precision Cypher supports for timezone offsets is minutes
+    const auto tz_offset =
+        std::chrono::duration_cast<std::chrono::minutes>(std::chrono::seconds(tz_offset_secs.ValueInt()));
+
+    *data = utils::ZonedDateTime(utils::AsLocalTime(time_since_epoch), utils::Timezone(tz_offset));
+
+    return true;
+  }
+
+  bool ReadLegacyDateTimeZoneId(Value *data) {
+    int64_t time_since_epoch;
+    if (!ComputeTimeSinceEpoch(&time_since_epoch)) {
+      return false;
+    }
+
+    Value tz_id;
+    if (!ReadValue(&tz_id, Value::Type::String)) {
+      return false;
+    }
+
+    *data = utils::ZonedDateTime(utils::AsLocalTime(time_since_epoch), utils::Timezone(tz_id.ValueString()));
     return true;
   }
 };

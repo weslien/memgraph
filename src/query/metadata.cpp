@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,8 +11,6 @@
 
 #include "query/metadata.hpp"
 
-#include <algorithm>
-#include <compare>
 #include <string>
 #include <string_view>
 
@@ -66,6 +64,20 @@ constexpr std::string_view GetCodeString(const NotificationCode code) {
       return "PlanHinting"sv;
     case NotificationCode::REGISTER_REPLICA:
       return "RegisterReplica"sv;
+#ifdef MG_ENTERPRISE
+    case NotificationCode::REGISTER_REPLICATION_INSTANCE:
+      return "RegisterReplicationInstance"sv;
+    case NotificationCode::ADD_COORDINATOR_INSTANCE:
+      return "AddCoordinatorInstance"sv;
+    case NotificationCode::REMOVE_COORDINATOR_INSTANCE:
+      return "RemoveCoordinatorInstance"sv;
+    case NotificationCode::UNREGISTER_INSTANCE:
+      return "UnregisterInstance"sv;
+    case NotificationCode::DEMOTE_INSTANCE_TO_REPLICA:
+      return "DemoteInstanceToReplica"sv;
+    case NotificationCode::FORCE_RESET_CLUSTER_STATE:
+      return "ReconcileClusterState"sv;
+#endif
     case NotificationCode::REPLICA_PORT_WARNING:
       return "ReplicaPortWarning"sv;
     case NotificationCode::SET_REPLICA:
@@ -78,6 +90,12 @@ constexpr std::string_view GetCodeString(const NotificationCode code) {
       return "StopStream"sv;
     case NotificationCode::STOP_ALL_STREAMS:
       return "StopAllStreams"sv;
+    case NotificationCode::ENABLE_TTL:
+      return "EnableTTL"sv;
+    case NotificationCode::DISABLE_TTL:
+      return "DisableTTL"sv;
+    case NotificationCode::STOP_TTL:
+      return "StopTTL"sv;
   }
 }
 }  // namespace

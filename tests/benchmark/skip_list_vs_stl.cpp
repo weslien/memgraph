@@ -1,4 +1,4 @@
-// Copyright 2022 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -79,7 +79,7 @@ BENCHMARK_DEFINE_F(StdSetInsertFixture, Insert)(benchmark::State &state) {
   std::uniform_int_distribution<uint64_t> dist(0, kMaxNum);
   uint64_t counter = 0;
   while (state.KeepRunning()) {
-    std::lock_guard<memgraph::utils::SpinLock> guard(lock);
+    auto guard = std::lock_guard{lock};
     if (container.insert(dist(gen)).second) {
       ++counter;
     }
@@ -101,8 +101,7 @@ class StdSetWithPoolAllocatorInsertFixture : public benchmark::Fixture {
   }
 
  protected:
-  memgraph::utils::PoolResource memory_{256U /* max_blocks_per_chunk */, 1024U /* max_block_size */,
-                                        memgraph::utils::NewDeleteResource()};
+  memgraph::utils::PoolResource memory_{128U /* max_blocks_per_chunk */, memgraph::utils::NewDeleteResource()};
   std::set<uint64_t, std::less<>, memgraph::utils::Allocator<uint64_t>> container{&memory_};
   memgraph::utils::SpinLock lock;
 };
@@ -113,7 +112,7 @@ BENCHMARK_DEFINE_F(StdSetWithPoolAllocatorInsertFixture, Insert)
   std::uniform_int_distribution<uint64_t> dist(0, kMaxNum);
   uint64_t counter = 0;
   while (state.KeepRunning()) {
-    std::lock_guard<memgraph::utils::SpinLock> guard(lock);
+    auto guard = std::lock_guard{lock};
     if (container.insert(dist(gen)).second) {
       ++counter;
     }
@@ -187,7 +186,7 @@ BENCHMARK_DEFINE_F(StdSetFindFixture, Find)(benchmark::State &state) {
   std::uniform_int_distribution<uint64_t> dist(0, kMaxNum);
   uint64_t counter = 0;
   while (state.KeepRunning()) {
-    std::lock_guard<memgraph::utils::SpinLock> guard(lock);
+    auto guard = std::lock_guard{lock};
     if (container.find(dist(gen)) != container.end()) {
       ++counter;
     }
@@ -208,8 +207,7 @@ class StdSetWithPoolAllocatorFindFixture : public benchmark::Fixture {
   }
 
  protected:
-  memgraph::utils::PoolResource memory_{256U /* max_blocks_per_chunk */, 1024U /* max_block_size */,
-                                        memgraph::utils::NewDeleteResource()};
+  memgraph::utils::PoolResource memory_{128U /* max_blocks_per_chunk */, memgraph::utils::NewDeleteResource()};
   std::set<uint64_t, std::less<>, memgraph::utils::Allocator<uint64_t>> container{&memory_};
   memgraph::utils::SpinLock lock;
 };
@@ -220,7 +218,7 @@ BENCHMARK_DEFINE_F(StdSetWithPoolAllocatorFindFixture, Find)
   std::uniform_int_distribution<uint64_t> dist(0, kMaxNum);
   uint64_t counter = 0;
   while (state.KeepRunning()) {
-    std::lock_guard<memgraph::utils::SpinLock> guard(lock);
+    auto guard = std::lock_guard{lock};
     if (container.find(dist(gen)) != container.end()) {
       ++counter;
     }
@@ -303,7 +301,7 @@ BENCHMARK_DEFINE_F(StdMapInsertFixture, Insert)(benchmark::State &state) {
   std::uniform_int_distribution<uint64_t> dist(0, kMaxNum);
   uint64_t counter = 0;
   while (state.KeepRunning()) {
-    std::lock_guard<memgraph::utils::SpinLock> guard(lock);
+    auto guard = std::lock_guard{lock};
     if (container.insert({dist(gen), 0}).second) {
       ++counter;
     }
@@ -325,8 +323,7 @@ class StdMapWithPoolAllocatorInsertFixture : public benchmark::Fixture {
   }
 
  protected:
-  memgraph::utils::PoolResource memory_{256U /* max_blocks_per_chunk */, 1024U /* max_block_size */,
-                                        memgraph::utils::NewDeleteResource()};
+  memgraph::utils::PoolResource memory_{128U /* max_blocks_per_chunk */, memgraph::utils::NewDeleteResource()};
   std::map<uint64_t, uint64_t, std::less<>, memgraph::utils::Allocator<std::pair<const uint64_t, uint64_t>>> container{
       &memory_};
   memgraph::utils::SpinLock lock;
@@ -338,7 +335,7 @@ BENCHMARK_DEFINE_F(StdMapWithPoolAllocatorInsertFixture, Insert)
   std::uniform_int_distribution<uint64_t> dist(0, kMaxNum);
   uint64_t counter = 0;
   while (state.KeepRunning()) {
-    std::lock_guard<memgraph::utils::SpinLock> guard(lock);
+    auto guard = std::lock_guard{lock};
     if (container.insert({dist(gen), 0}).second) {
       ++counter;
     }
@@ -412,7 +409,7 @@ BENCHMARK_DEFINE_F(StdMapFindFixture, Find)(benchmark::State &state) {
   std::uniform_int_distribution<uint64_t> dist(0, kMaxNum);
   uint64_t counter = 0;
   while (state.KeepRunning()) {
-    std::lock_guard<memgraph::utils::SpinLock> guard(lock);
+    auto guard = std::lock_guard{lock};
     if (container.find(dist(gen)) != container.end()) {
       ++counter;
     }
@@ -433,8 +430,7 @@ class StdMapWithPoolAllocatorFindFixture : public benchmark::Fixture {
   }
 
  protected:
-  memgraph::utils::PoolResource memory_{256U /* max_blocks_per_chunk */, 1024U /* max_block_size */,
-                                        memgraph::utils::NewDeleteResource()};
+  memgraph::utils::PoolResource memory_{128U /* max_blocks_per_chunk */, memgraph::utils::NewDeleteResource()};
   std::map<uint64_t, uint64_t, std::less<>, memgraph::utils::Allocator<std::pair<const uint64_t, uint64_t>>> container{
       &memory_};
   memgraph::utils::SpinLock lock;
@@ -446,7 +442,7 @@ BENCHMARK_DEFINE_F(StdMapWithPoolAllocatorFindFixture, Find)
   std::uniform_int_distribution<uint64_t> dist(0, kMaxNum);
   uint64_t counter = 0;
   while (state.KeepRunning()) {
-    std::lock_guard<memgraph::utils::SpinLock> guard(lock);
+    auto guard = std::lock_guard{lock};
     if (container.find(dist(gen)) != container.end()) {
       ++counter;
     }

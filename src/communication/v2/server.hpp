@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -13,7 +13,7 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <iostream>
+#include <iosfwd>
 #include <memory>
 #include <optional>
 #include <string>
@@ -26,6 +26,7 @@
 #include <boost/asio/ip/tcp.hpp>
 
 #include "communication/context.hpp"
+#include "communication/fmt.hpp"
 #include "communication/init.hpp"
 #include "communication/v2/listener.hpp"
 #include "communication/v2/pool.hpp"
@@ -63,6 +64,10 @@ using ServerEndpoint = boost::asio::ip::tcp::endpoint;
  * @tparam TSessionContext the class with objects that will be forwarded to the
  *         session
  */
+
+inline struct handle_errors {
+} handle_errors_t;
+
 template <typename TSession, typename TSessionContext>
 class Server final {
   using ServerHandler = Server<TSession, TSessionContext>;
@@ -73,6 +78,10 @@ class Server final {
    * invokes workers_count workers
    */
   Server(ServerEndpoint &endpoint, TSessionContext *session_context, ServerContext *server_context,
+         int inactivity_timeout_sec, std::string_view service_name,
+         size_t workers_count = std::thread::hardware_concurrency());
+
+  Server(handle_errors /*_*/, ServerEndpoint &endpoint, TSessionContext *session_context, ServerContext *server_context,
          int inactivity_timeout_sec, std::string_view service_name,
          size_t workers_count = std::thread::hardware_concurrency());
 
@@ -121,6 +130,18 @@ Server<TSession, TSessionContext>::Server(ServerEndpoint &endpoint, TSessionCont
                                                             inactivity_timeout_sec)} {}
 
 template <typename TSession, typename TSessionContext>
+Server<TSession, TSessionContext>::Server(handle_errors /*_*/, ServerEndpoint &endpoint,
+                                          TSessionContext *session_context, ServerContext *server_context,
+                                          const int inactivity_timeout_sec, const std::string_view service_name,
+                                          size_t workers_count)
+    : endpoint_{endpoint},
+      service_name_{service_name},
+      context_thread_pool_{workers_count},
+      listener_{Listener<TSession, TSessionContext>::Create(assert_create_t, context_thread_pool_.GetIOContext(),
+                                                            session_context, server_context, endpoint_, service_name_,
+                                                            inactivity_timeout_sec)} {}
+
+template <typename TSession, typename TSessionContext>
 bool Server<TSession, TSessionContext>::Start() {
   if (IsRunning()) {
     spdlog::error("The server is already running");
@@ -129,7 +150,7 @@ bool Server<TSession, TSessionContext>::Start() {
   listener_->Start();
 
   spdlog::info("{} server is fully armed and operational", service_name_);
-  spdlog::info("{} listening on {}", service_name_, endpoint_.address());
+  spdlog::info("{} listening on {}", service_name_, endpoint_);
   context_thread_pool_.Run();
 
   return true;

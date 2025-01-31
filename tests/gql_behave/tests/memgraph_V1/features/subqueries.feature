@@ -185,6 +185,20 @@ Feature: Subqueries
             """
         Then an error should be raised
 
+    Scenario: Subquery with an unbound variable
+        Given an empty graph
+        When executing query:
+        """
+        MATCH (node1)
+        CALL {
+            MATCH (node2)
+            WHERE node1.property > 0
+            return 1 as state
+        }
+        return 1
+        """
+        Then an error should be raised
+
     Scenario: Subquery returning primitive but not aliased
         Given an empty graph
         And having executed
@@ -406,3 +420,20 @@ Feature: Subqueries
         Then the result should be:
             | title          |
             | 'Forrest Gump' |
+    Scenario: Match after call
+        Given an empty graph
+        And having executed
+            """
+            CREATE ({n0:0})
+            """
+        When executing query:
+            """
+            CALL {
+            	RETURN 0 AS x
+            }
+            MATCH (n {n0:x})
+            RETURN n.n0 as n0;
+            """
+        Then the result should be:
+            | n0 |
+            | 0  |

@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -22,6 +22,7 @@
 #include "gtest/gtest.h"
 
 #include "communication/result_stream_faker.hpp"
+#include "query/auth_checker.hpp"
 #include "query/interpreter.hpp"
 #include "query/interpreter_context.hpp"
 #include "query/stream/streams.hpp"
@@ -36,14 +37,16 @@ class QueryExecution : public testing::Test {
   const std::string testSuite = "query_plan_edge_cases";
   std::optional<memgraph::dbms::DatabaseAccess> db_acc_;
   std::optional<memgraph::query::InterpreterContext> interpreter_context_;
+  std::optional<memgraph::query::AllowEverythingAuthChecker> auth_checker_;
   std::optional<memgraph::query::Interpreter> interpreter_;
 
   std::filesystem::path data_directory{std::filesystem::temp_directory_path() / "MG_tests_unit_query_plan_edge_cases"};
 
   std::optional<memgraph::replication::ReplicationState> repl_state;
   std::optional<memgraph::utils::Gatekeeper<memgraph::dbms::Database>> db_gk;
+  std::optional<memgraph::system::System> system_state;
 
-  void SetUp() {
+  void SetUp() override {
     auto config = [&]() {
       memgraph::storage::Config config{};
       config.durability.storage_directory = data_directory;
@@ -65,14 +68,23 @@ class QueryExecution : public testing::Test {
                                                : memgraph::storage::StorageMode::IN_MEMORY_TRANSACTIONAL),
               "Wrong storage mode!");
     db_acc_ = std::move(db_acc);
-
-    interpreter_context_.emplace(memgraph::query::InterpreterConfig{}, nullptr, &repl_state.value());
+    system_state.emplace();
+    interpreter_context_.emplace(memgraph::query::InterpreterConfig{}, nullptr, &repl_state.value(), *system_state
+#ifdef MG_ENTERPRISE
+                                 ,
+                                 std::nullopt
+#endif
+    );
+    auth_checker_.emplace();
     interpreter_.emplace(&*interpreter_context_, *db_acc_);
+    interpreter_->SetUser(auth_checker_->GenQueryUser(std::nullopt, std::nullopt));
   }
 
-  void TearDown() {
+  void TearDown() override {
     interpreter_ = std::nullopt;
+    auth_checker_.reset();
     interpreter_context_ = std::nullopt;
+    system_state.reset();
     db_acc_.reset();
     db_gk.reset();
     repl_state.reset();
@@ -90,7 +102,7 @@ class QueryExecution : public testing::Test {
   auto Execute(const std::string &query) {
     ResultStreamFaker stream(this->db_acc_->get()->storage());
 
-    auto [header, _1, qid, _2] = interpreter_->Prepare(query, {}, {});
+    auto [header, _1, qid, _2] = interpreter_->Prepare(query, memgraph::query::no_params_fn, {});
     stream.Header(header);
     auto summary = interpreter_->PullAll(&stream);
     stream.Summary(summary);
@@ -100,7 +112,7 @@ class QueryExecution : public testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(QueryExecution, StorageTypes);
+TYPED_TEST_SUITE(QueryExecution, StorageTypes);
 
 TYPED_TEST(QueryExecution, MissingOptionalIntoExpand) {
   // validating bug where expanding from Null (due to a preceeding optional

@@ -8,8 +8,8 @@ everything which is needed for the CI environment.
 List of responsibilities:
     * execute default suites
     * terminate execution if any of internal scenarios fails
-    * creates the report file that is needed by the Apollo plugin
-      to post the status on Phabricator. (.quality_assurance_status)
+    * creates the report file that is packaged and exposed under Github
+      (.quality_assurance_status).
 """
 
 import argparse
@@ -104,11 +104,13 @@ class MemgraphRunner:
         memgraph_binary = os.path.join(self.build_directory, "memgraph")
         args_mg = [
             memgraph_binary,
-            "--storage-properties-on-edges",
+            "--storage-properties-on-edges=true",
             "--data-directory",
             self.data_directory.name,
             "--log-file",
             str(os.path.join(BASE_DIR, "tests", "gql_behave", "memgraph.log")),
+            "--query-modules-directory",
+            str(os.path.join(BUILD_DIR, "query_modules")),
         ]
         self.proc_mg = subprocess.Popen(args_mg + self.args)
         wait_for_server(7687, 1)
@@ -177,6 +179,8 @@ def main():
             "--stats-file",
             suite["stats_file"],
             suite["test_suite"],
+            "--storage-mode",
+            suite_storage_mode,
         ]
 
         # The exit code isn't checked here because the `behave` framework

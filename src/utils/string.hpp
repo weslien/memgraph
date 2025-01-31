@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -17,10 +17,10 @@
 #include <charconv>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
+#include <iomanip>
+#include <iosfwd>
 #include <iterator>
 #include <random>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -208,8 +208,13 @@ std::vector<TString, TAllocator> *Split(std::vector<TString, TAllocator> *out, c
   if (src.empty()) return out;
   size_t index = 0;
   while (splits < 0 || splits-- != 0) {
-    auto n = src.find(delimiter, index);
-    if (n == std::string::npos) break;
+    size_t n = 0;
+    if (delimiter.empty()) {  // Special case where we just return characters
+      n = index + 1;
+    } else {
+      n = src.find(delimiter, index);
+    }
+    if (n >= src.size()) break;
     out->emplace_back(src.substr(index, n - index));
     index = n + delimiter.size();
   }
@@ -228,28 +233,11 @@ inline std::vector<std::string> Split(const std::string_view src, const std::str
   return res;
 }
 
-/**
- * Split a string by whitespace into a vector.
- * Runs of consecutive whitespace are regarded as a single delimiter.
- * Additionally, the result will not contain empty strings at the start or end
- * as if the string was trimmed before splitting.
- * @return pointer to `out`.
- */
-template <class TString, class TAllocator>
-std::vector<TString, TAllocator> *Split(std::vector<TString, TAllocator> *out, const std::string_view src) {
-  out->clear();
-  if (src.empty()) return out;
-  // TODO: Investigate how much regex allocate and perhaps replace with custom
-  // solution doing no allocations.
-  std::regex not_whitespace("[^\\s]+");
-  auto matches_begin = std::cregex_iterator(src.data(), src.data() + src.size(), not_whitespace);
-  auto matches_end = std::cregex_iterator();
-  out->reserve(std::distance(matches_begin, matches_end));
-  for (auto match = matches_begin; match != matches_end; ++match) {
-    std::string_view match_view(&src[match->position()], match->length());
-    out->emplace_back(match_view);
-  }
-  return out;
+inline std::vector<std::string_view> SplitView(const std::string_view src, const std::string_view delimiter,
+                                               int splits = -1) {
+  std::vector<std::string_view> res;
+  Split(&res, src, delimiter, splits);
+  return res;
 }
 
 /**
@@ -258,11 +246,7 @@ std::vector<TString, TAllocator> *Split(std::vector<TString, TAllocator> *out, c
  * Additionally, the result will not contain empty strings at the start or end
  * as if the string was trimmed before splitting.
  */
-inline std::vector<std::string> Split(const std::string_view src) {
-  std::vector<std::string> res;
-  Split(&res, src);
-  return res;
-}
+std::vector<std::string> Split(const std::string_view src);
 
 /**
  * Like `Split` but string is processed from right to left.
@@ -332,6 +316,13 @@ inline int64_t ParseInt(const std::string_view s) {
 
 inline uint64_t ParseStringToUint64(const std::string_view s) {
   if (uint64_t value = 0; std::from_chars(s.data(), s.data() + s.size(), value).ec == std::errc{}) {
+    return value;
+  }
+  throw utils::ParseException(s);
+}
+
+inline uint32_t ParseStringToUint32(const std::string_view s) {
+  if (uint32_t value = 0; std::from_chars(s.data(), s.data() + s.size(), value).ec == std::errc{}) {
     return value;
   }
   throw utils::ParseException(s);
@@ -458,5 +449,52 @@ inline std::string_view Substr(const std::string_view string, size_t pos = 0, si
   auto len = std::min(string.size() - pos, count);
   return string.substr(pos, len);
 }
+
+/**
+ * Convert a double value to a string representation.
+ * Precision of converted value is 16.
+ * Function also removes trailing zeros after the dot.
+ *
+ * @param value The double value to be converted.
+ *
+ * @return The string representation of the double value.
+ *
+ * @throws None
+ */
+inline std::string DoubleToString(const double value) {
+  static const int PRECISION = 15;
+
+  std::stringstream ss;
+  ss << std::setprecision(PRECISION) << std::fixed << value;
+  auto sv = ss.view();
+
+  // Because of setprecision and fixed manipulator we are guaranteed to have the dot
+  sv = sv.substr(0, sv.find_last_not_of('0') + 1);
+  if (sv.ends_with('.')) {
+    sv = sv.substr(0, sv.size() - 1);
+  }
+  return std::string(sv);
+}
+
+// Avoids copies if possible
+struct NoCopyStr {
+  explicit NoCopyStr(std::string_view view_in) : sv{view_in} {}
+  NoCopyStr &operator=(std::string &&str_in) {
+    str = std::move(str_in);
+    sv = str;
+    return *this;
+  }
+  std::string_view view() const { return sv; }
+
+  ~NoCopyStr() = default;
+  NoCopyStr(NoCopyStr &) = delete;
+  NoCopyStr &operator=(NoCopyStr &) = delete;
+  NoCopyStr(NoCopyStr &&) = delete;
+  NoCopyStr &operator=(NoCopyStr &&) = delete;
+
+ private:
+  std::string str;
+  std::string_view sv;
+};
 
 }  // namespace memgraph::utils

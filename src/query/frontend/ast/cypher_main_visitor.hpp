@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,14 +11,20 @@
 
 #pragma once
 
+#include <cstdio>          // Ensure EOF macro is defined
+#pragma push_macro("EOF")  // hide EOF for antlr headers
+#include <support/Any.h>
+#include "query/frontend/opencypher/generated/MemgraphCypherBaseVisitor.h"
+#pragma pop_macro("EOF")  // bring EOF back
+
+#include "query/frontend/ast/ast.hpp"
+#include "query/parameters.hpp"
+#include "utils/exceptions.hpp"
+#include "utils/logging.hpp"
+
 #include <string>
 #include <unordered_set>
 #include <utility>
-
-#include "query/frontend/ast/ast.hpp"
-#include "query/frontend/opencypher/generated/MemgraphCypherBaseVisitor.h"
-#include "utils/exceptions.hpp"
-#include "utils/logging.hpp"
 
 namespace memgraph::query::frontend {
 
@@ -30,7 +36,8 @@ struct ParsingContext {
 
 class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
  public:
-  explicit CypherMainVisitor(ParsingContext context, AstStorage *storage) : context_(context), storage_(storage) {}
+  explicit CypherMainVisitor(ParsingContext context, AstStorage *storage, Parameters *parameters)
+      : context_(context), storage_(storage), parameters_(parameters) {}
 
  private:
   Expression *CreateBinaryOperatorByToken(size_t token, Expression *e1, Expression *e2) {
@@ -51,6 +58,8 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
         return storage_->Create<DivisionOperator>(e1, e2);
       case MemgraphCypher::PERCENT:
         return storage_->Create<ModOperator>(e1, e2);
+      case MemgraphCypher::CARET:
+        return storage_->Create<ExponentiationOperator>(e1, e2);
       case MemgraphCypher::EQ:
         return storage_->Create<EqualOperator>(e1, e2);
       case MemgraphCypher::NEQ1:
@@ -142,9 +151,34 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
   antlrcpp::Any visitCypherQuery(MemgraphCypher::CypherQueryContext *ctx) override;
 
   /**
+   * @return PreQueryDirectives*
+   */
+  antlrcpp::Any visitPreQueryDirectives(MemgraphCypher::PreQueryDirectivesContext *ctx) override;
+
+  /**
    * @return IndexQuery*
    */
   antlrcpp::Any visitIndexQuery(MemgraphCypher::IndexQueryContext *ctx) override;
+
+  /**
+   * @return IndexQuery*
+   */
+  antlrcpp::Any visitEdgeIndexQuery(MemgraphCypher::EdgeIndexQueryContext *ctx) override;
+
+  /**
+   * @return PointIndexQuery*
+   */
+  antlrcpp::Any visitPointIndexQuery(MemgraphCypher::PointIndexQueryContext *ctx) override;
+
+  /**
+   * @return TextIndexQuery*
+   */
+  antlrcpp::Any visitTextIndexQuery(MemgraphCypher::TextIndexQueryContext *ctx) override;
+
+  /**
+   * @return VectorIndexQuery*
+   */
+  antlrcpp::Any visitVectorIndexQuery(MemgraphCypher::VectorIndexQueryContext *ctx) override;
 
   /**
    * @return ExplainQuery*
@@ -175,6 +209,11 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
    * @return ConstraintQuery*
    */
   antlrcpp::Any visitConstraintQuery(MemgraphCypher::ConstraintQueryContext *ctx) override;
+
+  /**
+   * @return TypeConstraintType
+   */
+  antlrcpp::Any visitTypeConstraintType(MemgraphCypher::TypeConstraintTypeContext *ctx) override;
 
   /**
    * @return AuthQuery*
@@ -232,6 +271,63 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
   antlrcpp::Any visitShowReplicas(MemgraphCypher::ShowReplicasContext *ctx) override;
 
   /**
+   * @return CoordinatorQuery*
+   */
+  antlrcpp::Any visitCoordinatorQuery(MemgraphCypher::CoordinatorQueryContext *ctx) override;
+
+  /**
+   * @return DropGraphQuery*
+   */
+  antlrcpp::Any visitDropGraphQuery(MemgraphCypher::DropGraphQueryContext *ctx) override;
+
+  /**
+   * @return CoordinatorQuery*
+   */
+  antlrcpp::Any visitRegisterInstanceOnCoordinator(MemgraphCypher::RegisterInstanceOnCoordinatorContext *ctx) override;
+
+  /**
+   * @return CoordinatorQuery*
+   */
+  antlrcpp::Any visitUnregisterInstanceOnCoordinator(
+      MemgraphCypher::UnregisterInstanceOnCoordinatorContext *ctx) override;
+
+  /**
+   * @return CoordinatorQuery*
+   */
+  antlrcpp::Any visitSetInstanceToMain(MemgraphCypher::SetInstanceToMainContext *ctx) override;
+
+  /**
+   * @return CoordinatorQuery*
+   */
+  antlrcpp::Any visitAddCoordinatorInstance(MemgraphCypher::AddCoordinatorInstanceContext *ctx) override;
+
+  /**
+   * @return CoordinatorQuery*
+   */
+  antlrcpp::Any visitRemoveCoordinatorInstance(MemgraphCypher::RemoveCoordinatorInstanceContext *ctx) override;
+
+  /**
+   * @return CoordinatorQuery*
+   */
+  antlrcpp::Any visitForceResetClusterStateOnCoordinator(
+      MemgraphCypher::ForceResetClusterStateOnCoordinatorContext *ctx) override;
+
+  /**
+   * @return CoordinatorQuery*
+   */
+  antlrcpp::Any visitDemoteInstanceOnCoordinator(MemgraphCypher::DemoteInstanceOnCoordinatorContext *ctx) override;
+
+  /**
+   * @return CoordinatorQuery*
+   */
+  antlrcpp::Any visitShowInstance(MemgraphCypher::ShowInstanceContext *ctx) override;
+
+  /**
+   * @return CoordinatorQuery*
+   */
+  antlrcpp::Any visitShowInstances(MemgraphCypher::ShowInstancesContext *ctx) override;
+
+  /**
    * @return LockPathQuery*
    */
   antlrcpp::Any visitLockPathQuery(MemgraphCypher::LockPathQueryContext *ctx) override;
@@ -280,6 +376,16 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
    * @return CreateSnapshotQuery*
    */
   antlrcpp::Any visitCreateSnapshotQuery(MemgraphCypher::CreateSnapshotQueryContext *ctx) override;
+
+  /**
+   * @return RecoverSnapshotQuery*
+   */
+  antlrcpp::Any visitRecoverSnapshotQuery(MemgraphCypher::RecoverSnapshotQueryContext *ctx) override;
+
+  /**
+   * @return ShowSnapshotsQuery*
+   */
+  antlrcpp::Any visitShowSnapshotsQuery(MemgraphCypher::ShowSnapshotsQueryContext *ctx) override;
 
   /**
    * @return StreamQuery*
@@ -462,9 +568,49 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
   antlrcpp::Any visitCreateIndex(MemgraphCypher::CreateIndexContext *ctx) override;
 
   /**
-   * @return DropIndex*
+   * @return IndexQuery*
    */
   antlrcpp::Any visitDropIndex(MemgraphCypher::DropIndexContext *ctx) override;
+
+  /**
+   * @return EdgeIndexQuery*
+   */
+  antlrcpp::Any visitCreateEdgeIndex(MemgraphCypher::CreateEdgeIndexContext *ctx) override;
+
+  /**
+   * @return DropEdgeIndex*
+   */
+  antlrcpp::Any visitDropEdgeIndex(MemgraphCypher::DropEdgeIndexContext *ctx) override;
+
+  /**
+   * @return CreatePointIndexQuery*
+   */
+  antlrcpp::Any visitCreatePointIndex(MemgraphCypher::CreatePointIndexContext *ctx) override;
+
+  /**
+   * @return DropPointIndexQuery*
+   */
+  antlrcpp::Any visitDropPointIndex(MemgraphCypher::DropPointIndexContext *ctx) override;
+
+  /**
+   * @return CreateTextIndexQuery*
+   */
+  antlrcpp::Any visitCreateTextIndex(MemgraphCypher::CreateTextIndexContext *ctx) override;
+
+  /**
+   * @return DropTextIndexQuery*
+   */
+  antlrcpp::Any visitDropTextIndex(MemgraphCypher::DropTextIndexContext *ctx) override;
+
+  /**
+   * @return CreateVectorIndexQuery*
+   */
+  antlrcpp::Any visitCreateVectorIndex(MemgraphCypher::CreateVectorIndexContext *ctx) override;
+
+  /**
+   * @return DropVectorIndexQuery*
+   */
+  antlrcpp::Any visitDropVectorIndex(MemgraphCypher::DropVectorIndexContext *ctx) override;
 
   /**
    * @return AuthQuery*
@@ -479,7 +625,17 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
   /**
    * @return AuthQuery*
    */
+  antlrcpp::Any visitChangePassword(MemgraphCypher::ChangePasswordContext *ctx) override;
+
+  /**
+   * @return AuthQuery*
+   */
   antlrcpp::Any visitDropUser(MemgraphCypher::DropUserContext *ctx) override;
+
+  /**
+   * @return AuthQuery*
+   */
+  antlrcpp::Any visitShowCurrentUser(MemgraphCypher::ShowCurrentUserContext *ctx) override;
 
   /**
    * @return AuthQuery*
@@ -572,12 +728,17 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
   /**
    * @return AuthQuery*
    */
-  antlrcpp::Any visitGrantDatabaseToUser(MemgraphCypher::GrantDatabaseToUserContext *ctx) override;
+  antlrcpp::Any visitGrantDatabaseToUserOrRole(MemgraphCypher::GrantDatabaseToUserOrRoleContext *ctx) override;
 
   /**
    * @return AuthQuery*
    */
-  antlrcpp::Any visitRevokeDatabaseFromUser(MemgraphCypher::RevokeDatabaseFromUserContext *ctx) override;
+  antlrcpp::Any visitDenyDatabaseFromUserOrRole(MemgraphCypher::DenyDatabaseFromUserOrRoleContext *ctx) override;
+
+  /**
+   * @return AuthQuery*
+   */
+  antlrcpp::Any visitRevokeDatabaseFromUserOrRole(MemgraphCypher::RevokeDatabaseFromUserOrRoleContext *ctx) override;
 
   /**
    * @return AuthQuery*
@@ -674,7 +835,17 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
   /**
    * @return Pattern*
    */
+  antlrcpp::Any visitForcePatternPart(MemgraphCypher::ForcePatternPartContext *ctx) override;
+
+  /**
+   * @return Pattern*
+   */
   antlrcpp::Any visitPatternElement(MemgraphCypher::PatternElementContext *ctx) override;
+
+  /**
+   * @return Pattern*
+   */
+  antlrcpp::Any visitRelationshipsPattern(MemgraphCypher::RelationshipsPatternContext *ctx) override;
 
   /**
    * @return vector<pair<EdgeAtom*, NodeAtom*>>
@@ -771,7 +942,7 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
   antlrcpp::Any visitExpression6(MemgraphCypher::Expression6Context *ctx) override;
 
   /**
-   * Power.
+   * Exponentiation.
    *
    * @return Expression*
    */
@@ -840,6 +1011,11 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
    * @return Exists* (Expression)
    */
   antlrcpp::Any visitExistsExpression(MemgraphCypher::ExistsExpressionContext *ctx) override;
+
+  /**
+   * @return pattern comprehension (Expression)
+   */
+  antlrcpp::Any visitPatternComprehension(MemgraphCypher::PatternComprehensionContext *ctx) override;
 
   /**
    * @return Expression*
@@ -986,9 +1162,59 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
   antlrcpp::Any visitDropDatabase(MemgraphCypher::DropDatabaseContext *ctx) override;
 
   /**
+   * @return MultiDatabaseQuery*
+   */
+  antlrcpp::Any visitShowDatabase(MemgraphCypher::ShowDatabaseContext *ctx) override;
+
+  /**
    * @return ShowDatabasesQuery*
    */
   antlrcpp::Any visitShowDatabases(MemgraphCypher::ShowDatabasesContext *ctx) override;
+
+  /**
+   * @return CreateEnumQuery*
+   */
+  antlrcpp::Any visitCreateEnumQuery(MemgraphCypher::CreateEnumQueryContext *ctx) override;
+
+  /**
+   * @return ShowEnumsQuery*
+   */
+  antlrcpp::Any visitShowEnumsQuery(MemgraphCypher::ShowEnumsQueryContext *ctx) override;
+
+  /**
+   * @return AlterEnumAddValueQuery*
+   */
+  antlrcpp::Any visitAlterEnumAddValueQuery(MemgraphCypher::AlterEnumAddValueQueryContext *ctx) override;
+
+  /**
+   * @return AlterEnumUpdateValueQuery*
+   */
+  antlrcpp::Any visitAlterEnumUpdateValueQuery(MemgraphCypher::AlterEnumUpdateValueQueryContext *ctx) override;
+
+  /**
+   * @return AlterEnumRemoveValueQuery*
+   */
+  antlrcpp::Any visitAlterEnumRemoveValueQuery(MemgraphCypher::AlterEnumRemoveValueQueryContext *ctx) override;
+
+  /**
+   * @return DropEnumQuery*
+   */
+  antlrcpp::Any visitDropEnumQuery(MemgraphCypher::DropEnumQueryContext *ctx) override;
+
+  /**
+   * @return ShowSchemaInfoQuery*
+   */
+  antlrcpp::Any visitShowSchemaInfoQuery(MemgraphCypher::ShowSchemaInfoQueryContext *ctx) override;
+
+  /**
+   * @return TtlQuery*
+   */
+  antlrcpp::Any visitTtlQuery(MemgraphCypher::TtlQueryContext *ctx) override;
+
+  /**
+   * @return SetSessionTraceQuery*
+   */
+  antlrcpp::Any visitSetSessionTraceQuery(MemgraphCypher::SetSessionTraceQueryContext *ctx) override;
 
  public:
   Query *query() { return query_; }
@@ -1021,6 +1247,8 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
   // We use this variable in visitReturnItem to check if we are in with or
   // return.
   bool in_with_ = false;
+
+  Parameters *parameters_;
 
   QueryInfo query_info_;
 };

@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -64,8 +64,8 @@ TEST_P(StorageModeTest, Mode) {
   ASSERT_FALSE(creator->Commit().HasError());
 }
 
-INSTANTIATE_TEST_CASE_P(ParameterizedStorageModeTests, StorageModeTest, ::testing::ValuesIn(storage_modes),
-                        StorageModeTest::PrintStringParamToName());
+INSTANTIATE_TEST_SUITE_P(ParameterizedStorageModeTests, StorageModeTest, ::testing::ValuesIn(storage_modes),
+                         StorageModeTest::PrintStringParamToName());
 
 class StorageModeMultiTxTest : public ::testing::Test {
  protected:
@@ -74,6 +74,8 @@ class StorageModeMultiTxTest : public ::testing::Test {
     std::filesystem::remove_all(tmp);
     return tmp;
   }();  // iile
+
+  void TearDown() override { std::filesystem::remove_all(data_directory); }
 
   memgraph::storage::Config config{.durability.storage_directory = data_directory,
                                    .disk.main_storage_directory = data_directory / "disk"};
@@ -88,7 +90,16 @@ class StorageModeMultiTxTest : public ::testing::Test {
         return db_acc;
       }()  // iile
   };
-  memgraph::query::InterpreterContext interpreter_context{{}, nullptr, &repl_state};
+  memgraph::system::System system_state;
+  memgraph::query::InterpreterContext interpreter_context{{},
+                                                          nullptr,
+                                                          &repl_state,
+                                                          system_state
+#ifdef MG_ENTERPRISE
+                                                          ,
+                                                          std::nullopt
+#endif
+  };
   InterpreterFaker running_interpreter{&interpreter_context, db}, main_interpreter{&interpreter_context, db};
 };
 

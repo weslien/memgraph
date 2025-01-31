@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -17,7 +17,7 @@
 #include <limits>
 #include <map>
 #include <optional>
-#include <regex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -30,6 +30,9 @@
 #include "query/interpret/frame.hpp"
 #include "query/typed_value.hpp"
 #include "spdlog/spdlog.h"
+#include "storage/v2/point.hpp"
+#include "storage/v2/storage_mode.hpp"
+#include "utils/cast.hpp"
 #include "utils/exceptions.hpp"
 #include "utils/frame_change_id.hpp"
 #include "utils/logging.hpp"
@@ -59,12 +62,14 @@ class ReferenceExpressionEvaluator : public ExpressionVisitor<TypedValue *> {
   UNSUCCESSFUL_VISIT(MultiplicationOperator);
   UNSUCCESSFUL_VISIT(DivisionOperator);
   UNSUCCESSFUL_VISIT(ModOperator);
+  UNSUCCESSFUL_VISIT(ExponentiationOperator);
   UNSUCCESSFUL_VISIT(NotEqualOperator);
   UNSUCCESSFUL_VISIT(EqualOperator);
   UNSUCCESSFUL_VISIT(LessOperator);
   UNSUCCESSFUL_VISIT(GreaterOperator);
   UNSUCCESSFUL_VISIT(LessEqualOperator);
   UNSUCCESSFUL_VISIT(GreaterEqualOperator);
+  UNSUCCESSFUL_VISIT(RangeOperator);
 
   UNSUCCESSFUL_VISIT(NotOperator);
   UNSUCCESSFUL_VISIT(UnaryPlusOperator);
@@ -98,6 +103,8 @@ class ReferenceExpressionEvaluator : public ExpressionVisitor<TypedValue *> {
   UNSUCCESSFUL_VISIT(ParameterLookup);
   UNSUCCESSFUL_VISIT(RegexMatch);
   UNSUCCESSFUL_VISIT(Exists);
+  UNSUCCESSFUL_VISIT(PatternComprehension);
+  UNSUCCESSFUL_VISIT(EnumValueAccess);
 
 #undef UNSUCCESSFUL_VISIT
 
@@ -136,12 +143,14 @@ class PrimitiveLiteralExpressionEvaluator : public ExpressionVisitor<TypedValue>
   INVALID_VISIT(MultiplicationOperator)
   INVALID_VISIT(DivisionOperator)
   INVALID_VISIT(ModOperator)
+  INVALID_VISIT(ExponentiationOperator)
   INVALID_VISIT(NotEqualOperator)
   INVALID_VISIT(EqualOperator)
   INVALID_VISIT(LessOperator)
   INVALID_VISIT(GreaterOperator)
   INVALID_VISIT(LessEqualOperator)
   INVALID_VISIT(GreaterEqualOperator)
+  INVALID_VISIT(RangeOperator)
   INVALID_VISIT(InListOperator)
   INVALID_VISIT(SubscriptOperator)
   INVALID_VISIT(ListSlicingOperator)
@@ -167,6 +176,8 @@ class PrimitiveLiteralExpressionEvaluator : public ExpressionVisitor<TypedValue>
   INVALID_VISIT(Identifier)
   INVALID_VISIT(RegexMatch)
   INVALID_VISIT(Exists)
+  INVALID_VISIT(PatternComprehension)
+  INVALID_VISIT(EnumValueAccess)
 
 #undef INVALID_VISIT
  private:
@@ -186,6 +197,8 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
   using ExpressionVisitor<TypedValue>::Visit;
 
   utils::MemoryResource *GetMemoryResource() const { return ctx_->memory; }
+
+  void ResetPropertyLookupCache() { property_lookup_cache_.clear(); }
 
   TypedValue Visit(NamedExpression &named_expression) override {
     const auto &symbol = symbol_table_->at(named_expression);
@@ -219,7 +232,6 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
     }                                                                                   \
   }
 
-  BINARY_OPERATOR_VISITOR(OrOperator, ||, OR);
   BINARY_OPERATOR_VISITOR(XorOperator, ^, XOR);
   BINARY_OPERATOR_VISITOR(AdditionOperator, +, +);
   BINARY_OPERATOR_VISITOR(SubtractionOperator, -, -);
@@ -240,6 +252,8 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
 #undef BINARY_OPERATOR_VISITOR
 #undef UNARY_OPERATOR_VISITOR
 
+  TypedValue Visit(RangeOperator &op) override { return op.expr1_->Accept(*this) && op.expr2_->Accept(*this); }
+
   TypedValue Visit(AndOperator &op) override {
     auto value1 = op.expression1_->Accept(*this);
     if (value1.IsBool() && !value1.ValueBool()) {
@@ -251,6 +265,30 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
       return value1 && value2;
     } catch (const TypedValueException &) {
       throw QueryRuntimeException("Invalid types: {} and {} for AND.", value1.type(), value2.type());
+    }
+  }
+
+  TypedValue Visit(OrOperator &op) override {
+    auto value1 = op.expression1_->Accept(*this);
+    if (value1.IsBool() && value1.ValueBool()) {
+      // If first expression is true, don't evaluate the second one.
+      return value1;
+    }
+    auto value2 = op.expression2_->Accept(*this);
+    try {
+      return value1 || value2;
+    } catch (const TypedValueException &) {
+      throw QueryRuntimeException("Invalid types: {} and {} for OR.", value1.type(), value2.type());
+    }
+  }
+
+  TypedValue Visit(ExponentiationOperator &op) override {
+    auto value1 = op.expression1_->Accept(*this);
+    auto value2 = op.expression2_->Accept(*this);
+    try {
+      return pow(value1, value2);
+    } catch (const TypedValueException &) {
+      throw QueryRuntimeException("Invalid types: {} and {} for ^.", value1.type(), value2.type());
     }
   }
 
@@ -455,269 +493,9 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
     return TypedValue(value.IsNull(), ctx_->memory);
   }
 
-  TypedValue Visit(PropertyLookup &property_lookup) override {
-    ReferenceExpressionEvaluator referenceExpressionEvaluator(frame_, symbol_table_, ctx_);
+  TypedValue Visit(PropertyLookup &property_lookup) override;
 
-    TypedValue *expression_result_ptr = property_lookup.expression_->Accept(referenceExpressionEvaluator);
-    TypedValue expression_result;
-
-    if (nullptr == expression_result_ptr) {
-      expression_result = property_lookup.expression_->Accept(*this);
-      expression_result_ptr = &expression_result;
-    }
-    auto maybe_date = [this](const auto &date, const auto &prop_name) -> std::optional<TypedValue> {
-      if (prop_name == "year") {
-        return TypedValue(date.year, ctx_->memory);
-      }
-      if (prop_name == "month") {
-        return TypedValue(date.month, ctx_->memory);
-      }
-      if (prop_name == "day") {
-        return TypedValue(date.day, ctx_->memory);
-      }
-      return std::nullopt;
-    };
-    auto maybe_local_time = [this](const auto &lt, const auto &prop_name) -> std::optional<TypedValue> {
-      if (prop_name == "hour") {
-        return TypedValue(lt.hour, ctx_->memory);
-      }
-      if (prop_name == "minute") {
-        return TypedValue(lt.minute, ctx_->memory);
-      }
-      if (prop_name == "second") {
-        return TypedValue(lt.second, ctx_->memory);
-      }
-      if (prop_name == "millisecond") {
-        return TypedValue(lt.millisecond, ctx_->memory);
-      }
-      if (prop_name == "microsecond") {
-        return TypedValue(lt.microsecond, ctx_->memory);
-      }
-      return std::nullopt;
-    };
-    auto maybe_duration = [this](const auto &dur, const auto &prop_name) -> std::optional<TypedValue> {
-      if (prop_name == "day") {
-        return TypedValue(dur.Days(), ctx_->memory);
-      }
-      if (prop_name == "hour") {
-        return TypedValue(dur.SubDaysAsHours(), ctx_->memory);
-      }
-      if (prop_name == "minute") {
-        return TypedValue(dur.SubDaysAsMinutes(), ctx_->memory);
-      }
-      if (prop_name == "second") {
-        return TypedValue(dur.SubDaysAsSeconds(), ctx_->memory);
-      }
-      if (prop_name == "millisecond") {
-        return TypedValue(dur.SubDaysAsMilliseconds(), ctx_->memory);
-      }
-      if (prop_name == "microsecond") {
-        return TypedValue(dur.SubDaysAsMicroseconds(), ctx_->memory);
-      }
-      if (prop_name == "nanosecond") {
-        return TypedValue(dur.SubDaysAsNanoseconds(), ctx_->memory);
-      }
-      return std::nullopt;
-    };
-    auto maybe_graph = [this](const auto &graph, const auto &prop_name) -> std::optional<TypedValue> {
-      if (prop_name == "nodes") {
-        utils::pmr::vector<TypedValue> vertices(ctx_->memory);
-        vertices.reserve(graph.vertices().size());
-        for (const auto &v : graph.vertices()) {
-          vertices.emplace_back(TypedValue(v, ctx_->memory));
-        }
-        return TypedValue(vertices, ctx_->memory);
-      }
-      if (prop_name == "edges") {
-        utils::pmr::vector<TypedValue> edges(ctx_->memory);
-        edges.reserve(graph.edges().size());
-        for (const auto &e : graph.edges()) {
-          edges.emplace_back(TypedValue(e, ctx_->memory));
-        }
-        return TypedValue(edges, ctx_->memory);
-      }
-      return std::nullopt;
-    };
-    switch (expression_result_ptr->type()) {
-      case TypedValue::Type::Null:
-        return TypedValue(ctx_->memory);
-      case TypedValue::Type::Vertex:
-        if (property_lookup.evaluation_mode_ == PropertyLookup::EvaluationMode::GET_ALL_PROPERTIES) {
-          auto symbol_pos = static_cast<Identifier *>(property_lookup.expression_)->symbol_pos_;
-          if (!property_lookup_cache_.contains(symbol_pos)) {
-            property_lookup_cache_.emplace(symbol_pos, GetAllProperties(expression_result_ptr->ValueVertex()));
-          }
-
-          auto property_id = ctx_->properties[property_lookup.property_.ix];
-          if (property_lookup_cache_[symbol_pos].contains(property_id)) {
-            return TypedValue(property_lookup_cache_[symbol_pos][property_id], ctx_->memory);
-          }
-          return TypedValue(ctx_->memory);
-        } else {
-          return TypedValue(GetProperty(expression_result_ptr->ValueVertex(), property_lookup.property_), ctx_->memory);
-        }
-      case TypedValue::Type::Edge:
-        if (property_lookup.evaluation_mode_ == PropertyLookup::EvaluationMode::GET_ALL_PROPERTIES) {
-          auto symbol_pos = static_cast<Identifier *>(property_lookup.expression_)->symbol_pos_;
-          if (!property_lookup_cache_.contains(symbol_pos)) {
-            property_lookup_cache_.emplace(symbol_pos, GetAllProperties(expression_result_ptr->ValueEdge()));
-          }
-
-          auto property_id = ctx_->properties[property_lookup.property_.ix];
-          if (property_lookup_cache_[symbol_pos].contains(property_id)) {
-            return TypedValue(property_lookup_cache_[symbol_pos][property_id], ctx_->memory);
-          }
-          return TypedValue(ctx_->memory);
-        } else {
-          return TypedValue(GetProperty(expression_result_ptr->ValueEdge(), property_lookup.property_), ctx_->memory);
-        }
-      case TypedValue::Type::Map: {
-        auto &map = expression_result_ptr->ValueMap();
-        auto found = map.find(property_lookup.property_.name.c_str());
-        if (found == map.end()) return TypedValue(ctx_->memory);
-        return TypedValue(found->second, ctx_->memory);
-      }
-      case TypedValue::Type::Duration: {
-        const auto &prop_name = property_lookup.property_.name;
-        const auto &dur = expression_result_ptr->ValueDuration();
-        if (auto dur_field = maybe_duration(dur, prop_name); dur_field) {
-          return TypedValue(*dur_field, ctx_->memory);
-        }
-        throw QueryRuntimeException("Invalid property name {} for Duration", prop_name);
-      }
-      case TypedValue::Type::Date: {
-        const auto &prop_name = property_lookup.property_.name;
-        const auto &date = expression_result_ptr->ValueDate();
-        if (auto date_field = maybe_date(date, prop_name); date_field) {
-          return TypedValue(*date_field, ctx_->memory);
-        }
-        throw QueryRuntimeException("Invalid property name {} for Date", prop_name);
-      }
-      case TypedValue::Type::LocalTime: {
-        const auto &prop_name = property_lookup.property_.name;
-        const auto &lt = expression_result_ptr->ValueLocalTime();
-        if (auto lt_field = maybe_local_time(lt, prop_name); lt_field) {
-          return std::move(*lt_field);
-        }
-        throw QueryRuntimeException("Invalid property name {} for LocalTime", prop_name);
-      }
-      case TypedValue::Type::LocalDateTime: {
-        const auto &prop_name = property_lookup.property_.name;
-        const auto &ldt = expression_result_ptr->ValueLocalDateTime();
-        if (auto date_field = maybe_date(ldt.date, prop_name); date_field) {
-          return std::move(*date_field);
-        }
-        if (auto lt_field = maybe_local_time(ldt.local_time, prop_name); lt_field) {
-          return TypedValue(*lt_field, ctx_->memory);
-        }
-        throw QueryRuntimeException("Invalid property name {} for LocalDateTime", prop_name);
-      }
-      case TypedValue::Type::Graph: {
-        const auto &prop_name = property_lookup.property_.name;
-        const auto &graph = expression_result_ptr->ValueGraph();
-        if (auto graph_field = maybe_graph(graph, prop_name); graph_field) {
-          return TypedValue(*graph_field, ctx_->memory);
-        }
-        throw QueryRuntimeException("Invalid property name {} for Graph", prop_name);
-      }
-      default:
-        throw QueryRuntimeException(
-            "Only nodes, edges, maps, temporal types and graphs have properties to be looked up.");
-    }
-  }
-
-  TypedValue Visit(AllPropertiesLookup &all_properties_lookup) override {
-    TypedValue::TMap result(ctx_->memory);
-
-    auto expression_result = all_properties_lookup.expression_->Accept(*this);
-    switch (expression_result.type()) {
-      case TypedValue::Type::Null:
-        return TypedValue(ctx_->memory);
-      case TypedValue::Type::Vertex: {
-        for (const auto properties = *expression_result.ValueVertex().Properties(view_);
-             const auto &[property_id, value] : properties) {
-          result.emplace(dba_->PropertyToName(property_id), value);
-        }
-        return TypedValue(result, ctx_->memory);
-      }
-      case TypedValue::Type::Edge: {
-        for (const auto properties = *expression_result.ValueEdge().Properties(view_);
-             const auto &[property_id, value] : properties) {
-          result.emplace(dba_->PropertyToName(property_id), value);
-        }
-        return TypedValue(result, ctx_->memory);
-      }
-      case TypedValue::Type::Map: {
-        for (auto &[name, value] : expression_result.ValueMap()) {
-          result.emplace(name, value);
-        }
-        return TypedValue(result, ctx_->memory);
-      }
-      case TypedValue::Type::Duration: {
-        const auto &dur = expression_result.ValueDuration();
-        result.emplace("day", TypedValue(dur.Days(), ctx_->memory));
-        result.emplace("hour", TypedValue(dur.SubDaysAsHours(), ctx_->memory));
-        result.emplace("minute", TypedValue(dur.SubDaysAsMinutes(), ctx_->memory));
-        result.emplace("second", TypedValue(dur.SubDaysAsSeconds(), ctx_->memory));
-        result.emplace("millisecond", TypedValue(dur.SubDaysAsMilliseconds(), ctx_->memory));
-        result.emplace("microseconds", TypedValue(dur.SubDaysAsMicroseconds(), ctx_->memory));
-        result.emplace("nanoseconds", TypedValue(dur.SubDaysAsNanoseconds(), ctx_->memory));
-        return TypedValue(result, ctx_->memory);
-      }
-      case TypedValue::Type::Date: {
-        const auto &date = expression_result.ValueDate();
-        result.emplace("year", TypedValue(date.year, ctx_->memory));
-        result.emplace("month", TypedValue(date.month, ctx_->memory));
-        result.emplace("day", TypedValue(date.day, ctx_->memory));
-        return TypedValue(result, ctx_->memory);
-      }
-      case TypedValue::Type::LocalTime: {
-        const auto &lt = expression_result.ValueLocalTime();
-        result.emplace("hour", TypedValue(lt.hour, ctx_->memory));
-        result.emplace("minute", TypedValue(lt.minute, ctx_->memory));
-        result.emplace("second", TypedValue(lt.second, ctx_->memory));
-        result.emplace("millisecond", TypedValue(lt.millisecond, ctx_->memory));
-        result.emplace("microsecond", TypedValue(lt.microsecond, ctx_->memory));
-        return TypedValue(result, ctx_->memory);
-      }
-      case TypedValue::Type::LocalDateTime: {
-        const auto &ldt = expression_result.ValueLocalDateTime();
-        const auto &date = ldt.date;
-        const auto &lt = ldt.local_time;
-        result.emplace("year", TypedValue(date.year, ctx_->memory));
-        result.emplace("month", TypedValue(date.month, ctx_->memory));
-        result.emplace("day", TypedValue(date.day, ctx_->memory));
-        result.emplace("hour", TypedValue(lt.hour, ctx_->memory));
-        result.emplace("minute", TypedValue(lt.minute, ctx_->memory));
-        result.emplace("second", TypedValue(lt.second, ctx_->memory));
-        result.emplace("millisecond", TypedValue(lt.millisecond, ctx_->memory));
-        result.emplace("microsecond", TypedValue(lt.microsecond, ctx_->memory));
-        return TypedValue(result, ctx_->memory);
-      }
-      case TypedValue::Type::Graph: {
-        const auto &graph = expression_result.ValueGraph();
-
-        utils::pmr::vector<TypedValue> vertices(ctx_->memory);
-        vertices.reserve(graph.vertices().size());
-        for (const auto &v : graph.vertices()) {
-          vertices.emplace_back(TypedValue(v, ctx_->memory));
-        }
-        result.emplace("nodes", TypedValue(std::move(vertices), ctx_->memory));
-
-        utils::pmr::vector<TypedValue> edges(ctx_->memory);
-        edges.reserve(graph.edges().size());
-        for (const auto &e : graph.edges()) {
-          edges.emplace_back(TypedValue(e, ctx_->memory));
-        }
-        result.emplace("edges", TypedValue(std::move(edges), ctx_->memory));
-
-        return TypedValue(result, ctx_->memory);
-      }
-      default:
-        throw QueryRuntimeException(
-            "Only nodes, edges, maps, temporal types and graphs have properties to be looked up.");
-    }
-  }
+  TypedValue Visit(AllPropertiesLookup &all_properties_lookup) override;
 
   TypedValue Visit(LabelsTest &labels_test) override {
     auto expression_result = labels_test.expression_->Accept(*this);
@@ -825,8 +603,8 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
       throw QueryRuntimeException("'coalesce' requires at least one argument.");
     }
 
-    for (int64_t i = 0; i < exprs.size(); ++i) {
-      TypedValue val(exprs[i]->Accept(*this), ctx_->memory);
+    for (auto &expr : exprs) {
+      TypedValue val(expr->Accept(*this), ctx_->memory);
       if (!val.IsNull()) {
         return val;
       }
@@ -837,27 +615,36 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
 
   TypedValue Visit(Function &function) override {
     FunctionContext function_ctx{dba_, ctx_->memory, ctx_->timestamp, &ctx_->counters, view_};
+    bool is_transactional = storage::IsTransactional(dba_->GetStorageMode());
+    TypedValue res(ctx_->memory);
     // Stack allocate evaluated arguments when there's a small number of them.
     if (function.arguments_.size() <= 8) {
-      TypedValue arguments[8] = {TypedValue(ctx_->memory), TypedValue(ctx_->memory), TypedValue(ctx_->memory),
-                                 TypedValue(ctx_->memory), TypedValue(ctx_->memory), TypedValue(ctx_->memory),
-                                 TypedValue(ctx_->memory), TypedValue(ctx_->memory)};
-      for (size_t i = 0; i < function.arguments_.size(); ++i) {
-        arguments[i] = function.arguments_[i]->Accept(*this);
+      utils::uninitialised_storage<std::array<TypedValue, 8>> arguments;
+      auto constructed_count = 0;
+      auto destroy_arguments = utils::OnScopeExit{[&] {
+        for (size_t i = 0; i != constructed_count; ++i) {
+          std::destroy_at(&(*arguments.as())[i]);
+        }
+      }};
+      for (size_t i = 0; i != function.arguments_.size(); ++i) {
+        std::construct_at(&(*arguments.as())[i], function.arguments_[i]->Accept(*this));
+        ++constructed_count;
       }
-      auto res = function.function_(arguments, function.arguments_.size(), function_ctx);
-      MG_ASSERT(res.GetMemoryResource() == ctx_->memory);
-      return res;
+
+      res = function.function_(arguments.as()->data(), function.arguments_.size(), function_ctx);
     } else {
       TypedValue::TVector arguments(ctx_->memory);
       arguments.reserve(function.arguments_.size());
       for (const auto &argument : function.arguments_) {
         arguments.emplace_back(argument->Accept(*this));
       }
-      auto res = function.function_(arguments.data(), arguments.size(), function_ctx);
-      MG_ASSERT(res.GetMemoryResource() == ctx_->memory);
-      return res;
+      res = function.function_(arguments.data(), arguments.size(), function_ctx);
     }
+    MG_ASSERT(res.GetMemoryResource() == ctx_->memory);
+    if (!is_transactional && res.ContainsDeleted()) [[unlikely]] {
+      return TypedValue(ctx_->memory);
+    }
+    return res;
   }
 
   TypedValue Visit(Reduce &reduce) override {
@@ -903,7 +690,17 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
     return TypedValue(std::move(result), ctx_->memory);
   }
 
-  TypedValue Visit(Exists &exists) override { return TypedValue{frame_->at(symbol_table_->at(exists)), ctx_->memory}; }
+  TypedValue Visit(Exists &exists) override {
+    TypedValue &frame_exists_value = frame_->at(symbol_table_->at(exists));
+    if (!frame_exists_value.IsFunction()) [[unlikely]] {
+      throw QueryRuntimeException(
+          "Unexpected behavior: Exists expected a function, got {}. Please report the problem on GitHub issues",
+          frame_exists_value.type());
+    }
+    TypedValue result{ctx_->memory};
+    frame_exists_value.ValueFunction()(&result);
+    return result;
+  }
 
   TypedValue Visit(All &all) override {
     auto list_value = all.list_expression_->Accept(*this);
@@ -924,19 +721,18 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
         throw QueryRuntimeException("Predicate of ALL must evaluate to boolean, got {}.", result.type());
       }
       if (!result.IsNull()) {
-        has_value = true;
         if (!result.ValueBool()) {
           return TypedValue(false, ctx_->memory);
         }
+        has_value = true;
       } else {
         has_null_elements = true;
       }
     }
-    if (!has_value) {
+    if (!list.empty() && !has_value) {
       return TypedValue(ctx_->memory);
-    }
-    if (has_null_elements) {
-      return TypedValue(false, ctx_->memory);
+    } else if (has_null_elements) {
+      return TypedValue(ctx_->memory);
     } else {
       return TypedValue(true, ctx_->memory);
     }
@@ -954,6 +750,7 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
     const auto &symbol = symbol_table_->at(*single.identifier_);
     bool has_value = false;
     bool predicate_satisfied = false;
+    bool has_null_elements = false;
     for (const auto &element : list) {
       frame_->at(symbol) = element;
       auto result = single.where_->expression_->Accept(*this);
@@ -963,7 +760,11 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
       if (result.type() == TypedValue::Type::Bool) {
         has_value = true;
       }
-      if (result.IsNull() || !result.ValueBool()) {
+      if (result.IsNull()) {
+        has_null_elements = true;
+        continue;
+      }
+      if (!result.ValueBool()) {
         continue;
       }
       // Return false if more than one element satisfies the predicate.
@@ -973,7 +774,9 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
         predicate_satisfied = true;
       }
     }
-    if (!has_value) {
+    if (!list.empty() && !has_value) {
+      return TypedValue(ctx_->memory);
+    } else if (has_null_elements && !predicate_satisfied) {
       return TypedValue(ctx_->memory);
     } else {
       return TypedValue(predicate_satisfied, ctx_->memory);
@@ -990,6 +793,7 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
     }
     const auto &list = list_value.ValueList();
     const auto &symbol = symbol_table_->at(*any.identifier_);
+    bool has_null_elements = false;
     bool has_value = false;
     for (const auto &element : list) {
       frame_->at(symbol) = element;
@@ -998,14 +802,18 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
         throw QueryRuntimeException("Predicate of ANY must evaluate to boolean, got {}.", result.type());
       }
       if (!result.IsNull()) {
-        has_value = true;
         if (result.ValueBool()) {
           return TypedValue(true, ctx_->memory);
         }
+        has_value = true;
+      } else {
+        has_null_elements = true;
       }
     }
     // Return Null if all elements are Null
-    if (!has_value) {
+    if (!list.empty() && !has_value) {
+      return TypedValue(ctx_->memory);
+    } else if (has_null_elements) {
       return TypedValue(ctx_->memory);
     } else {
       return TypedValue(false, ctx_->memory);
@@ -1022,6 +830,7 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
     }
     const auto &list = list_value.ValueList();
     const auto &symbol = symbol_table_->at(*none.identifier_);
+    bool has_null_elements = false;
     bool has_value = false;
     for (const auto &element : list) {
       frame_->at(symbol) = element;
@@ -1030,14 +839,18 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
         throw QueryRuntimeException("Predicate of NONE must evaluate to boolean, got {}.", result.type());
       }
       if (!result.IsNull()) {
-        has_value = true;
         if (result.ValueBool()) {
           return TypedValue(false, ctx_->memory);
         }
+        has_value = true;
+      } else {
+        has_null_elements = true;
       }
     }
     // Return Null if all elements are Null
-    if (!has_value) {
+    if (!list.empty() && !has_value) {
+      return TypedValue(ctx_->memory);
+    } else if (has_null_elements) {
       return TypedValue(ctx_->memory);
     } else {
       return TypedValue(true, ctx_->memory);
@@ -1048,28 +861,26 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
     return TypedValue(ctx_->parameters.AtTokenPosition(param_lookup.token_position_), ctx_->memory);
   }
 
-  TypedValue Visit(RegexMatch &regex_match) override {
-    auto target_string_value = regex_match.string_expr_->Accept(*this);
-    auto regex_value = regex_match.regex_->Accept(*this);
-    if (target_string_value.IsNull() || regex_value.IsNull()) {
-      return TypedValue(ctx_->memory);
+  TypedValue Visit(RegexMatch &regex_match) override;
+
+  TypedValue Visit(PatternComprehension &pattern_comprehension) override {
+    const TypedValue &frame_pattern_comprehension_value = frame_->at(symbol_table_->at(pattern_comprehension));
+    if (!frame_pattern_comprehension_value.IsList()) [[unlikely]] {
+      throw QueryRuntimeException(
+          "Unexpected behavior: Pattern Comprehension expected a list, got {}. Please report the problem on GitHub "
+          "issues",
+          frame_pattern_comprehension_value.type());
     }
-    if (regex_value.type() != TypedValue::Type::String) {
-      throw QueryRuntimeException("Regular expression must evaluate to a string, got {}.", regex_value.type());
+    return frame_pattern_comprehension_value;
+  }
+
+  TypedValue Visit(EnumValueAccess &enum_value_access) override {
+    auto maybe_enum = dba_->GetEnumValue(enum_value_access.enum_name_, enum_value_access.enum_value_);
+    if (maybe_enum.HasError()) [[unlikely]] {
+      throw QueryRuntimeException("Enum value '{}' in enum '{}' not found.", enum_value_access.enum_value_,
+                                  enum_value_access.enum_name_);
     }
-    if (target_string_value.type() != TypedValue::Type::String) {
-      // Instead of error, we return Null which makes it compatible in case we
-      // use indexed lookup which filters out any non-string properties.
-      // Assuming a property lookup is the target_string_value.
-      return TypedValue(ctx_->memory);
-    }
-    const auto &target_string = target_string_value.ValueString();
-    try {
-      std::regex regex(regex_value.ValueString());
-      return TypedValue(std::regex_match(target_string, regex), ctx_->memory);
-    } catch (const std::regex_error &e) {
-      throw QueryRuntimeException("Regex error in '{}': {}", regex_value.ValueString(), e.what());
-    }
+    return TypedValue(*maybe_enum, ctx_->memory);
   }
 
  private:
@@ -1097,11 +908,11 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
           throw QueryRuntimeException("Unexpected error when getting properties.");
       }
     }
-    return *maybe_props;
+    return *std::move(maybe_props);
   }
 
   template <class TRecordAccessor>
-  storage::PropertyValue GetProperty(const TRecordAccessor &record_accessor, PropertyIx prop) {
+  storage::PropertyValue GetProperty(const TRecordAccessor &record_accessor, const PropertyIx &prop) {
     auto maybe_prop = record_accessor.GetProperty(view_, ctx_->properties[prop.ix]);
     if (maybe_prop.HasError() && maybe_prop.GetError() == storage::Error::NONEXISTENT_OBJECT) {
       // This is a very nasty and temporary hack in order to make MERGE work.
@@ -1124,7 +935,7 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
           throw QueryRuntimeException("Unexpected error when getting a property.");
       }
     }
-    return *maybe_prop;
+    return *std::move(maybe_prop);
   }
 
   template <class TRecordAccessor>
@@ -1154,7 +965,7 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
     return *maybe_prop;
   }
 
-  storage::LabelId GetLabel(LabelIx label) { return ctx_->labels[label.ix]; }
+  storage::LabelId GetLabel(const LabelIx &label) { return ctx_->labels[label.ix]; }
 
   Frame *frame_;
   const SymbolTable *symbol_table_;
@@ -1172,9 +983,19 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
 /// @param what - Name of what's getting evaluated. Used for user feedback (via
 ///               exception) when the evaluated value is not an int.
 /// @throw QueryRuntimeException if expression doesn't evaluate to an int.
-int64_t EvaluateInt(ExpressionEvaluator *evaluator, Expression *expr, const std::string &what);
+int64_t EvaluateInt(ExpressionVisitor<TypedValue> &eval, Expression *expr, std::string_view what);
+
+/// A helper function for evaluating an expression that's an uint.
+///
+/// @param what - Name of what's getting evaluated. Used for user feedback (via
+///               exception) when the evaluated value is not an uint.
+/// @throw QueryRuntimeException if expression doesn't evaluate to an uint.
+std::optional<int64_t> EvaluateUint(ExpressionVisitor<TypedValue> &eval, Expression *expr, std::string_view what);
+
+std::optional<int64_t> EvaluateHopsLimit(ExpressionVisitor<TypedValue> &eval, Expression *expr);
+std::optional<int64_t> EvaluateCommitFrequency(ExpressionVisitor<TypedValue> &eval, Expression *expr);
+std::optional<int64_t> EvaluateDeleteBufferSize(ExpressionVisitor<TypedValue> &eval, Expression *expr);
 
 std::optional<size_t> EvaluateMemoryLimit(ExpressionVisitor<TypedValue> &eval, Expression *memory_limit,
                                           size_t memory_scale);
-
 }  // namespace memgraph::query

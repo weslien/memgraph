@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -23,6 +23,8 @@
 // variable of the same name, EOF.
 // This hides the definition of the macro which causes
 // the compilation to fail.
+#include "query/interpret/frame.hpp"
+#include "query/parameters.hpp"
 #include "query/plan/planner.hpp"
 //////////////////////////////////////////////////////
 #include "communication/result_stream_faker.hpp"
@@ -31,6 +33,8 @@
 #include "query/frontend/semantic/symbol_generator.hpp"
 #include "query/interpreter.hpp"
 #include "storage/v2/inmemory/storage.hpp"
+
+using memgraph::replication_coordination_glue::ReplicationRole;
 
 // The following classes are wrappers for memgraph::utils::MemoryResource, so that we can
 // use BENCHMARK_TEMPLATE
@@ -52,12 +56,12 @@ class NewDeleteResource final {
 };
 
 class PoolResource final {
-  memgraph::utils::PoolResource memory_{128, 4 * 1024};
+  memgraph::utils::PoolResource memory_{128};
 
  public:
   memgraph::utils::MemoryResource *get() { return &memory_; }
 
-  void Reset() { memory_.Release(); }
+  void Reset() {}
 };
 
 static void AddVertices(memgraph::storage::Storage *db, int vertex_count) {
@@ -117,10 +121,11 @@ static void AddTree(memgraph::storage::Storage *db, int vertex_count) {
 static memgraph::query::CypherQuery *ParseCypherQuery(const std::string &query_string,
                                                       memgraph::query::AstStorage *ast) {
   memgraph::query::frontend::ParsingContext parsing_context;
+  memgraph::query::Parameters parameters;
   parsing_context.is_query_cached = false;
   memgraph::query::frontend::opencypher::Parser parser(query_string);
   // Convert antlr4 AST into Memgraph AST.
-  memgraph::query::frontend::CypherMainVisitor cypher_visitor(parsing_context, ast);
+  memgraph::query::frontend::CypherMainVisitor cypher_visitor(parsing_context, ast, &parameters);
   cypher_visitor.visit(parser.tree());
   return memgraph::utils::Downcast<memgraph::query::CypherQuery>(cypher_visitor.query());
 };

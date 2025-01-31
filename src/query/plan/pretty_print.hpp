@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -12,7 +12,7 @@
 /// @file
 #pragma once
 
-#include <iostream>
+#include <iosfwd>
 
 #include <json/json.hpp>
 
@@ -67,6 +67,14 @@ class PlanPrinter : public virtual HierarchicalLogicalOperatorVisitor {
   bool PreVisit(ScanAllByLabelPropertyRange &) override;
   bool PreVisit(ScanAllByLabelProperty &) override;
   bool PreVisit(ScanAllById &) override;
+  bool PreVisit(ScanAllByEdge &) override;
+  bool PreVisit(ScanAllByEdgeType &) override;
+  bool PreVisit(ScanAllByEdgeTypeProperty &) override;
+  bool PreVisit(ScanAllByEdgeTypePropertyValue &) override;
+  bool PreVisit(ScanAllByEdgeTypePropertyRange &) override;
+  bool PreVisit(ScanAllByPointDistance &) override;
+  bool PreVisit(ScanAllByPointWithinbbox &) override;
+  bool PreVisit(ScanAllByEdgeId &) override;
 
   bool PreVisit(Expand &) override;
   bool PreVisit(ExpandVariable &) override;
@@ -91,6 +99,9 @@ class PlanPrinter : public virtual HierarchicalLogicalOperatorVisitor {
   bool PreVisit(OrderBy &) override;
   bool PreVisit(Distinct &) override;
   bool PreVisit(Union &) override;
+  bool PreVisit(RollUpApply &) override;
+  bool PreVisit(PeriodicCommit &) override;
+  bool PreVisit(PeriodicSubquery &) override;
 
   bool PreVisit(Unwind &) override;
   bool PreVisit(CallProcedure &) override;
@@ -130,9 +141,9 @@ std::string ToString(EdgeAtom::Type type);
 
 std::string ToString(Ordering ord);
 
-nlohmann::json ToJson(Expression *expression);
+nlohmann::json ToJson(Expression *expression, const DbAccessor &dba);
 
-nlohmann::json ToJson(const utils::Bound<Expression *> &bound);
+nlohmann::json ToJson(const utils::Bound<Expression *> &bound, const DbAccessor &dba);
 
 nlohmann::json ToJson(const Symbol &symbol);
 
@@ -142,7 +153,7 @@ nlohmann::json ToJson(storage::LabelId label, const DbAccessor &dba);
 
 nlohmann::json ToJson(storage::PropertyId property, const DbAccessor &dba);
 
-nlohmann::json ToJson(NamedExpression *nexpr);
+nlohmann::json ToJson(NamedExpression *nexpr, const DbAccessor &dba);
 
 nlohmann::json ToJson(const std::vector<std::pair<storage::PropertyId, Expression *>> &properties,
                       const DbAccessor &dba);
@@ -151,7 +162,7 @@ nlohmann::json ToJson(const NodeCreationInfo &node_info, const DbAccessor &dba);
 
 nlohmann::json ToJson(const EdgeCreationInfo &edge_info, const DbAccessor &dba);
 
-nlohmann::json ToJson(const Aggregate::Element &elem);
+nlohmann::json ToJson(const Aggregate::Element &elem, const DbAccessor &dba);
 
 template <class T, class... Args>
 nlohmann::json ToJson(const std::vector<T> &items, Args &&...args) {
@@ -199,10 +210,17 @@ class PlanToJsonVisitor : public virtual HierarchicalLogicalOperatorVisitor {
 
   bool PreVisit(ScanAll &) override;
   bool PreVisit(ScanAllByLabel &) override;
-  bool PreVisit(ScanAllByLabelPropertyRange &) override;
-  bool PreVisit(ScanAllByLabelPropertyValue &) override;
   bool PreVisit(ScanAllByLabelProperty &) override;
+  bool PreVisit(ScanAllByLabelPropertyValue &) override;
+  bool PreVisit(ScanAllByLabelPropertyRange &) override;
   bool PreVisit(ScanAllById &) override;
+
+  bool PreVisit(ScanAllByEdge &) override;
+  bool PreVisit(ScanAllByEdgeType &) override;
+  bool PreVisit(ScanAllByEdgeTypeProperty &) override;
+  bool PreVisit(ScanAllByEdgeTypePropertyValue &) override;
+  bool PreVisit(ScanAllByEdgeTypePropertyRange &) override;
+  bool PreVisit(ScanAllByEdgeId &) override;
 
   bool PreVisit(EmptyResult &) override;
   bool PreVisit(Produce &) override;
@@ -218,6 +236,9 @@ class PlanToJsonVisitor : public virtual HierarchicalLogicalOperatorVisitor {
   bool PreVisit(Foreach &) override;
   bool PreVisit(CallProcedure &) override;
   bool PreVisit(LoadCsv &) override;
+  bool PreVisit(RollUpApply &) override;
+  bool PreVisit(PeriodicCommit &) override;
+  bool PreVisit(PeriodicSubquery &) override;
 
   bool Visit(Once &) override;
 

@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -10,7 +10,6 @@
 // licenses/APL.txt.
 
 #include "csv/parsing.hpp"
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "utils/string.hpp"
 
@@ -367,8 +366,8 @@ TEST_P(CsvReaderTest, EmptyColumns) {
   }
 }
 
-INSTANTIATE_TEST_CASE_P(NewlineParameterizedTest, CsvReaderTest,
-                        ::testing::Values(TestParam{"\n", CompressionMethod::NONE},
-                                          TestParam{"\r\n", CompressionMethod::NONE},
-                                          TestParam{"\n", CompressionMethod::GZip},
-                                          TestParam{"\n", CompressionMethod::BZip2}));
+INSTANTIATE_TEST_SUITE_P(NewlineParameterizedTest, CsvReaderTest,
+                         ::testing::Values(TestParam{"\n", CompressionMethod::NONE},
+                                           TestParam{"\r\n", CompressionMethod::NONE},
+                                           TestParam{"\n", CompressionMethod::GZip},
+                                           TestParam{"\n", CompressionMethod::BZip2}));

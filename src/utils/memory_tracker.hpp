@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -12,15 +12,35 @@
 #pragma once
 
 #include <atomic>
+#include <optional>
+#include <string>
 #include <type_traits>
 
 #include "utils/exceptions.hpp"
 
 namespace memgraph::utils {
 
+struct MemoryTrackerStatus {
+  struct data {
+    int64_t size;
+    int64_t will_be;
+    int64_t hard_limit;
+  };
+
+  // DEVNOTE: Do not call from within allocator, will cause another allocation
+  auto msg() -> std::optional<std::string>;
+
+  void set(data d) { data_ = d; }
+
+ private:
+  std::optional<data> data_;
+};
+
+auto MemoryErrorStatus() -> MemoryTrackerStatus &;
+
 class OutOfMemoryException : public utils::BasicException {
  public:
-  explicit OutOfMemoryException(const std::string &msg) : utils::BasicException(msg) {}
+  explicit OutOfMemoryException(std::string msg) : utils::BasicException(std::move(msg)) {}
   SPECIALIZE_GET_EXCEPTION_NAME(OutOfMemoryException)
 };
 
@@ -32,23 +52,19 @@ class MemoryTracker final {
   ~MemoryTracker() = default;
 
   MemoryTracker(MemoryTracker &&other) noexcept
-      : amount_(other.amount_.load(std::memory_order_acquire)),
-        peak_(other.peak_.load(std::memory_order_acquire)),
-        hard_limit_(other.hard_limit_.load(std::memory_order_acquire)),
-        maximum_hard_limit_(other.maximum_hard_limit_) {
-    other.maximum_hard_limit_ = 0;
-    other.amount_.store(0, std::memory_order_acquire);
-    other.peak_.store(0, std::memory_order_acquire);
-    other.hard_limit_.store(0, std::memory_order_acquire);
-  }
+      : amount_(other.amount_.exchange(0, std::memory_order_acq_rel)),
+        peak_(other.peak_.exchange(0, std::memory_order_acq_rel)),
+        hard_limit_(other.hard_limit_.exchange(0, std::memory_order_acq_rel)),
+        maximum_hard_limit_(std::exchange(other.maximum_hard_limit_, 0)) {}
 
   MemoryTracker(const MemoryTracker &) = delete;
   MemoryTracker &operator=(const MemoryTracker &) = delete;
 
   MemoryTracker &operator=(MemoryTracker &&) = delete;
 
-  void Alloc(int64_t size);
+  bool Alloc(int64_t size);
   void Free(int64_t size);
+  void DoCheck();
 
   auto Amount() const { return amount_.load(std::memory_order_relaxed); }
 

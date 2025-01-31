@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -31,6 +31,7 @@
 
 #include "query_plan_common.hpp"
 
+using memgraph::replication_coordination_glue::ReplicationRole;
 using namespace memgraph::query;
 using namespace memgraph::query::plan;
 
@@ -50,7 +51,7 @@ class QueryPlanTest : public testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(QueryPlanTest, StorageTypes);
+TYPED_TEST_SUITE(QueryPlanTest, StorageTypes);
 
 TYPED_TEST(QueryPlanTest, Skip) {
   auto storage_dba = this->db->Access();
@@ -179,8 +180,11 @@ TYPED_TEST(QueryPlanTest, OrderBy) {
     auto order_equal = [&values, &shuffled]() {
       return std::equal(values.begin(), values.end(), shuffled.begin(), TypedValue::BoolEqual{});
     };
+
+    std::random_device rd;
+    std::mt19937 g(rd());
     for (int i = 0; i < 50 && order_equal(); ++i) {
-      std::random_shuffle(shuffled.begin(), shuffled.end());
+      std::shuffle(shuffled.begin(), shuffled.end(), g);
     }
     ASSERT_FALSE(order_equal());
 
@@ -217,8 +221,12 @@ TYPED_TEST(QueryPlanTest, OrderByMultiple) {
   // "right" sequence, but randomized
   const int N = 20;
   std::vector<std::pair<int, int>> prop_values;
+
   for (int i = 0; i < N * N; ++i) prop_values.emplace_back(i % N, i / N);
-  std::random_shuffle(prop_values.begin(), prop_values.end());
+
+  std::random_device rd;
+  std::mt19937 g(rd());
+  std::shuffle(prop_values.begin(), prop_values.end(), g);
   for (const auto &pair : prop_values) {
     auto v = dba.InsertVertex();
     ASSERT_TRUE(v.SetProperty(p1, memgraph::storage::PropertyValue(pair.first)).HasValue());

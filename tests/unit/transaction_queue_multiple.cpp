@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -68,7 +68,16 @@ class TransactionQueueMultipleTest : public ::testing::Test {
       }()  // iile
   };
 
-  memgraph::query::InterpreterContext interpreter_context{{}, nullptr, &repl_state};
+  memgraph::system::System system_state;
+  memgraph::query::InterpreterContext interpreter_context{{},
+                                                          nullptr,
+                                                          &repl_state,
+                                                          system_state
+#ifdef MG_ENTERPRISE
+                                                          ,
+                                                          std::nullopt
+#endif
+  };
   InterpreterFaker main_interpreter{&interpreter_context, db};
   std::vector<InterpreterFaker *> running_interpreters;
 
@@ -89,7 +98,7 @@ class TransactionQueueMultipleTest : public ::testing::Test {
 };
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
-TYPED_TEST_CASE(TransactionQueueMultipleTest, StorageTypes);
+TYPED_TEST_SUITE(TransactionQueueMultipleTest, StorageTypes);
 
 // Tests whether admin can see transaction of superadmin
 TYPED_TEST(TransactionQueueMultipleTest, TerminateTransaction) {

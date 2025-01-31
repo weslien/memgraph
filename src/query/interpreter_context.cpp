@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -9,24 +9,44 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+#include <memory>
+
 #include "query/interpreter_context.hpp"
 
 #include "query/interpreter.hpp"
+#include "system/include/system/system.hpp"
 namespace memgraph::query {
 
-InterpreterContext::InterpreterContext(InterpreterConfig interpreter_config, dbms::DbmsHandler *dbms_handler,
-                                       replication::ReplicationState *rs, query::AuthQueryHandler *ah,
-                                       query::AuthChecker *ac)
-    : dbms_handler(dbms_handler), config(interpreter_config), repl_state(rs), auth(ah), auth_checker(ac) {}
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::optional<InterpreterContext> InterpreterContextHolder::instance{};
+
+InterpreterContext::InterpreterContext(
+    InterpreterConfig interpreter_config, dbms::DbmsHandler *dbms_handler, replication::ReplicationState *rs,
+    memgraph::system::System &system,
+#ifdef MG_ENTERPRISE
+    std::optional<std::reference_wrapper<memgraph::coordination::CoordinatorState>> const &coordinator_state,
+#endif
+    AuthQueryHandler *ah, AuthChecker *ac, ReplicationQueryHandler *replication_handler)
+    : dbms_handler(dbms_handler),
+      config(interpreter_config),
+      repl_state(rs),
+#ifdef MG_ENTERPRISE
+      coordinator_state_(coordinator_state),
+#endif
+      auth(ah),
+      auth_checker(ac),
+      replication_handler_{replication_handler},
+      system_{&system} {
+}
 
 std::vector<std::vector<TypedValue>> InterpreterContext::TerminateTransactions(
-    std::vector<std::string> maybe_kill_transaction_ids, const std::optional<std::string> &username,
-    std::function<bool(std::string const &)> privilege_checker) {
+    std::vector<std::string> maybe_kill_transaction_ids, QueryUserOrRole *user_or_role,
+    std::function<bool(QueryUserOrRole *, std::string const &)> privilege_checker) {
   auto not_found_midpoint = maybe_kill_transaction_ids.end();
 
   // Multiple simultaneous TERMINATE TRANSACTIONS aren't allowed
   // TERMINATE and SHOW TRANSACTIONS are mutually exclusive
-  interpreters.WithLock([&not_found_midpoint, &maybe_kill_transaction_ids, username,
+  interpreters.WithLock([&not_found_midpoint, &maybe_kill_transaction_ids, user_or_role,
                          privilege_checker = std::move(privilege_checker)](const auto &interpreters) {
     for (Interpreter *interpreter : interpreters) {
       TransactionStatus alive_status = TransactionStatus::ACTIVE;
@@ -56,9 +76,17 @@ std::vector<std::vector<TypedValue>> InterpreterContext::TerminateTransactions(
         std::iter_swap(it, not_found_midpoint);
         auto get_interpreter_db_name = [&]() -> std::string const & {
           static std::string all;
-          return interpreter->current_db_.db_acc_ ? interpreter->current_db_.db_acc_->get()->id() : all;
+          return interpreter->current_db_.db_acc_ ? interpreter->current_db_.db_acc_->get()->name() : all;
         };
-        if (interpreter->username_ == username || privilege_checker(get_interpreter_db_name())) {
+
+        auto same_user = [](const auto &lv, const auto &rv) {
+          if (lv.get() == rv) return true;
+          if (lv && rv) return *lv == *rv;
+          return false;
+        };
+
+        if (same_user(interpreter->user_or_role_, user_or_role) ||
+            privilege_checker(user_or_role, get_interpreter_db_name())) {
           killed = true;  // Note: this is used by the above `clean_status` (OnScopeExit)
           spdlog::warn("Transaction {} successfully killed", transaction_id);
         } else {

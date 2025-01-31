@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -15,13 +15,13 @@
 #include <string>
 #include <unordered_map>
 
-#include <gtest/internal/gtest-param-util-generated.h>
-
 #include "auth/models.hpp"
 #include "disk_test_utils.hpp"
 #include "license/license.hpp"
 #include "storage/v2/disk/storage.hpp"
 #include "storage/v2/inmemory/storage.hpp"
+
+#include <gtest/gtest.h>
 
 using namespace memgraph::query;
 using namespace memgraph::query::plan;
@@ -122,7 +122,7 @@ TEST_P(FineGrainedBfsTestInMemory, All) {
 
 std::unique_ptr<VertexDb<FineGrainedBfsTestInMemory::StorageType>> FineGrainedBfsTestInMemory::db_{nullptr};
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     FineGrained, FineGrainedBfsTestInMemory,
     testing::Combine(testing::Values(3), testing::Values(-1),
                      testing::Values(EdgeAtom::Direction::OUT, EdgeAtom::Direction::IN, EdgeAtom::Direction::BOTH),
@@ -162,7 +162,7 @@ TEST_P(FineGrainedBfsTestOnDisk, All) {
 
 std::unique_ptr<VertexDb<FineGrainedBfsTestOnDisk::StorageType>> FineGrainedBfsTestOnDisk::db_{nullptr};
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     FineGrained, FineGrainedBfsTestOnDisk,
     testing::Combine(testing::Values(3), testing::Values(-1),
                      testing::Values(EdgeAtom::Direction::OUT, EdgeAtom::Direction::IN, EdgeAtom::Direction::BOTH),

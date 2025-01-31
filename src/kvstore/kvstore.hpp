@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -42,7 +42,7 @@ class KVStore final {
    * NOTE: Don't instantiate more instances of a KVStore with the same
    *       storage directory because that will lead to undefined behaviour.
    */
-  explicit KVStore(std::filesystem::path storage);
+  explicit KVStore(std::filesystem::path const &storage);
 
   KVStore(const KVStore &other) = delete;
   KVStore(KVStore &&other);
@@ -61,7 +61,7 @@ class KVStore final {
    * @return true if the value has been successfully stored.
    *         In case of any error false is going to be returned.
    */
-  bool Put(const std::string &key, const std::string &value);
+  bool Put(std::string_view key, std::string_view value);
 
   /**
    * Store values under the given keys.
@@ -81,7 +81,7 @@ class KVStore final {
    * @return Value for the given key. std::nullopt in case of any error
    *         OR the value doesn't exist.
    */
-  std::optional<std::string> Get(const std::string &key) const noexcept;
+  std::optional<std::string> Get(std::string_view key) const noexcept;
 
   /**
    * Deletes the key and corresponding value from storage.
@@ -118,7 +118,8 @@ class KVStore final {
   bool DeletePrefix(const std::string &prefix = "");
 
   /**
-   * Store values under the given keys and delete the keys.
+   * Store values under the given keys and delete the keys. If keys in delete are the same as in put you could end
+   * without any keys.
    *
    * @param items
    * @param keys
@@ -154,19 +155,27 @@ class KVStore final {
   bool CompactRange(const std::string &begin_prefix, const std::string &end_prefix);
 
   /**
+   * Flushes all memtables to storage.
+   *
+   * @return - true if the flush finished successfully, false otherwise.
+   */
+  bool SyncWal();
+
+  /**
    * Custom prefix-based iterator over kvstore.
    *
    * It filters all (key, value) pairs where the key has a certain prefix
    * and behaves as if all of those pairs are stored in a single iterable
    * collection of std::pair<std::string, std::string>.
    */
-  class iterator final : public std::iterator<std::input_iterator_tag,                      // iterator_category
-                                              std::pair<std::string, std::string>,          // value_type
-                                              long,                                         // difference_type
-                                              const std::pair<std::string, std::string> *,  // pointer
-                                              const std::pair<std::string, std::string> &   // reference
-                                              > {
+  class iterator final {
    public:
+    using iterator_concept [[maybe_unused]] = std::input_iterator_tag;
+    using value_type = std::pair<std::string, std::string>;
+    using difference_type = long;
+    using pointer = const std::pair<std::string, std::string> *;
+    using reference = const std::pair<std::string, std::string> &;
+
     explicit iterator(const KVStore *kvstore, const std::string &prefix = "", bool at_end = false);
 
     iterator(const iterator &other) = delete;

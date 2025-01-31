@@ -1,4 +1,4 @@
-// Copyright 2022 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Licensed as a Memgraph Enterprise file under the Memgraph Enterprise
 // License (the "License"); by using this file, you agree to be bound by the terms of the License, and you may not use
@@ -44,12 +44,6 @@ class Module final {
   ///                         module
   /// @return dict retuned by module function
   nlohmann::json Call(const nlohmann::json &params, int timeout_millisec);
-
-  /// This function returns a boolean value indicating whether the module has a
-  /// specified executable path and can thus be used.
-  ///
-  /// @return boolean indicating whether the module can be used
-  bool IsUsed();
 
   ~Module();
 

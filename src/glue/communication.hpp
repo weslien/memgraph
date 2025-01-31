@@ -1,4 +1,4 @@
-// Copyright 2022 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -56,22 +56,21 @@ storage::Result<communication::bolt::Path> ToBoltPath(const query::Path &path, c
 /// @param storage::View for ToBoltVertex and ToBoltEdge.
 ///
 /// @throw std::bad_alloc
-storage::Result<std::map<std::string, communication::bolt::Value>> ToBoltGraph(const query::Graph &graph,
-                                                                               const storage::Storage &db,
-                                                                               storage::View view);
+storage::Result<communication::bolt::map_t> ToBoltGraph(const query::Graph &graph, const storage::Storage &db,
+                                                        storage::View view);
 
 /// @param query::TypedValue for converting to communication::bolt::Value.
 /// @param storage::Storage for ToBoltVertex and ToBoltEdge.
 /// @param storage::View for ToBoltVertex and ToBoltEdge.
 ///
 /// @throw std::bad_alloc
-storage::Result<communication::bolt::Value> ToBoltValue(const query::TypedValue &value, const storage::Storage &db,
+storage::Result<communication::bolt::Value> ToBoltValue(const query::TypedValue &value, const storage::Storage *db,
                                                         storage::View view);
 
-query::TypedValue ToTypedValue(const communication::bolt::Value &value);
+query::TypedValue ToTypedValue(const communication::bolt::Value &value, storage::Storage const *storage);
 
-communication::bolt::Value ToBoltValue(const storage::PropertyValue &value);
+communication::bolt::Value ToBoltValue(const storage::PropertyValue &value, const storage::Storage &storage);
 
-storage::PropertyValue ToPropertyValue(const communication::bolt::Value &value);
+storage::PropertyValue ToPropertyValue(communication::bolt::Value const &value, storage::Storage const *storage);
 
 }  // namespace memgraph::glue

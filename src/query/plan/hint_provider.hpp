@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -114,6 +114,30 @@ class PlanHintsProvider final : public HierarchicalLogicalOperatorVisitor {
   bool PreVisit(ScanAllById & /*unused*/) override { return true; }
   bool PostVisit(ScanAllById & /*unused*/) override { return true; }
 
+  bool PreVisit(ScanAllByEdge & /*unused*/) override { return true; }
+  bool PostVisit(ScanAllByEdge & /*unused*/) override { return true; }
+
+  bool PreVisit(ScanAllByEdgeType & /*unused*/) override { return true; }
+  bool PostVisit(ScanAllByEdgeType & /*unused*/) override { return true; }
+
+  bool PreVisit(ScanAllByEdgeTypeProperty & /*unused*/) override { return true; }
+  bool PostVisit(ScanAllByEdgeTypeProperty & /*unused*/) override { return true; }
+
+  bool PreVisit(ScanAllByEdgeTypePropertyValue & /*unused*/) override { return true; }
+  bool PostVisit(ScanAllByEdgeTypePropertyValue & /*unused*/) override { return true; }
+
+  bool PreVisit(ScanAllByEdgeTypePropertyRange & /*unused*/) override { return true; }
+  bool PostVisit(ScanAllByEdgeTypePropertyRange & /*unused*/) override { return true; }
+
+  bool PreVisit(ScanAllByEdgeId & /*unused*/) override { return true; }
+  bool PostVisit(ScanAllByEdgeId & /*unused*/) override { return true; }
+
+  bool PreVisit(ScanAllByPointDistance & /*unused*/) override { return true; }
+  bool PostVisit(ScanAllByPointDistance & /*unused*/) override { return true; }
+
+  bool PreVisit(ScanAllByPointWithinbbox & /*unused*/) override { return true; }
+  bool PostVisit(ScanAllByPointWithinbbox & /*unused*/) override { return true; }
+
   bool PreVisit(ConstructNamedPath & /*unused*/) override { return true; }
   bool PostVisit(ConstructNamedPath & /*unused*/) override { return true; }
 
@@ -206,6 +230,25 @@ class PlanHintsProvider final : public HierarchicalLogicalOperatorVisitor {
 
   bool PostVisit(IndexedJoin & /*unused*/) override { return true; }
 
+  bool PreVisit(RollUpApply &op) override {
+    op.input()->Accept(*this);
+    op.list_collection_branch_->Accept(*this);
+    return false;
+  }
+
+  bool PostVisit(RollUpApply & /*unused*/) override { return true; }
+
+  bool PreVisit(PeriodicCommit & /*unused*/) override { return true; }
+  bool PostVisit(PeriodicCommit & /*unused*/) override { return true; }
+
+  bool PreVisit(PeriodicSubquery &op) override {
+    op.input()->Accept(*this);
+    op.subquery_->Accept(*this);
+    return false;
+  }
+
+  bool PostVisit(PeriodicSubquery & /*op*/) override { return true; }
+
  private:
   const SymbolTable &symbol_table_;
   std::vector<std::string> hints_;
@@ -261,7 +304,7 @@ class PlanHintsProvider final : public HierarchicalLogicalOperatorVisitor {
   }
 
   std::string ExtractAndJoin(auto &&collection, auto &&projection) {
-    auto elements = collection | ranges::views::transform(projection);
+    auto elements = collection | ranges::views::transform(std::forward<decltype(projection)>(projection));
     return boost::algorithm::join(elements, ", ");
   }
 };

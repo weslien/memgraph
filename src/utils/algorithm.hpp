@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -68,7 +68,7 @@ inline std::string IterableToString(const TIterable &iterable, const std::string
  */
 template <typename TIterable>
 inline std::string IterableToString(const TIterable &iterable, const std::string_view delim = ", ") {
-  return IterableToString(iterable, delim, [](const auto &item) { return item; });
+  return IterableToString(iterable, delim, std::identity{});
 }
 
 /**
@@ -188,6 +188,7 @@ bool Contains(const std::unordered_map<TKey, TValue, THash, TKeyEqual, TAllocato
  */
 template <typename TIterable, typename TElement>
 inline bool Contains(const TIterable &iterable, const TElement &element) {
+  // TODO: C++23 change with std::ranges::contains and inline
   return std::find(iterable.begin(), iterable.end(), element) != iterable.end();
 }
 
@@ -216,8 +217,7 @@ TCollection Reversed(const TCollection &collection, const TAllocator &alloc) {
 template <typename TIterator>
 class Iterable {
  public:
-  Iterable(TIterator &&begin, TIterator &&end)
-      : begin_(std::forward<TIterator>(begin)), end_(std::forward<TIterator>(end)) {}
+  Iterable(TIterator &&begin, TIterator &&end) : begin_(std::move(begin)), end_(std::move(end)) {}
 
   auto begin() { return begin_; };
   auto end() { return end_; };

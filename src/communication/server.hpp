@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -12,7 +12,7 @@
 #pragma once
 
 #include <atomic>
-#include <iostream>
+#include <iosfwd>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -22,6 +22,7 @@
 
 #include "communication/init.hpp"
 #include "communication/listener.hpp"
+#include "io/network/fmt.hpp"
 #include "io/network/socket.hpp"
 #include "utils/logging.hpp"
 #include "utils/message.hpp"
@@ -147,7 +148,8 @@ class Server final {
       // Connection is not available anymore or configuration failed.
       return;
     }
-    spdlog::info("Accepted a {} connection from {}", service_name_, s->endpoint());
+    auto const endpoint = s->endpoint();
+    spdlog::info("Accepted a {} connection from {}:{}.", service_name_, endpoint.GetAddress(), endpoint.GetPort());
     listener_.AddConnection(std::move(*s));
   }
 

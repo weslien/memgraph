@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,11 +11,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
-#include <iostream>
+#include <iosfwd>
 #include <map>
 #include <memory>
 #include <optional>
@@ -33,6 +34,8 @@
 #include "utils/endian.hpp"
 #include "utils/exceptions.hpp"
 #include "utils/typeinfo.hpp"
+
+#include <boost/container/flat_map.hpp>
 
 // The namespace name stands for SaveLoadKit. It should be not mistaken for the
 // Mercedes car model line.
@@ -56,19 +59,35 @@ class SlkDecodeException : public utils::BasicException {
 // the global namespace.
 
 template <typename T>
+inline void Save(const std::vector<T> &obj, Builder *builder,
+                 std::function<void(const T &, Builder *)> item_save_function);
+template <typename T>
+inline void Load(std::vector<T> *obj, Reader *reader, std::function<void(T *, Reader *)> item_load_function);
+
+template <typename T>
 void Save(const std::vector<T> &obj, Builder *builder);
 template <typename T>
 void Load(std::vector<T> *obj, Reader *reader);
 
-template <typename T>
-void Save(const std::set<T> &obj, Builder *builder);
-template <typename T>
-void Load(std::set<T> *obj, Reader *reader);
+template <typename T, size_t N>
+void Save(const std::array<T, N> &obj, Builder *builder);
+template <typename T, size_t N>
+void Load(std::array<T, N> *obj, Reader *reader);
 
-template <typename K, typename V>
-void Save(const std::map<K, V> &obj, Builder *builder);
-template <typename K, typename V>
-void Load(std::map<K, V> *obj, Reader *reader);
+template <typename T, typename Cmp>
+void Save(const std::set<T, Cmp> &obj, Builder *builder);
+template <typename T, typename Cmp>
+void Load(std::set<T, Cmp> *obj, Reader *reader);
+
+template <typename K, typename V, typename C, typename A>
+void Save(const std::map<K, V, C, A> &obj, Builder *builder);
+template <typename K, typename V, typename C, typename A>
+void Load(std::map<K, V, C, A> *obj, Reader *reader);
+
+template <typename K, typename V, typename C, typename A>
+void Save(const boost::container::flat_map<K, V, C, A> &obj, Builder *builder);
+template <typename K, typename V, typename C, typename A>
+void Load(boost::container::flat_map<K, V, C, A> *obj, Reader *reader);
 
 template <typename K, typename V>
 void Save(const std::unordered_map<K, V> &obj, Builder *builder);
@@ -201,8 +220,8 @@ inline void Load(std::vector<T> *obj, Reader *reader) {
   }
 }
 
-template <typename T>
-inline void Save(const std::set<T> &obj, Builder *builder) {
+template <typename T, size_t N>
+inline void Save(const std::array<T, N> &obj, Builder *builder) {
   uint64_t size = obj.size();
   Save(size, builder);
   for (const auto &item : obj) {
@@ -210,8 +229,26 @@ inline void Save(const std::set<T> &obj, Builder *builder) {
   }
 }
 
-template <typename T>
-inline void Load(std::set<T> *obj, Reader *reader) {
+template <typename T, size_t N>
+inline void Load(std::array<T, N> *obj, Reader *reader) {
+  uint64_t size = 0;
+  Load(&size, reader);
+  for (uint64_t i = 0; i < size; ++i) {
+    Load(&(*obj)[i], reader);
+  }
+}
+
+template <typename T, typename Cmp>
+inline void Save(const std::set<T, Cmp> &obj, Builder *builder) {
+  uint64_t size = obj.size();
+  Save(size, builder);
+  for (const auto &item : obj) {
+    Save(item, builder);
+  }
+}
+
+template <typename T, typename Cmp>
+inline void Load(std::set<T, Cmp> *obj, Reader *reader) {
   uint64_t size = 0;
   Load(&size, reader);
   for (uint64_t i = 0; i < size; ++i) {
@@ -221,7 +258,23 @@ inline void Load(std::set<T> *obj, Reader *reader) {
   }
 }
 
-#define MAKE_MAP_SAVE(map_type)                                   \
+#define MAKE_MAP_SAVE(map_type)                                         \
+  template <typename K, typename V, typename C, typename A>             \
+  inline void Save(const map_type<K, V, C, A> &obj, Builder *builder) { \
+    uint64_t size = obj.size();                                         \
+    Save(size, builder);                                                \
+    for (const auto &item : obj) {                                      \
+      Save(item.first, builder);                                        \
+      Save(item.second, builder);                                       \
+    }                                                                   \
+  }
+
+MAKE_MAP_SAVE(std::map)
+MAKE_MAP_SAVE(boost::container::flat_map)
+
+#undef MAKE_MAP_SAVE
+
+#define MAKE_UMAP_SAVE(map_type)                                  \
   template <typename K, typename V>                               \
   inline void Save(const map_type<K, V> &obj, Builder *builder) { \
     uint64_t size = obj.size();                                   \
@@ -232,12 +285,43 @@ inline void Load(std::set<T> *obj, Reader *reader) {
     }                                                             \
   }
 
-MAKE_MAP_SAVE(std::map)
-MAKE_MAP_SAVE(std::unordered_map)
+MAKE_UMAP_SAVE(std::unordered_map)
 
-#undef MAKE_MAP_SAVE
+#undef MAKE_UMAP_SAVE
 
-#define MAKE_MAP_LOAD(map_type)                           \
+#define MAKE_MAP_LOAD(map_type)                                 \
+  template <typename K, typename V, typename C, typename A>     \
+  inline void Load(map_type<K, V, C, A> *obj, Reader *reader) { \
+    uint64_t size = 0;                                          \
+    Load(&size, reader);                                        \
+    for (uint64_t i = 0; i < size; ++i) {                       \
+      K key;                                                    \
+      V value;                                                  \
+      Load(&key, reader);                                       \
+      Load(&value, reader);                                     \
+      obj->emplace(std::move(key), std::move(value));           \
+    }                                                           \
+  }
+
+MAKE_MAP_LOAD(std::map)
+
+#undef MAKE_MAP_LOAD
+
+template <typename K, typename V, typename C, typename A>
+inline void Load(boost::container::flat_map<K, V, C, A> *obj, Reader *reader) {
+  uint64_t size = 0;
+  Load(&size, reader);
+  obj->reserve(size);  // optimisation for flat_map
+  for (uint64_t i = 0; i < size; ++i) {
+    K key;
+    V value;
+    Load(&key, reader);
+    Load(&value, reader);
+    obj->emplace(std::move(key), std::move(value));
+  }
+}
+
+#define MAKE_UMAP_LOAD(map_type)                          \
   template <typename K, typename V>                       \
   inline void Load(map_type<K, V> *obj, Reader *reader) { \
     uint64_t size = 0;                                    \
@@ -251,10 +335,9 @@ MAKE_MAP_SAVE(std::unordered_map)
     }                                                     \
   }
 
-MAKE_MAP_LOAD(std::map)
-MAKE_MAP_LOAD(std::unordered_map)
+MAKE_UMAP_LOAD(std::unordered_map)
 
-#undef MAKE_MAP_LOAD
+#undef MAKE_UMAP_LOAD
 
 template <typename T>
 inline void Save(const std::unique_ptr<T> &obj, Builder *builder) {
@@ -273,7 +356,7 @@ inline void Load(std::unique_ptr<T> *obj, Reader *reader) {
   // Prevent any loading which may potentially break class hierarchies.
   // Unfortunately, C++14 doesn't have (or I'm not aware of it) a trait for
   // checking whether some type has any derived or base classes.
-  static_assert(!std::is_polymorphic<T>::value,
+  static_assert(!std::is_polymorphic_v<T>,
                 "Only non polymorphic types can be loaded generically from a "
                 "pointer. Pass a custom load function as the 3rd argument.");
   bool exists = false;
@@ -379,7 +462,7 @@ inline void Load(std::shared_ptr<T> *obj, Reader *reader, std::vector<std::share
   // Prevent any loading which may potentially break class hierarchies.
   // Unfortunately, C++14 doesn't have (or I'm not aware of it) a trait for
   // checking whether some type has any derived or base classes.
-  static_assert(!std::is_polymorphic<T>::value,
+  static_assert(!std::is_polymorphic_v<T>,
                 "Only non polymorphic types can be loaded generically from a "
                 "pointer. Pass a custom load function as the 4th argument.");
   bool exists = false;
@@ -484,6 +567,19 @@ inline void Load(utils::TypeId *obj, Reader *reader) {
   enum_type obj_encoded;
   slk::Load(&obj_encoded, reader);
   *obj = utils::TypeId(utils::MemcpyCast<enum_type>(obj_encoded));
+}
+
+template <utils::Enum T>
+void Save(const T &enum_value, slk::Builder *builder) {
+  slk::Save(utils::UnderlyingCast(enum_value), builder);
+}
+
+template <utils::Enum T>
+void Load(T *enum_value, slk::Reader *reader) {
+  using UnderlyingType = std::underlying_type_t<T>;
+  UnderlyingType value;
+  slk::Load(&value, reader);
+  *enum_value = static_cast<T>(value);
 }
 
 }  // namespace memgraph::slk

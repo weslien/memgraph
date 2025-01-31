@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -17,11 +17,13 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include <gflags/gflags.h>
 
 #include "communication/session.hpp"
 #include "io/network/epoll.hpp"
+#include "io/network/fmt.hpp"
 #include "io/network/socket.hpp"
 #include "utils/logging.hpp"
 #include "utils/signals.hpp"
@@ -51,13 +53,13 @@ class Listener final {
   using SessionHandler = Session<TSession, TSessionContext>;
 
  public:
-  Listener(TSessionContext *data, ServerContext *context, int inactivity_timeout_sec, const std::string &service_name,
+  Listener(TSessionContext *data, ServerContext *context, int inactivity_timeout_sec, std::string service_name,
            size_t workers_count)
       : data_(data),
         alive_(false),
         context_(context),
         inactivity_timeout_sec_(inactivity_timeout_sec),
-        service_name_(service_name),
+        service_name_(std::move(service_name)),
         workers_count_(workers_count) {}
 
   ~Listener() {
@@ -81,7 +83,7 @@ class Listener final {
    * @param connection socket which should be added to the event pool
    */
   void AddConnection(io::network::Socket &&connection) {
-    std::lock_guard<utils::SpinLock> guard(lock_);
+    auto guard = std::lock_guard{lock_};
 
     // Remember fd before moving connection into Session.
     int fd = connection.fd();
@@ -123,7 +125,7 @@ class Listener final {
         utils::ThreadSetName(fmt::format("{} timeout", service_name));
         while (alive_) {
           {
-            std::lock_guard<utils::SpinLock> guard(lock_);
+            auto guard = std::lock_guard{lock_};
             for (auto &session : sessions_) {
               if (session->TimedOut()) {
                 spdlog::warn("{} session associated with {} timed out", service_name, session->socket().endpoint());
@@ -158,7 +160,7 @@ class Listener final {
     }
     // Here we free all active connections to close them and notify the other
     // end that we won't process them because we stopped all worker threads.
-    std::lock_guard<utils::SpinLock> guard(lock_);
+    auto guard = std::lock_guard{lock_};
     sessions_.clear();
   }
 
@@ -245,7 +247,7 @@ class Listener final {
     // https://idea.popcount.org/2017-03-20-epoll-is-fundamentally-broken-22/
     epoll_.Delete(session.socket().fd());
 
-    std::lock_guard<utils::SpinLock> guard(lock_);
+    auto guard = std::lock_guard{lock_};
     auto it = std::find_if(sessions_.begin(), sessions_.end(), [&](const auto &l) { return l.get() == &session; });
 
     MG_ASSERT(it != sessions_.end(), "Trying to remove session that is not found in sessions!");

@@ -1,0 +1,24 @@
+queries_cluster: &queries_cluster
+  cluster:
+    main:
+      args: ["--bolt-port", "7687", "--log-level=TRACE"]
+      log_file: "query_planning.log"
+      setup_queries: []
+      validation_queries: []
+
+
+workloads:
+  - name: "Query planning cartesian"
+    binary: "tests/e2e/pytest_runner.sh"
+    args: ["query_planning/query_planning_cartesian.py"]
+    <<: *queries_cluster
+
+  - name: "Query planning point index"
+    binary: "tests/e2e/pytest_runner.sh"
+    args: ["query_planning/query_planning_point_index.py"]
+    <<: *queries_cluster
+
+  - name: "Query planning valid query plans"
+    binary: "tests/e2e/pytest_runner.sh"
+    args: ["query_planning/query_planning_valid_query_plans.py"]
+    <<: *queries_cluster

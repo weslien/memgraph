@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -13,16 +13,17 @@
 #include <gtest/gtest.h>
 #include <filesystem>
 
-#include "disk_test_utils.hpp"
+#include "dbms/constants.hpp"
+#include "dbms/inmemory/storage_helper.hpp"
 #include "storage/v2/disk/storage.hpp"
 #include "storage/v2/inmemory/storage.hpp"
 #include "storage/v2/isolation_level.hpp"
 #include "storage/v2/storage.hpp"
-#include "storage/v2/storage_error.hpp"
+#include "utils/scheduler.hpp"
 
 // NOLINTNEXTLINE(google-build-using-namespace)
 using namespace memgraph::storage;
-
+using memgraph::replication_coordination_glue::ReplicationRole;
 constexpr auto testSuite = "storage_v2_get_info";
 const std::filesystem::path storage_directory{std::filesystem::temp_directory_path() / testSuite};
 
@@ -31,10 +32,16 @@ class InfoTest : public testing::Test {
  protected:
   void SetUp() override {
     std::filesystem::remove_all(storage_directory);
+    config_.salient.name = memgraph::dbms::kDefaultDB;
     memgraph::storage::UpdatePaths(config_, storage_directory);
+    config_.durability.snapshot_interval = memgraph::utils::SchedulerInterval{std::chrono::seconds{1}};
     config_.durability.snapshot_wal_mode =
         memgraph::storage::Config::Durability::SnapshotWalMode::PERIODIC_SNAPSHOT_WITH_WAL;
-    this->storage = std::make_unique<StorageType>(config_);
+    if (std::is_same_v<StorageType, InMemoryStorage>) {
+      this->storage = memgraph::dbms::CreateInMemoryStorage(config_, repl_state_);
+    } else {
+      this->storage = std::make_unique<StorageType>(config_);
+    }
   }
 
   void TearDown() override {
@@ -43,6 +50,7 @@ class InfoTest : public testing::Test {
   }
 
   memgraph::storage::Config config_;
+  memgraph::replication::ReplicationState repl_state_{storage_directory};
   std::unique_ptr<memgraph::storage::Storage> storage;
   StorageMode mode{std::is_same_v<StorageType, DiskStorage> ? StorageMode::ON_DISK_TRANSACTIONAL
                                                             : StorageMode::IN_MEMORY_TRANSACTIONAL};
@@ -50,8 +58,8 @@ class InfoTest : public testing::Test {
 
 using StorageTypes = ::testing::Types<memgraph::storage::InMemoryStorage, memgraph::storage::DiskStorage>;
 
-TYPED_TEST_CASE(InfoTest, StorageTypes);
-// TYPED_TEST_CASE(IndexTest, InMemoryStorageType);
+TYPED_TEST_SUITE(InfoTest, StorageTypes);
+// TYPED_TEST_SUITE(IndexTest, InMemoryStorageType);
 
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TYPED_TEST(InfoTest, InfoCheck) {
@@ -78,7 +86,7 @@ TYPED_TEST(InfoTest, InfoCheck) {
     auto v2 = acc->CreateVertex();
     auto v3 = acc->CreateVertex();
     auto v4 = acc->CreateVertex();
-    auto v5 = acc->CreateVertex();
+    [[maybe_unused]] auto v5 = acc->CreateVertex();
 
     ASSERT_FALSE(v2.AddLabel(lbl).HasError());
     ASSERT_FALSE(v3.AddLabel(lbl).HasError());
@@ -135,7 +143,7 @@ TYPED_TEST(InfoTest, InfoCheck) {
     ASSERT_FALSE(unique_acc->Commit().HasError());
   }
 
-  StorageInfo info = this->storage->GetInfo(true);  // force to use configured directory
+  StorageInfo info = this->storage->GetInfo();
 
   ASSERT_EQ(info.vertex_count, 5);
   ASSERT_EQ(info.edge_count, 2);
@@ -146,6 +154,7 @@ TYPED_TEST(InfoTest, InfoCheck) {
   ASSERT_LT(info.disk_usage, 1000'000);
   ASSERT_EQ(info.label_indices, 1);
   ASSERT_EQ(info.label_property_indices, 1);
+  ASSERT_EQ(info.text_indices, 0);
   ASSERT_EQ(info.existence_constraints, 0);
   ASSERT_EQ(info.unique_constraints, 2);
   ASSERT_EQ(info.storage_mode, this->mode);

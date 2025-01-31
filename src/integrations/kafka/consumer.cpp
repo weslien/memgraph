@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -13,7 +13,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <iterator>
 #include <memory>
 #include <unordered_set>
 
@@ -22,7 +21,7 @@
 
 #include "integrations/constants.hpp"
 #include "integrations/kafka/exceptions.hpp"
-#include "utils/exceptions.hpp"
+#include "integrations/kafka/fmt.hpp"
 #include "utils/logging.hpp"
 #include "utils/on_scope_exit.hpp"
 #include "utils/thread.hpp"

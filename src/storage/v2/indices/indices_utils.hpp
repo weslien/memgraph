@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,6 +11,7 @@
 
 #include <thread>
 #include "storage/v2/delta.hpp"
+#include "storage/v2/durability/recovery_type.hpp"
 #include "storage/v2/mvcc.hpp"
 #include "storage/v2/transaction.hpp"
 #include "storage/v2/vertex.hpp"
@@ -20,14 +21,18 @@
 
 namespace memgraph::storage {
 
-using ParallelizedIndexCreationInfo =
-    std::pair<std::vector<std::pair<Gid, uint64_t>> /*vertex_recovery_info*/, uint64_t /*thread_count*/>;
+namespace {
+
+template <Delta::Action... actions>
+struct ActionSet {
+  constexpr bool contains(Delta::Action action) const { return ((action == actions) || ...); }
+};
 
 /// Traverses deltas visible from transaction with start timestamp greater than
 /// the provided timestamp, and calls the provided callback function for each
 /// delta. If the callback ever returns true, traversal is stopped and the
 /// function returns true. Otherwise, the function returns false.
-template <typename TCallback>
+template <ActionSet interesting, typename TCallback>
 inline bool AnyVersionSatisfiesPredicate(uint64_t timestamp, const Delta *delta, const TCallback &predicate) {
   while (delta != nullptr) {
     const auto ts = delta->timestamp->load(std::memory_order_acquire);
@@ -35,7 +40,7 @@ inline bool AnyVersionSatisfiesPredicate(uint64_t timestamp, const Delta *delta,
     if (ts < timestamp) {
       break;
     }
-    if (predicate(*delta)) {
+    if (interesting.contains(delta->action) && predicate(*delta)) {
       return true;
     }
     // Move to the next delta.
@@ -43,6 +48,8 @@ inline bool AnyVersionSatisfiesPredicate(uint64_t timestamp, const Delta *delta,
   }
   return false;
 }
+
+}  // namespace
 
 /// Helper function for label index garbage collection. Returns true if there's
 /// a reachable version of the vertex that has the given label.
@@ -59,16 +66,19 @@ inline bool AnyVersionHasLabel(const Vertex &vertex, LabelId label, uint64_t tim
   if (!deleted && has_label) {
     return true;
   }
-  return AnyVersionSatisfiesPredicate(timestamp, delta, [&has_label, &deleted, label](const Delta &delta) {
+  constexpr auto interesting =
+      ActionSet<Delta::Action::ADD_LABEL, Delta::Action::REMOVE_LABEL, Delta::Action::RECREATE_OBJECT,
+                Delta::Action::DELETE_DESERIALIZED_OBJECT, Delta::Action::DELETE_OBJECT>{};
+  return AnyVersionSatisfiesPredicate<interesting>(timestamp, delta, [&has_label, &deleted, label](const Delta &delta) {
     switch (delta.action) {
       case Delta::Action::ADD_LABEL:
-        if (delta.label == label) {
+        if (delta.label.value == label) {
           MG_ASSERT(!has_label, "Invalid database state!");
           has_label = true;
         }
         break;
       case Delta::Action::REMOVE_LABEL:
-        if (delta.label == label) {
+        if (delta.label.value == label) {
           MG_ASSERT(has_label, "Invalid database state!");
           has_label = false;
         }
@@ -100,10 +110,10 @@ inline bool AnyVersionHasLabel(const Vertex &vertex, LabelId label, uint64_t tim
 /// property value.
 inline bool AnyVersionHasLabelProperty(const Vertex &vertex, LabelId label, PropertyId key, const PropertyValue &value,
                                        uint64_t timestamp) {
-  bool has_label{false};
-  bool current_value_equal_to_value{value.IsNull()};
-  bool deleted{false};
-  const Delta *delta = nullptr;
+  Delta const *delta;
+  bool deleted;
+  bool has_label;
+  bool current_value_equal_to_value;
   {
     auto guard = std::shared_lock{vertex.lock};
     delta = vertex.delta;
@@ -118,24 +128,27 @@ inline bool AnyVersionHasLabelProperty(const Vertex &vertex, LabelId label, Prop
     return true;
   }
 
-  return AnyVersionSatisfiesPredicate(
+  constexpr auto interesting = ActionSet<Delta::Action::ADD_LABEL, Delta::Action::REMOVE_LABEL,
+                                         Delta::Action::SET_PROPERTY, Delta::Action::RECREATE_OBJECT,
+                                         Delta::Action::DELETE_DESERIALIZED_OBJECT, Delta::Action::DELETE_OBJECT>{};
+  return AnyVersionSatisfiesPredicate<interesting>(
       timestamp, delta, [&has_label, &current_value_equal_to_value, &deleted, label, key, &value](const Delta &delta) {
         switch (delta.action) {
           case Delta::Action::ADD_LABEL:
-            if (delta.label == label) {
+            if (delta.label.value == label) {
               MG_ASSERT(!has_label, "Invalid database state!");
               has_label = true;
             }
             break;
           case Delta::Action::REMOVE_LABEL:
-            if (delta.label == label) {
+            if (delta.label.value == label) {
               MG_ASSERT(has_label, "Invalid database state!");
               has_label = false;
             }
             break;
           case Delta::Action::SET_PROPERTY:
             if (delta.property.key == key) {
-              current_value_equal_to_value = delta.property.value == value;
+              current_value_equal_to_value = *delta.property.value == value;
             }
             break;
           case Delta::Action::RECREATE_OBJECT: {
@@ -156,6 +169,58 @@ inline bool AnyVersionHasLabelProperty(const Vertex &vertex, LabelId label, Prop
             break;
         }
         return !deleted && has_label && current_value_equal_to_value;
+      });
+}
+
+/// Helper function for edgetype-property index garbage collection. Returns true if
+/// there's a reachable version of the edge that has the given property value.
+inline bool AnyVersionHasProperty(const Edge &edge, PropertyId key, const PropertyValue &value, uint64_t timestamp) {
+  Delta const *delta;
+  bool deleted;
+  bool current_value_equal_to_value;
+  {
+    auto guard = std::shared_lock{edge.lock};
+    delta = edge.delta;
+    deleted = edge.deleted;
+    // Avoid IsPropertyEqual if already not possible
+    if (delta == nullptr && deleted) return false;
+    current_value_equal_to_value = edge.properties.IsPropertyEqual(key, value);
+  }
+
+  if (!deleted && current_value_equal_to_value) {
+    return true;
+  }
+
+  constexpr auto interesting = ActionSet<Delta::Action::SET_PROPERTY, Delta::Action::RECREATE_OBJECT,
+                                         Delta::Action::DELETE_DESERIALIZED_OBJECT, Delta::Action::DELETE_OBJECT>{};
+  return AnyVersionSatisfiesPredicate<interesting>(
+      timestamp, delta, [&current_value_equal_to_value, &deleted, key, &value](const Delta &delta) {
+        switch (delta.action) {
+          case Delta::Action::SET_PROPERTY:
+            if (delta.property.key == key) {
+              current_value_equal_to_value = *delta.property.value == value;
+            }
+            break;
+          case Delta::Action::RECREATE_OBJECT: {
+            MG_ASSERT(deleted, "Invalid database state!");
+            deleted = false;
+            break;
+          }
+          case Delta::Action::DELETE_DESERIALIZED_OBJECT:
+          case Delta::Action::DELETE_OBJECT: {
+            MG_ASSERT(!deleted, "Invalid database state!");
+            deleted = true;
+            break;
+          }
+          case Delta::Action::ADD_LABEL:
+          case Delta::Action::REMOVE_LABEL:
+          case Delta::Action::ADD_IN_EDGE:
+          case Delta::Action::ADD_OUT_EDGE:
+          case Delta::Action::REMOVE_IN_EDGE:
+          case Delta::Action::REMOVE_OUT_EDGE:
+            break;
+        }
+        return !deleted && current_value_equal_to_value;
       });
 }
 
@@ -189,7 +254,7 @@ inline bool CurrentVersionHasLabelProperty(const Vertex &vertex, LabelId label, 
       auto resLabel = cache.GetHasLabel(view, &vertex, label);
       if (resLabel && *resLabel) {
         auto resProp = cache.GetProperty(view, &vertex, key);
-        if (resProp && *resProp == value) return true;
+        if (resProp && resProp->get() == value) return true;
       }
     }
 
@@ -216,6 +281,39 @@ inline bool CurrentVersionHasLabelProperty(const Vertex &vertex, LabelId label, 
   }
 
   return exists && !deleted && has_label && current_value_equal_to_value;
+}
+
+// Helper function for iterating through label-property index. Returns true if
+// this transaction can see the given vertex, and the visible version has the
+// given label and property.
+inline bool CurrentEdgeVersionHasProperty(const Edge &edge, PropertyId key, const PropertyValue &value,
+                                          Transaction *transaction, View view) {
+  bool exists = true;
+  bool deleted = false;
+  bool current_value_equal_to_value = value.IsNull();
+  const Delta *delta = nullptr;
+  {
+    auto guard = std::shared_lock{edge.lock};
+    deleted = edge.deleted;
+    current_value_equal_to_value = edge.properties.IsPropertyEqual(key, value);
+    delta = edge.delta;
+  }
+
+  // Checking cache has a cost, only do it if we have any deltas
+  // if we have no deltas then what we already have from the vertex is correct.
+  if (delta && transaction->isolation_level != IsolationLevel::READ_UNCOMMITTED) {
+    auto const n_processed = ApplyDeltasForRead(transaction, delta, view, [&, key](const Delta &delta) {
+      // clang-format off
+      DeltaDispatch(delta, utils::ChainedOverloaded{
+        Deleted_ActionMethod(deleted),
+        Exists_ActionMethod(exists),
+        PropertyValueMatch_ActionMethod(current_value_equal_to_value, key,value)
+      });
+      // clang-format on
+    });
+  }
+
+  return exists && !deleted && current_value_equal_to_value;
 }
 
 template <typename TIndexAccessor>
@@ -259,11 +357,12 @@ inline void CreateIndexOnSingleThread(utils::SkipList<Vertex>::Accessor &vertice
 template <typename TIndex, typename TIndexKey, typename TSKiplistIter, typename TFunc>
 inline void CreateIndexOnMultipleThreads(utils::SkipList<Vertex>::Accessor &vertices, TSKiplistIter skiplist_iter,
                                          TIndex &index, TIndexKey key,
-                                         const ParallelizedIndexCreationInfo &parallel_exec_info, const TFunc &func) {
+                                         const durability::ParallelizedSchemaCreationInfo &parallel_exec_info,
+                                         const TFunc &func) {
   utils::MemoryTracker::OutOfMemoryExceptionEnabler oom_exception;
 
-  const auto &vertex_batches = parallel_exec_info.first;
-  const auto thread_count = std::min(parallel_exec_info.second, vertex_batches.size());
+  const auto &vertex_batches = parallel_exec_info.vertex_recovery_info;
+  const auto thread_count = std::min(parallel_exec_info.thread_count, vertex_batches.size());
 
   MG_ASSERT(!vertex_batches.empty(),
             "The size of batches should always be greater than zero if you want to use the parallel version of index "
@@ -305,6 +404,20 @@ inline void CreateIndexOnMultipleThreads(utils::SkipList<Vertex>::Accessor &vert
   if (maybe_error.Lock()->has_value()) {
     throw utils::OutOfMemoryException((*maybe_error.Lock())->what());
   }
+}
+
+// Helper function that determines, if a transaction has an original start timestamp
+// (for example in a periodic commit when it is necessary to preserve initial index iterators)
+// whether we are allowed to see the entity in the index data structures
+// Returns true if we are allowed to see the entity in the index data structures
+// If the method returns true, the reverts of the deltas will finally decide what's the version
+// of the graph entity
+inline bool CanSeeEntityWithTimestamp(uint64_t insertion_timestamp, Transaction *transaction) {
+  if (!transaction->original_start_timestamp.has_value()) {
+    return true;
+  }
+
+  return insertion_timestamp < transaction->original_start_timestamp.value();
 }
 
 }  // namespace memgraph::storage

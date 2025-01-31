@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2025 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -11,31 +11,29 @@
 
 #pragma once
 
+#include <string_view>
 #include <unordered_set>
 
 #include <gflags/gflags.h>
 
 #include "dbms/database.hpp"
+#include "dbms/dbms_handler.hpp"
 #include "memory/query_memory_control.hpp"
 #include "query/auth_checker.hpp"
 #include "query/auth_query_handler.hpp"
-#include "query/config.hpp"
 #include "query/context.hpp"
-#include "query/cypher_query_interpreter.hpp"
 #include "query/db_accessor.hpp"
 #include "query/exceptions.hpp"
 #include "query/frontend/ast/ast.hpp"
 #include "query/frontend/ast/cypher_main_visitor.hpp"
-#include "query/frontend/stripped.hpp"
-#include "query/interpret/frame.hpp"
 #include "query/metadata.hpp"
 #include "query/plan/operator.hpp"
 #include "query/plan/read_write_type_checker.hpp"
+#include "query/query_logger.hpp"
 #include "query/stream.hpp"
 #include "query/stream/streams.hpp"
 #include "query/trigger.hpp"
 #include "query/typed_value.hpp"
-#include "spdlog/spdlog.h"
 #include "storage/v2/disk/storage.hpp"
 #include "storage/v2/isolation_level.hpp"
 #include "storage/v2/storage.hpp"
@@ -43,13 +41,13 @@
 #include "utils/event_trigger.hpp"
 #include "utils/logging.hpp"
 #include "utils/memory.hpp"
-#include "utils/settings.hpp"
 #include "utils/skip_list.hpp"
 #include "utils/spin_lock.hpp"
 #include "utils/synchronized.hpp"
-#include "utils/thread_pool.hpp"
-#include "utils/timer.hpp"
-#include "utils/tsc.hpp"
+
+#ifdef MG_ENTERPRISE
+#include "coordination/instance_status.hpp"
+#endif
 
 namespace memgraph::metrics {
 extern const Event FailedQuery;
@@ -60,6 +58,54 @@ extern const Event SuccessfulQuery;
 
 namespace memgraph::query {
 
+struct QueryAllocator {
+  QueryAllocator() = default;
+  QueryAllocator(QueryAllocator const &) = delete;
+  QueryAllocator &operator=(QueryAllocator const &) = delete;
+
+  // No move addresses to pool & monotonic fields must be stable
+  QueryAllocator(QueryAllocator &&) = delete;
+  QueryAllocator &operator=(QueryAllocator &&) = delete;
+
+  auto resource() -> utils::MemoryResource * {
+#ifndef MG_MEMORY_PROFILE
+    return &pool;
+#else
+    return upstream_resource();
+#endif
+  }
+  auto resource_without_pool() -> utils::MemoryResource * {
+#ifndef MG_MEMORY_PROFILE
+    return &monotonic;
+#else
+    return upstream_resource();
+#endif
+  }
+  auto resource_without_pool_or_mono() -> utils::MemoryResource * { return upstream_resource(); }
+
+ private:
+  // At least one page to ensure not sharing page with other subsystems
+  static constexpr auto kMonotonicInitialSize = 4UL * 1024UL;
+  // TODO: need to profile to check for good defaults, also maybe PoolResource
+  //  needs to be smarter. We expect more reuse of smaller objects than larger
+  //  objects. 64*1024B is maybe wasteful, whereas 256*32B maybe sensible.
+  //  Depends on number of small objects expected.
+  static constexpr auto kPoolBlockPerChunk = 64UL;
+  static constexpr auto kPoolMaxBlockSize = 1024UL;
+
+  static auto upstream_resource() -> utils::MemoryResource * {
+    // singleton ResourceWithOutOfMemoryException
+    // explicitly backed by NewDeleteResource
+    static auto upstream = utils::ResourceWithOutOfMemoryException{utils::NewDeleteResource()};
+    return &upstream;
+  }
+
+#ifndef MG_MEMORY_PROFILE
+  memgraph::utils::MonotonicBufferResource monotonic{kMonotonicInitialSize, upstream_resource()};
+  memgraph::utils::PoolResource pool{kPoolBlockPerChunk, &monotonic, upstream_resource()};
+#endif
+};
+
 struct InterpreterContext;
 
 inline constexpr size_t kExecutionMemoryBlockSize = 1UL * 1024UL * 1024UL;
@@ -67,44 +113,56 @@ inline constexpr size_t kExecutionPoolMaxBlockSize = 1024UL;  // 2 ^ 10
 
 enum class QueryHandlerResult { COMMIT, ABORT, NOTHING };
 
-class ReplicationQueryHandler {
+#ifdef MG_ENTERPRISE
+class CoordinatorQueryHandler {
  public:
-  ReplicationQueryHandler() = default;
-  virtual ~ReplicationQueryHandler() = default;
+  CoordinatorQueryHandler() = default;
+  virtual ~CoordinatorQueryHandler() = default;
 
-  ReplicationQueryHandler(const ReplicationQueryHandler &) = default;
-  ReplicationQueryHandler &operator=(const ReplicationQueryHandler &) = default;
+  CoordinatorQueryHandler(const CoordinatorQueryHandler &) = default;
+  CoordinatorQueryHandler &operator=(const CoordinatorQueryHandler &) = default;
 
-  ReplicationQueryHandler(ReplicationQueryHandler &&) = default;
-  ReplicationQueryHandler &operator=(ReplicationQueryHandler &&) = default;
+  CoordinatorQueryHandler(CoordinatorQueryHandler &&) = default;
+  CoordinatorQueryHandler &operator=(CoordinatorQueryHandler &&) = default;
 
-  struct Replica {
-    std::string name;
-    std::string socket_address;
-    ReplicationQuery::SyncMode sync_mode;
-    std::optional<double> timeout;
-    uint64_t current_timestamp_of_replica;
-    uint64_t current_number_of_timestamp_behind_master;
-    ReplicationQuery::ReplicaState state;
+  struct MainReplicaStatus {
+    std::string_view name;
+    std::string_view socket_address;
+    bool alive;
+    bool is_main;
+
+    MainReplicaStatus(std::string_view name, std::string_view socket_address, bool alive, bool is_main)
+        : name{name}, socket_address{socket_address}, alive{alive}, is_main{is_main} {}
   };
 
-  /// @throw QueryRuntimeException if an error ocurred.
-  virtual void SetReplicationRole(ReplicationQuery::ReplicationRole replication_role, std::optional<int64_t> port) = 0;
+  /// @throw QueryRuntimeException if an error occurred.
+  virtual void RegisterReplicationInstance(std::string_view bolt_server, std::string_view management_server,
+                                           std::string_view replication_server, std::string_view instance_name,
+                                           CoordinatorQuery::SyncMode sync_mode) = 0;
 
-  /// @throw QueryRuntimeException if an error ocurred.
-  virtual ReplicationQuery::ReplicationRole ShowReplicationRole() const = 0;
+  /// @throw QueryRuntimeException if an error occurred.
+  virtual void UnregisterInstance(std::string_view instance_name) = 0;
 
-  /// @throw QueryRuntimeException if an error ocurred.
-  virtual void RegisterReplica(const std::string &name, const std::string &socket_address,
-                               ReplicationQuery::SyncMode sync_mode,
-                               const std::chrono::seconds replica_check_frequency) = 0;
+  /// @throw QueryRuntimeException if an error occurred.
+  virtual void SetReplicationInstanceToMain(std::string_view instance_name) = 0;
 
-  /// @throw QueryRuntimeException if an error ocurred.
-  virtual void DropReplica(std::string_view replica_name) = 0;
+  /// @throw QueryRuntimeException if an error occurred.
+  virtual coordination::InstanceStatus ShowInstance() const = 0;
 
-  /// @throw QueryRuntimeException if an error ocurred.
-  virtual std::vector<Replica> ShowReplicas() const = 0;
+  /// @throw QueryRuntimeException if an error occurred.
+  virtual std::vector<coordination::InstanceStatus> ShowInstances() const = 0;
+
+  /// @throw QueryRuntimeException if an error occurred.
+  virtual void AddCoordinatorInstance(int32_t coordinator_id, std::string_view bolt_server,
+                                      std::string_view coordinator_server, std::string_view management_server) = 0;
+
+  virtual void RemoveCoordinatorInstance(int32_t coordinator_id) = 0;
+
+  virtual void DemoteInstanceToReplica(std::string_view instance_name) = 0;
+
+  virtual void ForceResetClusterState() = 0;
 };
+#endif
 
 class AnalyzeGraphQueryHandler {
  public:
@@ -140,7 +198,7 @@ struct PreparedQuery {
  * NOTE: maybe need to parse more in the future, ATM we ignore some parts from BOLT
  */
 struct QueryExtras {
-  std::map<std::string, memgraph::storage::PropertyValue> metadata_pv;
+  storage::PropertyValue::map_t metadata_pv;
   std::optional<int64_t> tx_timeout;
 };
 
@@ -162,6 +220,15 @@ struct CurrentDB {
     in_explicit_db_ = in_explicit_db;
   }
 
+  void ResetDB() {
+    db_acc_.reset();
+    db_transactional_accessor_.reset();
+    execution_db_accessor_.reset();
+    trigger_context_collector_.reset();
+  }
+
+  std::string name() const { return db_acc_ ? db_acc_->get()->name() : ""; }
+
   // TODO: don't provide explicitly via constructor, instead have a lazy way of getting the current/default
   // DatabaseAccess
   //       hence, explict bolt "use DB" in metadata wouldn't necessarily get access unless query required it.
@@ -172,9 +239,12 @@ struct CurrentDB {
   bool in_explicit_db_{false};
 };
 
+using UserParameters_fn = std::function<UserParameters(storage::Storage const *)>;
+constexpr auto no_params_fn = [](storage::Storage const *) -> UserParameters { return {}; };
+
 class Interpreter final {
  public:
-  Interpreter(InterpreterContext *interpreter_context);
+  explicit Interpreter(InterpreterContext *interpreter_context);
   Interpreter(InterpreterContext *interpreter_context, memgraph::dbms::DatabaseAccess db);
   Interpreter(const Interpreter &) = delete;
   Interpreter &operator=(const Interpreter &) = delete;
@@ -189,17 +259,35 @@ class Interpreter final {
     std::optional<std::string> db;
   };
 
-  std::optional<std::string> username_;
+#ifdef MG_ENTERPRISE
+  struct RouteResult {
+    int ttl{300};
+    std::string db{};  // Currently not used since we don't have any specific replication groups etc.
+    coordination::RoutingTable servers{};
+  };
+#endif
+
+  struct SessionInfo {
+    std::string uuid;
+    std::string username;
+    std::string login_timestamp;
+  };
+
+  std::shared_ptr<QueryUserOrRole> user_or_role_{};
+  SessionInfo session_info_;
   bool in_explicit_transaction_{false};
   CurrentDB current_db_;
 
   bool expect_rollback_{false};
   std::shared_ptr<utils::AsyncTimer> current_timeout_timer_{};
-  std::optional<std::map<std::string, storage::PropertyValue>> metadata_{};  //!< User defined transaction metadata
+  std::optional<storage::PropertyValue::map_t> metadata_{};  //!< User defined transaction metadata
 
 #ifdef MG_ENTERPRISE
   void SetCurrentDB(std::string_view db_name, bool explicit_db);
+  void ResetDB() { current_db_.ResetDB(); }
   void OnChangeCB(auto cb) { on_change_.emplace(cb); }
+#else
+  void SetCurrentDB();
 #endif
 
   /**
@@ -210,9 +298,12 @@ class Interpreter final {
    *
    * @throw query::QueryException
    */
-  Interpreter::PrepareResult Prepare(const std::string &query,
-                                     const std::map<std::string, storage::PropertyValue> &params,
+  Interpreter::PrepareResult Prepare(const std::string &query, UserParameters_fn params_getter,
                                      QueryExtras const &extras);
+
+#ifdef MG_ENTERPRISE
+  auto Route(std::map<std::string, std::string> const &routing) -> RouteResult;
+#endif
 
   /**
    * Execute the last prepared query and stream *all* of the results into the
@@ -279,49 +370,47 @@ class Interpreter final {
 
   void ResetUser();
 
-  void SetUser(std::string_view username);
+  void SetUser(std::shared_ptr<QueryUserOrRole> user);
+
+  void SetSessionInfo(std::string uuid, std::string username, std::string login_timestamp);
+
+  std::optional<memgraph::system::Transaction> system_transaction_{};
+
+  std::optional<QueryLogger> query_logger_{};
+
+  bool IsQueryLoggingActive() const;
+  void LogQueryMessage(std::string message);
 
  private:
-  struct QueryExecution {
-    std::variant<utils::MonotonicBufferResource, utils::PoolResource> execution_memory;
-    utils::ResourceWithOutOfMemoryException execution_memory_with_exception;
-    std::optional<PreparedQuery> prepared_query;
+  void ResetInterpreter() {
+    query_executions_.clear();
+    system_transaction_.reset();
+    transaction_queries_->clear();
+    if (current_db_.db_acc_ && current_db_.db_acc_->is_deleting()) {
+      current_db_.db_acc_.reset();
+    }
+  }
 
+  struct QueryExecution {
+    QueryAllocator execution_memory;  // NOTE: before all other fields which uses this memory
+
+    std::optional<PreparedQuery> prepared_query;
     std::map<std::string, TypedValue> summary;
     std::vector<Notification> notifications;
 
-    static auto Create(std::variant<utils::MonotonicBufferResource, utils::PoolResource> memory_resource,
-                       std::optional<PreparedQuery> prepared_query = std::nullopt) -> std::unique_ptr<QueryExecution> {
-      return std::make_unique<QueryExecution>(std::move(memory_resource), std::move(prepared_query));
-    }
+    static auto Create() -> std::unique_ptr<QueryExecution> { return std::make_unique<QueryExecution>(); }
 
-    explicit QueryExecution(std::variant<utils::MonotonicBufferResource, utils::PoolResource> memory_resource,
-                            std::optional<PreparedQuery> prepared_query)
-        : execution_memory(std::move(memory_resource)), prepared_query{std::move(prepared_query)} {
-      std::visit(
-          [&](auto &memory_resource) {
-            execution_memory_with_exception = utils::ResourceWithOutOfMemoryException(&memory_resource);
-          },
-          execution_memory);
-    };
+    explicit QueryExecution() = default;
 
     QueryExecution(const QueryExecution &) = delete;
-    QueryExecution(QueryExecution &&) = default;
+    QueryExecution(QueryExecution &&) = delete;
     QueryExecution &operator=(const QueryExecution &) = delete;
-    QueryExecution &operator=(QueryExecution &&) = default;
+    QueryExecution &operator=(QueryExecution &&) = delete;
 
-    ~QueryExecution() {
-      // We should always release the execution memory AFTER we
-      // destroy the prepared query which is using that instance
-      // of execution memory.
-      prepared_query.reset();
-      std::visit([](auto &memory_resource) { memory_resource.Release(); }, execution_memory);
-    }
+    ~QueryExecution() = default;
 
     void CleanRuntimeData() {
-      if (prepared_query.has_value()) {
-        prepared_query.reset();
-      }
+      prepared_query.reset();
       notifications.clear();
     }
   };
@@ -340,6 +429,7 @@ class Interpreter final {
   // TODO Figure out how this would work for multi-database
   // Exists only during a single transaction (for now should be okay as is)
   std::vector<std::unique_ptr<QueryExecution>> query_executions_;
+
   // all queries that are run as part of the current transaction
   utils::Synchronized<std::vector<std::string>, utils::SpinLock> transaction_queries_;
 
@@ -391,9 +481,7 @@ std::map<std::string, TypedValue> Interpreter::Pull(TStream *result_stream, std:
   try {
     // Wrap the (statically polymorphic) stream type into a common type which
     // the handler knows.
-    AnyStream stream{result_stream,
-                     std::visit([](auto &execution_memory) -> utils::MemoryResource * { return &execution_memory; },
-                                query_execution->execution_memory)};
+    AnyStream stream{result_stream, query_execution->execution_memory.resource()};
     const auto maybe_res = query_execution->prepared_query->query_handler(&stream, n);
     // Stream is using execution memory of the query_execution which
     // can be deleted after its execution so the stream should be cleared
@@ -435,21 +523,22 @@ std::map<std::string, TypedValue> Interpreter::Pull(TStream *result_stream, std:
         // NOTE: we cannot clear query_execution inside the Abort and Commit
         // methods as we will delete summary contained in them which we need
         // after our query finished executing.
-        query_executions_.clear();
-        transaction_queries_->clear();
+        ResetInterpreter();
       } else {
         // We can only clear this execution as some of the queries
         // in the transaction can be in unfinished state
         query_execution.reset(nullptr);
       }
     }
-  } catch (const ExplicitTransactionUsageException &) {
+  } catch (const ExplicitTransactionUsageException &e) {
+    LogQueryMessage(e.what());
     if (current_transaction_) {
       memgraph::memory::TryStopTrackingOnTransaction(*current_transaction_);
     }
     query_execution.reset(nullptr);
     throw;
-  } catch (const utils::BasicException &) {
+  } catch (const utils::BasicException &e) {
+    LogQueryMessage(e.what());
     if (current_transaction_) {
       memgraph::memory::TryStopTrackingOnTransaction(*current_transaction_);
     }

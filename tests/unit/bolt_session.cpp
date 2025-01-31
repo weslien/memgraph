@@ -1,4 +1,4 @@
-// Copyright 2023 Memgraph Ltd.
+// Copyright 2024 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -27,6 +27,7 @@ using memgraph::communication::bolt::Session;
 using memgraph::communication::bolt::SessionException;
 using memgraph::communication::bolt::State;
 using memgraph::communication::bolt::Value;
+using bolt_map_t = memgraph::communication::bolt::map_t;
 
 static const char *kInvalidQuery = "invalid query";
 static const char *kQueryReturn42 = "RETURN 42";
@@ -42,9 +43,8 @@ class TestSession final : public Session<TestInputStream, TestOutputStream> {
 
   TestSession(TestSessionContext *data, TestInputStream *input_stream, TestOutputStream *output_stream)
       : Session<TestInputStream, TestOutputStream>(input_stream, output_stream) {}
-  std::pair<std::vector<std::string>, std::optional<int>> Interpret(
-      const std::string &query, const std::map<std::string, Value> &params,
-      const std::map<std::string, Value> &extra) override {
+  std::pair<std::vector<std::string>, std::optional<int>> Interpret(const std::string &query, const bolt_map_t &params,
+                                                                    const bolt_map_t &extra) override {
     if (extra.contains("tx_metadata")) {
       auto const &metadata = extra.at("tx_metadata").ValueMap();
       if (!metadata.empty()) md_ = metadata;
@@ -64,7 +64,7 @@ class TestSession final : public Session<TestInputStream, TestOutputStream> {
     }
   }
 
-  std::map<std::string, Value> Pull(TEncoder *encoder, std::optional<int> n, std::optional<int> qid) override {
+  bolt_map_t Pull(TEncoder *encoder, std::optional<int> n, std::optional<int> qid) override {
     if (should_abort_) {
       throw memgraph::query::HintedAbortError(memgraph::query::AbortReason::TERMINATED);
     }
@@ -97,11 +97,9 @@ class TestSession final : public Session<TestInputStream, TestOutputStream> {
     }
   }
 
-  std::map<std::string, Value> Discard(std::optional<int> /*unused*/, std::optional<int> /*unused*/) override {
-    return {};
-  }
+  bolt_map_t Discard(std::optional<int> /*unused*/, std::optional<int> /*unused*/) override { return {}; }
 
-  void BeginTransaction(const std::map<std::string, Value> &extra) override {
+  void BeginTransaction(const bolt_map_t &extra) override {
     if (extra.contains("tx_metadata")) {
       auto const &metadata = extra.at("tx_metadata").ValueMap();
       if (!metadata.empty()) md_ = metadata;
@@ -114,16 +112,25 @@ class TestSession final : public Session<TestInputStream, TestOutputStream> {
 
   bool Authenticate(const std::string & /*username*/, const std::string & /*password*/) override { return true; }
 
+  bool SSOAuthenticate(const std::string & /*username*/, const std::string & /*password*/) override { return true; }
+
+#ifdef MG_ENTERPRISE
+  auto Route(bolt_map_t const & /*routing*/, std::vector<memgraph::communication::bolt::Value> const & /*bookmarks*/,
+             bolt_map_t const & /*extra*/) -> bolt_map_t override {
+    return {};
+  }
+#endif
+
   std::optional<std::string> GetServerNameForInit() override { return std::nullopt; }
 
-  void Configure(const std::map<std::string, memgraph::communication::bolt::Value> &) override {}
+  void Configure(const bolt_map_t &) override {}
   std::string GetCurrentDB() const override { return ""; }
 
   void TestHook_ShouldAbort() { should_abort_ = true; }
 
  private:
   std::string query_;
-  std::map<std::string, Value> md_;
+  bolt_map_t md_;
   bool should_abort_ = false;
 };
 
@@ -1027,104 +1034,115 @@ TEST(BoltSession, Noop) {
   }
 }
 
-TEST(BoltSession, Route) {
-  // Memgraph does not support route message, but it handles it
-  {
-    SCOPED_TRACE("v1");
-    INIT_VARS;
+TEST(BoltSession, Route){{SCOPED_TRACE("v1");
+INIT_VARS;
 
-    ExecuteHandshake(input_stream, session, output);
-    ExecuteInit(input_stream, session, output);
-    ASSERT_THROW(ExecuteCommand(input_stream, session, v4_3::route, sizeof(v4_3::route)), SessionException);
-    EXPECT_EQ(session.state_, State::Close);
-  }
-  {
-    SCOPED_TRACE("v4");
-    INIT_VARS;
+ExecuteHandshake(input_stream, session, output);
+ExecuteInit(input_stream, session, output);
+ASSERT_THROW(ExecuteCommand(input_stream, session, v4_3::route, sizeof(v4_3::route)), SessionException);
+EXPECT_EQ(session.state_, State::Close);
+}
+#ifdef MG_ENTERPRISE
+{
+  SCOPED_TRACE("v4");
+  INIT_VARS;
 
-    ExecuteHandshake(input_stream, session, output, v4_3::handshake_req, v4_3::handshake_resp);
-    ExecuteInit(input_stream, session, output, true);
-    ASSERT_NO_THROW(ExecuteCommand(input_stream, session, v4_3::route, sizeof(v4_3::route)));
-    static constexpr uint8_t expected_resp[] = {
-        0x00 /*two bytes of chunk header, chunk contains 64 bytes of data*/,
-        0x40,
-        0xb1 /*TinyStruct1*/,
-        0x7f /*Failure*/,
-        0xa2 /*TinyMap with 2 items*/,
-        0x84 /*TinyString with 4 chars*/,
-        'c',
-        'o',
-        'd',
-        'e',
-        0x82 /*TinyString with 2 chars*/,
-        '6',
-        '6',
-        0x87 /*TinyString with 7 chars*/,
-        'm',
-        'e',
-        's',
-        's',
-        'a',
-        'g',
-        'e',
-        0xd0 /*String*/,
-        0x2b /*With 43 chars*/,
-        'R',
-        'o',
-        'u',
-        't',
-        'e',
-        ' ',
-        'm',
-        'e',
-        's',
-        's',
-        'a',
-        'g',
-        'e',
-        ' ',
-        'i',
-        's',
-        ' ',
-        'n',
-        'o',
-        't',
-        ' ',
-        's',
-        'u',
-        'p',
-        'p',
-        'o',
-        'r',
-        't',
-        'e',
-        'd',
-        ' ',
-        'i',
-        'n',
-        ' ',
-        'M',
-        'e',
-        'm',
-        'g',
-        'r',
-        'a',
-        'p',
-        'h',
-        '!',
-        0x00 /*Terminating zeros*/,
-        0x00,
-    };
-    EXPECT_EQ(input_stream.size(), 0U);
-    CheckOutput(output, expected_resp, sizeof(expected_resp));
-    EXPECT_EQ(session.state_, State::Error);
+  ExecuteHandshake(input_stream, session, output, v4_3::handshake_req, v4_3::handshake_resp);
+  ExecuteInit(input_stream, session, output, true);
+  ASSERT_NO_THROW(ExecuteCommand(input_stream, session, v4_3::route, sizeof(v4_3::route)));
 
-    SCOPED_TRACE("Try to reset connection after ROUTE failed");
-    ASSERT_NO_THROW(ExecuteCommand(input_stream, session, v4::reset_req, sizeof(v4::reset_req)));
-    EXPECT_EQ(input_stream.size(), 0U);
-    CheckOutput(output, success_resp, sizeof(success_resp));
-    EXPECT_EQ(session.state_, State::Idle);
-  }
+  EXPECT_EQ(session.state_, State::Idle);
+  CheckSuccessMessage(output);
+}
+#else
+{
+  SCOPED_TRACE("v4");
+  INIT_VARS;
+
+  ExecuteHandshake(input_stream, session, output, v4_3::handshake_req, v4_3::handshake_resp);
+  ExecuteInit(input_stream, session, output, true);
+  ASSERT_NO_THROW(ExecuteCommand(input_stream, session, v4_3::route, sizeof(v4_3::route)));
+  static constexpr uint8_t expected_resp[] = {
+      0x00 /*two bytes of chunk header, chunk contains 64 bytes of data*/,
+      0x40,
+      0xb1 /*TinyStruct1*/,
+      0x7f /*Failure*/,
+      0xa2 /*TinyMap with 2 items*/,
+      0x84 /*TinyString with 4 chars*/,
+      'c',
+      'o',
+      'd',
+      'e',
+      0x82 /*TinyString with 2 chars*/,
+      '6',
+      '6',
+      0x87 /*TinyString with 7 chars*/,
+      'm',
+      'e',
+      's',
+      's',
+      'a',
+      'g',
+      'e',
+      0xd0 /*String*/,
+      0x2b /*With 43 chars*/,
+      'R',
+      'o',
+      'u',
+      't',
+      'e',
+      ' ',
+      'm',
+      'e',
+      's',
+      's',
+      'a',
+      'g',
+      'e',
+      ' ',
+      'i',
+      's',
+      ' ',
+      'n',
+      'o',
+      't',
+      ' ',
+      's',
+      'u',
+      'p',
+      'p',
+      'o',
+      'r',
+      't',
+      'e',
+      'd',
+      ' ',
+      'i',
+      'n',
+      ' ',
+      'M',
+      'e',
+      'm',
+      'g',
+      'r',
+      'a',
+      'p',
+      'h',
+      '!',
+      0x00 /*Terminating zeros*/,
+      0x00,
+  };
+  EXPECT_EQ(input_stream.size(), 0U);
+  CheckOutput(output, expected_resp, sizeof(expected_resp));
+  EXPECT_EQ(session.state_, State::Error);
+
+  SCOPED_TRACE("Try to reset connection after ROUTE failed");
+  ASSERT_NO_THROW(ExecuteCommand(input_stream, session, v4::reset_req, sizeof(v4::reset_req)));
+  EXPECT_EQ(input_stream.size(), 0U);
+  CheckOutput(output, success_resp, sizeof(success_resp));
+  EXPECT_EQ(session.state_, State::Idle);
+}
+#endif
 }
 
 TEST(BoltSession, Rollback) {
